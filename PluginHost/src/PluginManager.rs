@@ -12,6 +12,7 @@ use PluginAbi::{
     PluginHostServicesV1,
     PluginInstanceV1,
     PluginVTableV1,
+    MAX_ABI_BUFFER_BYTES,
     PLUGIN_ABI_VERSION_V1,
     PLUGIN_CONSTRUCTOR_SYMBOL_V1,
     PLUGIN_STATUS_NOT_INITIALIZED,
@@ -38,6 +39,17 @@ unsafe impl Send for PluginRuntime {}
 unsafe impl Sync for PluginRuntime {}
 
 impl PluginRuntime {
+    fn is_valid_buffer(buffer: AbiBuffer) -> bool {
+        if buffer.ptr.is_null() {
+            return buffer.len == 0 && buffer.capacity == 0;
+        }
+
+        buffer.len > 0 &&
+            buffer.len <= MAX_ABI_BUFFER_BYTES &&
+            buffer.capacity >= buffer.len &&
+            buffer.capacity <= MAX_ABI_BUFFER_BYTES
+    }
+
     fn new(instance: *mut PluginInstanceV1, library: Library) -> Result<Self, String> {
         if instance.is_null() {
             return Err("plugin constructor returned a null instance".to_owned());
@@ -56,6 +68,23 @@ impl PluginRuntime {
         let vtable = unsafe { &*instance_ref.vtable };
         if !vtable.is_compatible() {
             return Err("plugin vtable reported an incompatible ABI layout".to_owned());
+        }
+
+        let function_pointer_bytes = |pointer: usize| pointer != 0;
+        let pointers = [
+            vtable.name as usize,
+            vtable.manifest as usize,
+            vtable.on_load as usize,
+            vtable.is_loaded as usize,
+            vtable.handle_endpoint as usize,
+            vtable.execute_database as usize,
+            vtable.on_session_closed as usize,
+            vtable.on_unload as usize,
+            vtable.free_buffer as usize,
+            vtable.destroy as usize,
+        ];
+        if pointers.iter().any(|pointer| !function_pointer_bytes(*pointer)) {
+            return Err("plugin vtable contains a null function pointer".to_owned());
         }
 
         Ok(Self { instance: Some(instance), library })
@@ -91,14 +120,29 @@ impl PluginRuntime {
     }
 
     fn take_buffer(&self, buffer: AbiBuffer) -> Result<Vec<u8>, String> {
+        if !Self::is_valid_buffer(buffer) {
+            return Err("plugin returned an invalid response buffer".to_owned());
+        }
+
         let (_, vtable) = self.abi_parts()?;
         let bytes = (unsafe { buffer.to_vec() }).ok_or_else(||
             "plugin returned an invalid response buffer".to_owned()
-        );
+        )?;
         unsafe {
             (vtable.free_buffer)(buffer);
         }
-        bytes
+        Ok(bytes)
+    }
+
+    fn free_response_if_valid(&self, response: AbiBuffer) {
+        if response.ptr.is_null() || !Self::is_valid_buffer(response) {
+            return;
+        }
+        if let Ok((_, vtable)) = self.abi_parts() {
+            unsafe {
+                (vtable.free_buffer)(response);
+            }
+        }
     }
 
     fn call_buffer(
@@ -109,12 +153,7 @@ impl PluginRuntime {
         let mut response = AbiBuffer::EMPTY;
         let status = unsafe { call(context, &mut response) };
         if status != PLUGIN_STATUS_OK {
-            if !response.ptr.is_null() {
-                let (_, vtable) = self.abi_parts()?;
-                unsafe {
-                    (vtable.free_buffer)(response);
-                }
-            }
+            self.free_response_if_valid(response);
             return Err(format!("plugin ABI call failed with status {status}"));
         }
         self.take_buffer(response)
@@ -132,12 +171,7 @@ impl PluginRuntime {
         let mut response = AbiBuffer::EMPTY;
         let status = unsafe { call(context, AbiSlice::from_bytes(&request_bytes), &mut response) };
         if status != PLUGIN_STATUS_OK {
-            if !response.ptr.is_null() {
-                let (_, vtable) = self.abi_parts()?;
-                unsafe {
-                    (vtable.free_buffer)(response);
-                }
-            }
+            self.free_response_if_valid(response);
             return Err(format!("plugin ABI call failed with status {status}"));
         }
         let bytes = self.take_buffer(response)?;
@@ -470,15 +504,22 @@ impl PluginManager {
             source,
         })?;
 
-        Ok(
-            entries
-                .map(|entry|
-                    entry
-                        .map(|path| Self::normalize_path(path.as_path()))
-                        .map_err(|error| format_glob_error(&error))
-                )
-                .collect()
-        )
+        let mut paths = Vec::new();
+        let mut errors = Vec::new();
+
+        for entry in entries {
+            match entry {
+                Ok(path) => paths.push(Self::normalize_path(path.as_path())),
+                Err(error) => errors.push(Err(format_glob_error(&error))),
+            }
+        }
+
+        paths.sort();
+        paths.dedup();
+
+        let mut result = paths.into_iter().map(Ok).collect::<Vec<_>>();
+        result.extend(errors);
+        Ok(result)
     }
 
     /// Builds a candidate catalog without mutating manager state.

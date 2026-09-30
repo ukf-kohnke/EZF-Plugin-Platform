@@ -52,7 +52,8 @@
 //! - `is_plugin_loaded` / `load_plugin_if_missing`: `Ok(true)` when plugin is
 //!   available after optional lazy loading.
 //! - `with_*` helpers: `None` when no matching plugin (or no plugins) is present.
-//! - bulk load/unload functions return counts of affected plugins.
+//! - bulk loading returns a [`Factory::PluginLoadReport`] when policy-aware loading is used;
+//!   the compatibility [`Factory::load_plugins`] API continues to return a loaded count.
 #![allow(non_snake_case)]
 mod PluginManager;
 pub mod Factory {
@@ -75,6 +76,7 @@ pub mod Factory {
     use Common::Helper::Functions::getPluginRootDir;
     use glob::PatternError;
     use std::{
+        collections::{ BTreeMap, BTreeSet },
         fs,
         panic::{ AssertUnwindSafe, catch_unwind },
         path::{ Path, PathBuf },
@@ -97,6 +99,124 @@ pub mod Factory {
         pub fn is_success(&self) -> bool {
             self.failures.is_empty()
         }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PluginRequirement {
+        Required,
+        Optional,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PluginLoadFailure {
+        pub path: PathBuf,
+        pub plugin_name: Option<String>,
+        pub requirement: PluginRequirement,
+        pub error: String,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct PluginLoadReport {
+        pub requested_path: PathBuf,
+        pub discovered: Vec<PathBuf>,
+        pub loaded: Vec<String>,
+        pub skipped_already_loaded: Vec<PathBuf>,
+        pub failures: Vec<PluginLoadFailure>,
+    }
+
+    impl PluginLoadReport {
+        pub fn required_failures(&self) -> Vec<&PluginLoadFailure> {
+            self.failures
+                .iter()
+                .filter(|failure| failure.requirement == PluginRequirement::Required)
+                .collect()
+        }
+
+        pub fn has_required_failures(&self) -> bool {
+            self.failures.iter().any(|failure| failure.requirement == PluginRequirement::Required)
+        }
+
+        pub fn is_success(&self) -> bool {
+            !self.has_required_failures()
+        }
+
+        pub fn loaded_count(&self) -> usize {
+            self.loaded.len()
+        }
+
+        pub fn failure_count(&self) -> usize {
+            self.failures.len()
+        }
+
+        fn summary(&self) -> String {
+            format!(
+                "plugin load report for '{}': discovered={}, loaded={}, skipped={}, failures={}, required_failures={}",
+                self.requested_path.display(),
+                self.discovered.len(),
+                self.loaded.len(),
+                self.skipped_already_loaded.len(),
+                self.failures.len(),
+                self.required_failures().len()
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PluginLoadPolicy {
+        default_requirement: PluginRequirement,
+        overrides: BTreeMap<String, PluginRequirement>,
+    }
+
+    impl PluginLoadPolicy {
+        /// Treat every discovered plugin as required unless explicitly overridden.
+        pub fn required_all() -> Self {
+            Self {
+                default_requirement: PluginRequirement::Required,
+                overrides: BTreeMap::new(),
+            }
+        }
+
+        /// Treat every discovered plugin as optional unless explicitly required.
+        pub fn optional_all() -> Self {
+            Self {
+                default_requirement: PluginRequirement::Optional,
+                overrides: BTreeMap::new(),
+            }
+        }
+
+        pub fn require(mut self, plugin_name: impl Into<String>) -> Self {
+            self.overrides.insert(
+                normalize_plugin_name(&plugin_name.into()),
+                PluginRequirement::Required
+            );
+            self
+        }
+
+        pub fn optional(mut self, plugin_name: impl Into<String>) -> Self {
+            self.overrides.insert(
+                normalize_plugin_name(&plugin_name.into()),
+                PluginRequirement::Optional
+            );
+            self
+        }
+
+        pub fn requirement_for_name(&self, plugin_name: &str) -> PluginRequirement {
+            self.overrides
+                .get(&normalize_plugin_name(plugin_name))
+                .copied()
+                .unwrap_or(self.default_requirement)
+        }
+
+        pub fn requirement_for_path(&self, path: &Path) -> PluginRequirement {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| self.requirement_for_name(stem))
+                .unwrap_or(self.default_requirement)
+        }
+    }
+
+    fn normalize_plugin_name(name: &str) -> String {
+        name.trim().to_ascii_lowercase()
     }
 
     static HOST_DATABASE_EXECUTOR: OnceLock<PluginDatabaseCapability> = OnceLock::new();
@@ -153,6 +273,12 @@ pub mod Factory {
         PluginInitializationFailed {
             path: PathBuf,
         },
+        PluginLoadPolicyViolation {
+            report: PluginLoadReport,
+        },
+        PluginLoadInProgress {
+            path: PathBuf,
+        },
         PluginAlreadyLoaded {
             path: PathBuf,
             id: i64,
@@ -192,6 +318,10 @@ pub mod Factory {
                     ),
                 PluginManagerError::PluginInitializationFailed { path } =>
                     write!(f, "Plugin initialization failed at {:?}", path),
+                PluginManagerError::PluginLoadPolicyViolation { report } =>
+                    write!(f, "{}", report.summary()),
+                PluginManagerError::PluginLoadInProgress { path } =>
+                    write!(f, "Plugin at {:?} is already being loaded", path),
                 PluginManagerError::PluginAlreadyLoaded { path, id } =>
                     write!(f, "Plugin already loaded at {:?} with id {}", path, id),
                 PluginManagerError::PluginNotFound { id } =>
@@ -225,11 +355,13 @@ pub mod Factory {
     }
 
     #[allow(unused)]
-    pub(crate) fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
+    pub fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
         // Detach under the manager lock, execute on_unload() without it, and only restore on failure.
         let mut item = {
             let singleton = instance();
-            let mut manager = singleton.inner.lock().unwrap();
+            let mut manager = singleton.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             manager.detach_plugin(id)?
         };
 
@@ -238,7 +370,9 @@ pub mod Factory {
             Ok(())
         } else {
             let singleton = instance();
-            let mut manager = singleton.inner.lock().unwrap();
+            let mut manager = singleton.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             manager.restore_plugin(id, item);
             Err(PluginManagerError::PluginUnloadFailed { id })
         }
@@ -252,13 +386,13 @@ pub mod Factory {
             return Ok(true);
         }
 
-        let len = load_plugins(plugin_path)?;
-        Ok(len > 0 && find_id_by_name(plugin_name).is_some())
+        let report = load_plugins_with_policy(plugin_path, PluginLoadPolicy::optional_all())?;
+        Ok(report.loaded_count() > 0 && find_id_by_name(plugin_name).is_some())
     }
 
     pub(crate) fn find_id_by_name(plugin_name: &str) -> Option<i64> {
         let singleton = instance();
-        let manager = singleton.inner.lock().unwrap();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         manager
             .plugin_ids()
@@ -268,14 +402,46 @@ pub mod Factory {
             )
     }
 
+    static PLUGIN_LOADS_IN_PROGRESS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+    fn loads_in_progress() -> &'static Mutex<BTreeSet<PathBuf>> {
+        PLUGIN_LOADS_IN_PROGRESS.get_or_init(|| Mutex::new(BTreeSet::new()))
+    }
+
+    struct PluginLoadGuard {
+        path: PathBuf,
+    }
+
+    impl Drop for PluginLoadGuard {
+        fn drop(&mut self) {
+            let mut paths = loads_in_progress()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            paths.remove(&self.path);
+        }
+    }
+
+    fn begin_plugin_load(path: &Path) -> Result<PluginLoadGuard, PluginManagerError> {
+        let canonical_path = PluginManager::normalize_path(path);
+        let mut paths = loads_in_progress()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !paths.insert(canonical_path.clone()) {
+            return Err(PluginManagerError::PluginLoadInProgress { path: canonical_path });
+        }
+        Ok(PluginLoadGuard { path: canonical_path })
+    }
+
     pub fn load_plugin_file(path: &Path) -> Result<i64, PluginManagerError> {
+        load_plugin_file_inner(path)
+    }
+
+    fn load_plugin_file_inner(path: &Path) -> Result<i64, PluginManagerError> {
         let canonical_path = PluginManager::normalize_path(path);
 
-        // Avoid invoking plugin code at all when the path is already registered. The check is
-        // repeated after load to cover concurrent load attempts.
         {
             let singleton = instance();
-            let manager = singleton.inner.lock().unwrap();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
                 return Err(PluginManagerError::PluginAlreadyLoaded {
                     path: canonical_path,
@@ -284,12 +450,15 @@ pub mod Factory {
             }
         }
 
+        let _load_guard = begin_plugin_load(&canonical_path)?;
         let loaded = PluginManager::load_plugin(&canonical_path)?;
         let plugin_manifest = loaded.manifest().clone();
 
         let result = {
             let singleton = instance();
-            let mut manager = singleton.inner.lock().unwrap();
+            let mut manager = singleton.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
                 Err(PluginManagerError::PluginAlreadyLoaded {
@@ -297,106 +466,205 @@ pub mod Factory {
                     id: existing_id,
                 })
             } else {
-                let catalog = manager.catalog_with_manifest(&plugin_manifest)?;
-                Ok(manager.insert_loaded_plugin(&canonical_path, loaded, catalog))
+                match manager.catalog_with_manifest(&plugin_manifest) {
+                    Ok(catalog) =>
+                        Ok(manager.insert_loaded_plugin(&canonical_path, loaded, catalog)),
+                    Err(error) => Err(error),
+                }
             }
         };
 
-        // On a duplicate or catalog error `loaded` was not consumed and is therefore dropped here,
-        // outside the manager lock, so its on_unload() callback cannot re-enter the locked manager.
         result
     }
 
     pub fn load_plugins(plugin_path: &str) -> Result<usize, PluginManagerError> {
+        let report = load_plugins_with_policy(plugin_path, PluginLoadPolicy::required_all())?;
+        Ok(report.loaded_count())
+    }
+
+    pub fn load_plugins_with_policy(
+        plugin_path: &str,
+        policy: PluginLoadPolicy
+    ) -> Result<PluginLoadReport, PluginManagerError> {
         let entries = PluginManager::discover_plugin_paths(plugin_path)?;
-        let mut loaded_count = 0usize;
-        let mut had_entries = false;
+        let mut report = PluginLoadReport {
+            requested_path: PathBuf::from(plugin_path),
+            ..PluginLoadReport::default()
+        };
 
         for entry in entries {
             let canonical_path = match entry {
-                Ok(path) => {
-                    had_entries = true;
-                    path
-                }
+                Ok(path) => path,
                 Err(error) => {
-                    Common::Logging::Logger::Log::Dump(
-                        "{}",
-                        Common::Logging::LogConstants::LOGGERDEF,
-                        log::LevelFilter::Error,
-                        &[&format!("Plugin scan failed: {error}")]
-                    );
+                    report.failures.push(PluginLoadFailure {
+                        path: PathBuf::from(plugin_path),
+                        plugin_name: None,
+                        requirement: policy.default_requirement,
+                        error,
+                    });
                     continue;
                 }
             };
+            report.discovered.push(canonical_path.clone());
 
             {
                 let singleton = instance();
-                let manager = singleton.inner.lock().unwrap();
+                let manager = singleton.inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if manager.paths.contains_key(&canonical_path) {
+                    report.skipped_already_loaded.push(canonical_path);
                     continue;
                 }
             }
 
-            let loaded = match PluginManager::load_plugin(&canonical_path) {
-                Ok(loaded) => loaded,
+            let path_requirement = policy.requirement_for_path(&canonical_path);
+            let _load_guard = match begin_plugin_load(&canonical_path) {
+                Ok(guard) => guard,
                 Err(error) => {
-                    Common::Logging::Logger::Log::Dump(
-                        "{}",
-                        Common::Logging::LogConstants::LOGGERDEF,
-                        log::LevelFilter::Error,
-                        &[&format!("Plugin loading failed: {error}")]
-                    );
+                    report.failures.push(PluginLoadFailure {
+                        path: canonical_path,
+                        plugin_name: None,
+                        requirement: path_requirement,
+                        error: error.to_string(),
+                    });
                     continue;
                 }
             };
+
+            let loaded = match PluginManager::load_plugin(&canonical_path) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    let error_text = error.to_string();
+                    report.failures.push(PluginLoadFailure {
+                        path: canonical_path,
+                        plugin_name: None,
+                        requirement: path_requirement,
+                        error: error_text,
+                    });
+                    continue;
+                }
+            };
+
             let manifest = loaded.manifest().clone();
+            let manifest_requirement = policy.requirement_for_name(&manifest.name);
+            let requirement = if
+                path_requirement == PluginRequirement::Required ||
+                manifest_requirement == PluginRequirement::Required
+            {
+                PluginRequirement::Required
+            } else {
+                PluginRequirement::Optional
+            };
+            let plugin_name = manifest.name.clone();
 
             let registration = {
                 let singleton = instance();
-                let mut manager = singleton.inner.lock().unwrap();
+                let mut manager = singleton.inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
-                    Err((
-                        PluginManagerError::PluginAlreadyLoaded {
-                            path: canonical_path.clone(),
-                            id: existing_id,
-                        },
-                        loaded,
-                    ))
+                    Err(PluginManagerError::PluginAlreadyLoaded {
+                        path: canonical_path.clone(),
+                        id: existing_id,
+                    })
                 } else {
                     match manager.catalog_with_manifest(&manifest) {
                         Ok(catalog) =>
                             Ok(manager.insert_loaded_plugin(&canonical_path, loaded, catalog)),
-                        Err(error) => Err((error, loaded)),
+                        Err(error) => Err(error),
                     }
                 }
             };
 
             match registration {
-                Ok(_) => {
-                    loaded_count += 1;
-                }
-                Err((error, _loaded)) => {
-                    Common::Logging::Logger::Log::Dump(
-                        "{}",
-                        Common::Logging::LogConstants::LOGGERDEF,
-                        log::LevelFilter::Error,
-                        &[&format!("Plugin registration failed: {error}")]
-                    );
-                }
+                Ok(_) => report.loaded.push(plugin_name),
+                Err(error) =>
+                    report.failures.push(PluginLoadFailure {
+                        path: canonical_path,
+                        plugin_name: Some(plugin_name),
+                        requirement,
+                        error: error.to_string(),
+                    }),
             }
         }
 
-        if loaded_count == 0 && !had_entries {
+        let loaded_names = loaded_plugin_names();
+        for (configured_name, requirement) in &policy.overrides {
+            if *requirement != PluginRequirement::Required {
+                continue;
+            }
+
+            let present =
+                loaded_names
+                    .iter()
+                    .any(|loaded_name| normalize_plugin_name(loaded_name) == *configured_name) ||
+                report.loaded
+                    .iter()
+                    .any(|loaded_name| normalize_plugin_name(loaded_name) == *configured_name);
+
+            if !present {
+                report.failures.push(PluginLoadFailure {
+                    path: PathBuf::from(plugin_path),
+                    plugin_name: Some(configured_name.clone()),
+                    requirement: PluginRequirement::Required,
+                    error: format!("required plugin '{}' was not discovered or loaded", configured_name),
+                });
+            }
+        }
+
+        if report.discovered.is_empty() && report.failures.is_empty() {
             Common::Logging::Logger::Log::Dump(
                 "{}",
                 Common::Logging::LogConstants::LOGGERDEF,
                 log::LevelFilter::Warn,
-                &["No plugins were found in the configured plugin directory."]
+                &[
+                    &format!("No plugin libraries were found in the configured directory '{}'.", plugin_path),
+                ]
             );
         }
 
-        Ok(loaded_count)
+        for failure in &report.failures {
+            let level = match failure.requirement {
+                PluginRequirement::Required => log::LevelFilter::Error,
+                PluginRequirement::Optional => log::LevelFilter::Warn,
+            };
+            Common::Logging::Logger::Log::Dump(
+                "{}",
+                Common::Logging::LogConstants::LOGGERDEF,
+                level,
+                &[
+                    &format!(
+                        "{} plugin '{}' at '{}' could not be loaded: {}",
+                        match failure.requirement {
+                            PluginRequirement::Required => "Required",
+                            PluginRequirement::Optional => "Optional",
+                        },
+                        failure.plugin_name.as_deref().unwrap_or("unknown"),
+                        failure.path.display(),
+                        failure.error
+                    ),
+                ]
+            );
+        }
+
+        Common::Logging::Logger::Log::Dump(
+            "{}",
+            Common::Logging::LogConstants::LOGGERDEF,
+            if report.has_required_failures() {
+                log::LevelFilter::Error
+            } else {
+                log::LevelFilter::Info
+            },
+            &[&report.summary()]
+        );
+
+        if report.has_required_failures() {
+            return Err(PluginManagerError::PluginLoadPolicyViolation { report });
+        }
+
+        Ok(report)
     }
 
     pub fn load_plugin_if_missing(
@@ -413,7 +681,7 @@ pub mod Factory {
     /// MolgenDB or any other specific database implementation.
     pub fn has_database_plugin() -> bool {
         let singleton = instance();
-        let manager = singleton.inner.lock().unwrap();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         manager
             .plugin_ids()
@@ -435,7 +703,7 @@ pub mod Factory {
     {
         let (runtimes, names) = {
             let singleton = instance();
-            let manager = singleton.inner.lock().unwrap();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
             let mut runtimes = Vec::new();
             let mut names = Vec::new();
@@ -491,7 +759,7 @@ pub mod Factory {
                 )
             )?;
 
-        let mut loaded_count = 0usize;
+        let mut directories = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error|
                 format!(
@@ -500,10 +768,14 @@ pub mod Factory {
                 )
             )?;
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
+            if path.is_dir() {
+                directories.push(path);
             }
+        }
+        directories.sort();
 
+        let mut loaded_count = 0usize;
+        for path in directories {
             let path = path.to_string_lossy().into_owned();
             loaded_count += load_plugins(&path).map_err(|error|
                 format!("failed to load database plugins from '{}': {error}", path)
@@ -522,7 +794,7 @@ pub mod Factory {
 
         let runtime = {
             let singleton = instance();
-            let manager = singleton.inner.lock().unwrap();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let id = manager
                 .plugin_ids()
                 .into_iter()
@@ -540,7 +812,7 @@ pub mod Factory {
 
     pub fn plugin_catalog() -> PluginCatalog {
         let singleton = instance();
-        let manager = singleton.inner.lock().unwrap();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let catalog = manager.catalog();
         catalog
@@ -549,7 +821,7 @@ pub mod Factory {
     pub fn with_all_plugins<R, F>(func: F) -> Option<Vec<R>> where F: Fn(&mut dyn IPlugin) -> R {
         let runtimes = {
             let singleton = instance();
-            let manager = singleton.inner.lock().unwrap();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let ids = manager.plugin_ids();
             if ids.is_empty() {
                 return None;
@@ -630,7 +902,7 @@ pub mod Factory {
 
     pub fn loaded_plugin_names() -> Vec<String> {
         let singleton = instance();
-        let manager = singleton.inner.lock().unwrap();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         manager
             .plugin_ids()
@@ -641,13 +913,13 @@ pub mod Factory {
 
     pub fn loaded_plugin_ids() -> Vec<i64> {
         let singleton = instance();
-        let manager = singleton.inner.lock().unwrap();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         manager.plugin_ids()
     }
 
     pub fn plugin_count() -> usize {
         let singleton = instance();
-        let manager = singleton.inner.lock().unwrap();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         manager.plugin_count()
     }
 
@@ -679,7 +951,7 @@ pub mod Factory {
 
         let runtime = {
             let singleton = instance();
-            let manager = singleton.inner.lock().unwrap();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let id = manager
                 .plugin_ids()
                 .into_iter()
@@ -713,5 +985,55 @@ pub mod Factory {
                     &format!("Plugin '{}' is not available in the system", plugin_name)
                 )
             )?
+    }
+}
+
+#[cfg(test)]
+mod load_policy_tests {
+    use super::Factory::{ PluginLoadPolicy, PluginRequirement };
+    use std::path::Path;
+
+    #[test]
+    fn explicit_plugin_requirement_overrides_default_by_name_and_path() {
+        let policy = PluginLoadPolicy::optional_all().require("ProcessTracker");
+        assert_eq!(policy.requirement_for_name("processtracker"), PluginRequirement::Required);
+        assert_eq!(
+            policy.requirement_for_path(Path::new("/plugins/ProcessTracker.so")),
+            PluginRequirement::Required
+        );
+        assert_eq!(
+            policy.requirement_for_path(Path::new("/plugins/VariantFilter.so")),
+            PluginRequirement::Optional
+        );
+    }
+}
+
+#[cfg(test)]
+mod load_report_tests {
+    use super::Factory::{ PluginLoadFailure, PluginLoadReport, PluginRequirement };
+    use std::path::PathBuf;
+
+    #[test]
+    fn report_distinguishes_required_and_optional_failures() {
+        let mut report = PluginLoadReport {
+            requested_path: PathBuf::from("/plugins"),
+            ..PluginLoadReport::default()
+        };
+        report.failures.push(PluginLoadFailure {
+            path: PathBuf::from("/plugins/optional.so"),
+            plugin_name: Some("Optional".to_owned()),
+            requirement: PluginRequirement::Optional,
+            error: "load failed".to_owned(),
+        });
+        assert!(report.is_success());
+
+        report.failures.push(PluginLoadFailure {
+            path: PathBuf::from("/plugins/required.so"),
+            plugin_name: Some("Required".to_owned()),
+            requirement: PluginRequirement::Required,
+            error: "load failed".to_owned(),
+        });
+        assert!(!report.is_success());
+        assert_eq!(report.required_failures().len(), 1);
     }
 }

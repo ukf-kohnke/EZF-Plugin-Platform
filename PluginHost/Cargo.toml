@@ -1,0 +1,19 @@
+[package]
+name = "PluginHost"
+version = "3.4.1"
+edition = "2024"
+authors = ["Anselm Hoppmann <anselm.hoppmann@uniklinik-freiburg.de>", "Georg Kohnke <georg.kohnke@uniklinik-freiburg.de>", "Frederik Voigt <frederik.voigt@uniklinik-freiburg.de>", "Jonas Gassenschmidt <jonas.gassenschmidt@uniklinik-freiburg.de>"]
+description = "Dynamic plugin host and lifecycle runtime for EZF-Backend"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hoppmann/EZF-Backend.git"
+
+[dependencies]
+DatabaseContracts = { path = "../DatabaseContracts" }
+PluginAbi = { path = "../PluginAbi" }
+PluginContracts = { path = "../PluginContracts" }
+Common = { path = "../Common", features = ["docker"] }
+glob = "0.3.1"
+libloading = "0.8.3"
+log = "0.4.20"
+serde = "1.0"
+serde_json = "1.0"

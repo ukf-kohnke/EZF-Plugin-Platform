@@ -18,23 +18,35 @@ use PluginAbi::{
     PLUGIN_STATUS_NOT_INITIALIZED,
     PLUGIN_STATUS_OK,
 };
-use std::{ collections::HashMap, path::{ Path, PathBuf }, sync::{ Arc, Mutex } };
+use std::{
+    collections::HashMap,
+    path::{ Path, PathBuf },
+    sync::{ Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, atomic::{ AtomicBool, Ordering } },
+};
 
 const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
 
 /// Runtime state of one loaded plugin.
 ///
-/// The dynamic library and opaque plugin instance remain together so executable code cannot be
-/// unloaded while a runtime handle is still reachable. All interaction with the plugin happens
-/// through the versioned C-compatible ABI and serialized byte payloads.
+/// The dynamic library and opaque plugin instance remain together. Request calls hold a shared
+/// read lock, so independent calls can execute concurrently. Unload takes the exclusive write
+/// lock and therefore waits until every in-flight plugin call has returned before invoking
+/// `on_unload`, destroying the instance, and allowing the runtime to be dropped.
 pub(crate) struct PluginRuntime {
+    state: RwLock<PluginRuntimeState>,
+    unloading: AtomicBool,
+}
+
+struct PluginRuntimeState {
     instance: Option<*mut PluginInstanceV1>,
     #[allow(dead_code)]
     library: Library,
 }
 
-// Raw instance pointers are only touched while PluginRuntime is protected by its mutex. The
-// plugin implementation remains Send + Sync internally, and the ABI exposes no Rust references.
+// Raw instance pointers are only dereferenced while the PluginRuntime state is protected by the
+// RwLock. Plugin implementations are Send + Sync, and the ABI exposes no Rust references.
+unsafe impl Send for PluginRuntimeState {}
+unsafe impl Sync for PluginRuntimeState {}
 unsafe impl Send for PluginRuntime {}
 unsafe impl Sync for PluginRuntime {}
 
@@ -70,7 +82,6 @@ impl PluginRuntime {
             return Err("plugin vtable reported an incompatible ABI layout".to_owned());
         }
 
-        let function_pointer_bytes = |pointer: usize| pointer != 0;
         let pointers = [
             vtable.name as usize,
             vtable.manifest as usize,
@@ -83,26 +94,36 @@ impl PluginRuntime {
             vtable.free_buffer as usize,
             vtable.destroy as usize,
         ];
-        if pointers.iter().any(|pointer| !function_pointer_bytes(*pointer)) {
+        if pointers.iter().any(|pointer| *pointer == 0) {
             return Err("plugin vtable contains a null function pointer".to_owned());
         }
 
-        Ok(Self { instance: Some(instance), library })
+        Ok(Self {
+            state: RwLock::new(PluginRuntimeState {
+                instance: Some(instance),
+                library,
+            }),
+            unloading: AtomicBool::new(false),
+        })
     }
 
-    pub(crate) fn execute<R, F>(runtime: &Arc<Mutex<Self>>, func: F) -> Option<R>
-        where F: FnOnce(&mut Self) -> R
+    fn read_state(&self) -> RwLockReadGuard<'_, PluginRuntimeState> {
+        self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_state(&self) -> RwLockWriteGuard<'_, PluginRuntimeState> {
+        self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with_instance<R, F>(&self, func: F) -> Result<R, String>
+        where F: FnOnce(*mut std::ffi::c_void, &PluginVTableV1) -> R
     {
-        let mut runtime = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if runtime.instance.is_none() {
-            return None;
+        let state = self.read_state();
+        if self.unloading.load(Ordering::Acquire) {
+            return Err("plugin runtime is unloading".to_owned());
         }
-        Some(func(&mut runtime))
-    }
 
-    fn abi_parts_from_instance(
-        instance: *mut PluginInstanceV1
-    ) -> Result<(*mut std::ffi::c_void, &'static PluginVTableV1), String> {
+        let instance = state.instance.ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
         let instance_ref = unsafe { &*instance };
         if instance_ref.vtable.is_null() || instance_ref.context.is_null() {
             return Err("plugin runtime contains invalid ABI pointers".to_owned());
@@ -111,101 +132,105 @@ impl PluginRuntime {
         if !vtable.is_compatible() {
             return Err("plugin runtime contains an incompatible ABI vtable".to_owned());
         }
-        Ok((instance_ref.context, vtable))
+        Ok(func(instance_ref.context, vtable))
     }
 
-    fn abi_parts(&self) -> Result<(*mut std::ffi::c_void, &PluginVTableV1), String> {
-        let instance = self.instance.ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
-        Self::abi_parts_from_instance(instance)
-    }
+    fn call_buffer<F>(&self, select_call: F) -> Result<Vec<u8>, String>
+        where
+            F: FnOnce(
+                &PluginVTableV1
+            ) -> unsafe extern "C" fn(*mut std::ffi::c_void, *mut AbiBuffer) -> i32
+    {
+        self.with_instance(|context, vtable| {
+            let mut response = AbiBuffer::EMPTY;
+            let status = unsafe { select_call(vtable)(context, &mut response) };
+            if status != PLUGIN_STATUS_OK {
+                if Self::is_valid_buffer(response) && !response.ptr.is_null() {
+                    unsafe {
+                        (vtable.free_buffer)(response);
+                    }
+                }
+                return Err(format!("plugin ABI call failed with status {status}"));
+            }
 
-    fn take_buffer(&self, buffer: AbiBuffer) -> Result<Vec<u8>, String> {
-        if !Self::is_valid_buffer(buffer) {
-            return Err("plugin returned an invalid response buffer".to_owned());
-        }
+            if !Self::is_valid_buffer(response) {
+                return Err("plugin returned an invalid response buffer".to_owned());
+            }
 
-        let (_, vtable) = self.abi_parts()?;
-        let bytes = (unsafe { buffer.to_vec() }).ok_or_else(||
-            "plugin returned an invalid response buffer".to_owned()
-        )?;
-        unsafe {
-            (vtable.free_buffer)(buffer);
-        }
-        Ok(bytes)
-    }
-
-    fn free_response_if_valid(&self, response: AbiBuffer) {
-        if response.ptr.is_null() || !Self::is_valid_buffer(response) {
-            return;
-        }
-        if let Ok((_, vtable)) = self.abi_parts() {
+            let bytes = (unsafe { response.to_vec() }).ok_or_else(||
+                "plugin returned an invalid response buffer".to_owned()
+            )?;
             unsafe {
                 (vtable.free_buffer)(response);
             }
-        }
+            Ok(bytes)
+        })?
     }
 
-    fn call_buffer(
-        &self,
-        call: unsafe extern "C" fn(*mut std::ffi::c_void, *mut AbiBuffer) -> i32
-    ) -> Result<Vec<u8>, String> {
-        let (context, _) = self.abi_parts()?;
-        let mut response = AbiBuffer::EMPTY;
-        let status = unsafe { call(context, &mut response) };
-        if status != PLUGIN_STATUS_OK {
-            self.free_response_if_valid(response);
-            return Err(format!("plugin ABI call failed with status {status}"));
-        }
-        self.take_buffer(response)
-    }
-
-    fn call_json<T: Serialize, R: DeserializeOwned>(
+    fn call_json<T: Serialize, R: DeserializeOwned, F>(
         &self,
         request: &T,
-        call: PluginEndpointFnV1
-    ) -> Result<R, String> {
+        select_call: F
+    ) -> Result<R, String>
+        where F: FnOnce(&PluginVTableV1) -> PluginEndpointFnV1
+    {
         let request_bytes = serde_json
             ::to_vec(request)
             .map_err(|error| format!("failed to encode plugin request: {error}"))?;
-        let (context, _) = self.abi_parts()?;
-        let mut response = AbiBuffer::EMPTY;
-        let status = unsafe { call(context, AbiSlice::from_bytes(&request_bytes), &mut response) };
-        if status != PLUGIN_STATUS_OK {
-            self.free_response_if_valid(response);
-            return Err(format!("plugin ABI call failed with status {status}"));
-        }
-        let bytes = self.take_buffer(response)?;
-        serde_json
-            ::from_slice(&bytes)
-            .map_err(|error| format!("failed to decode plugin response: {error}"))
+
+        self.with_instance(|context, vtable| {
+            let mut response = AbiBuffer::EMPTY;
+            let status = unsafe {
+                select_call(vtable)(context, AbiSlice::from_bytes(&request_bytes), &mut response)
+            };
+            if status != PLUGIN_STATUS_OK {
+                if Self::is_valid_buffer(response) && !response.ptr.is_null() {
+                    unsafe {
+                        (vtable.free_buffer)(response);
+                    }
+                }
+                return Err(format!("plugin ABI call failed with status {status}"));
+            }
+
+            if !Self::is_valid_buffer(response) {
+                return Err("plugin returned an invalid response buffer".to_owned());
+            }
+
+            let bytes = (unsafe { response.to_vec() }).ok_or_else(||
+                "plugin returned an invalid response buffer".to_owned()
+            )?;
+            unsafe {
+                (vtable.free_buffer)(response);
+            }
+            serde_json
+                ::from_slice(&bytes)
+                .map_err(|error| format!("failed to decode plugin response: {error}"))
+        })?
     }
 
     pub(crate) fn name(&self) -> Result<String, String> {
-        let (_, vtable) = self.abi_parts()?;
-        let name = vtable.name;
-        let bytes = self.call_buffer(name)?;
+        let bytes = self.call_buffer(|vtable| vtable.name)?;
         serde_json
             ::from_slice(&bytes)
             .map_err(|error| format!("failed to decode plugin name: {error}"))
     }
 
     pub(crate) fn manifest(&self) -> Result<PluginManifest, String> {
-        let (_, vtable) = self.abi_parts()?;
-        let manifest = vtable.manifest;
-        let bytes = self.call_buffer(manifest)?;
+        let bytes = self.call_buffer(|vtable| vtable.manifest)?;
         serde_json
             ::from_slice(&bytes)
             .map_err(|error| format!("failed to decode plugin manifest: {error}"))
     }
 
     pub(crate) fn is_loaded(&self) -> Result<bool, String> {
-        let (context, vtable) = self.abi_parts()?;
-        let status = unsafe { (vtable.is_loaded)(context) };
-        match status {
-            PLUGIN_STATUS_OK => Ok(true),
-            PLUGIN_STATUS_NOT_INITIALIZED => Ok(false),
-            _ => Err(format!("plugin ABI is_loaded call failed with status {status}")),
-        }
+        self.with_instance(|context, vtable| {
+            let status = unsafe { (vtable.is_loaded)(context) };
+            match status {
+                PLUGIN_STATUS_OK => Ok(true),
+                PLUGIN_STATUS_NOT_INITIALIZED => Ok(false),
+                _ => Err(format!("plugin ABI is_loaded call failed with status {status}")),
+            }
+        })?
     }
 
     pub(crate) fn handle_endpoint(
@@ -215,27 +240,12 @@ impl PluginRuntime {
         PluginContracts::ApiContract::PluginEndpointResponse,
         PluginContracts::ApiContract::PluginEndpointError
     > {
-        let (_, vtable) = self
-            .abi_parts()
+        self
+            .call_json::<_, Result<_, _>, _>(&request, |vtable| vtable.handle_endpoint)
             .map_err(|error|
                 PluginContracts::ApiContract::PluginEndpointError::internal(
                     "plugin_abi_error",
                     "The plugin ABI call failed",
-                    &error
-                )
-            )?;
-        self
-            .call_json::<
-                _,
-                Result<
-                    PluginContracts::ApiContract::PluginEndpointResponse,
-                    PluginContracts::ApiContract::PluginEndpointError
-                >
-            >(&request, vtable.handle_endpoint)
-            .map_err(|error|
-                PluginContracts::ApiContract::PluginEndpointError::internal(
-                    "plugin_abi_error",
-                    "The plugin ABI response could not be decoded",
                     &error
                 )
             )?
@@ -245,15 +255,10 @@ impl PluginRuntime {
         &self,
         context: &PluginContracts::ApiContract::PluginSessionContext
     ) -> Result<(), PluginContracts::ApiContract::PluginLifecycleError> {
-        let (_, vtable) = self
-            .abi_parts()
-            .map_err(|error|
-                PluginContracts::ApiContract::PluginLifecycleError::new("plugin_abi_error", error)
-            )?;
         self
-            .call_json::<_, Result<(), PluginContracts::ApiContract::PluginLifecycleError>>(
+            .call_json::<_, Result<(), PluginContracts::ApiContract::PluginLifecycleError>, _>(
                 context,
-                vtable.on_session_closed
+                |vtable| vtable.on_session_closed
             )
             .map_err(|error|
                 PluginContracts::ApiContract::PluginLifecycleError::new("plugin_abi_error", error)
@@ -264,20 +269,8 @@ impl PluginRuntime {
         &self,
         request: DatabaseContracts::DatabaseRequest
     ) -> Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> {
-        let (_, vtable) = self
-            .abi_parts()
-            .map_err(|error|
-                DatabaseContracts::DatabaseError::new(
-                    DatabaseContracts::DatabaseErrorKind::Connection,
-                    error
-                )
-            )?;
-
         self
-            .call_json::<
-                _,
-                Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError>
-            >(&request, vtable.execute_database)
+            .call_json::<_, Result<_, _>, _>(&request, |vtable| vtable.execute_database)
             .map_err(|error|
                 DatabaseContracts::DatabaseError::new(
                     DatabaseContracts::DatabaseErrorKind::Decode,
@@ -286,25 +279,43 @@ impl PluginRuntime {
             )?
     }
 
-    fn unload(&mut self) -> bool {
-        let Some(instance) = self.instance else {
+    /// Quiesces the plugin by taking the exclusive runtime lock. Existing calls complete before
+    /// `on_unload` runs, and no new call can enter while unload is in progress.
+    fn unload(&self) -> bool {
+        if self.unloading.swap(true, Ordering::AcqRel) {
+            return self.state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .instance.is_none();
+        }
+
+        // The write lock is the quiescing barrier: every call that acquired the read lock before
+        // the unload marker was set must finish before this point. Calls starting afterwards see
+        // the marker in `with_instance` and are rejected without entering plugin code.
+        let mut state = self.write_state();
+        let Some(instance) = state.instance else {
             return true;
         };
 
-        let (context, on_unload, destroy) = match self.abi_parts() {
-            Ok((context, vtable)) => (context, vtable.on_unload, vtable.destroy),
-            Err(_) => {
-                return false;
-            }
-        };
-
-        let status = unsafe { on_unload(context) };
-        if status != PLUGIN_STATUS_OK {
+        let instance_ref = unsafe { &*instance };
+        if instance_ref.vtable.is_null() || instance_ref.context.is_null() {
+            self.unloading.store(false, Ordering::Release);
+            return false;
+        }
+        let vtable = unsafe { &*instance_ref.vtable };
+        if !vtable.is_compatible() {
+            self.unloading.store(false, Ordering::Release);
             return false;
         }
 
-        self.instance = None;
-        let destroy_status = unsafe { destroy(instance) };
+        let status = unsafe { (vtable.on_unload)(instance_ref.context) };
+        if status != PLUGIN_STATUS_OK {
+            self.unloading.store(false, Ordering::Release);
+            return false;
+        }
+
+        state.instance = None;
+        let destroy_status = unsafe { (vtable.destroy)(instance) };
         if destroy_status != PLUGIN_STATUS_OK {
             Common::Logging::Logger::Log::Dump(
                 "{}",
@@ -319,20 +330,19 @@ impl PluginRuntime {
 
 impl Drop for PluginRuntime {
     fn drop(&mut self) {
-        let Some(instance) = self.instance else {
+        self.unloading.store(true, Ordering::Release);
+        let mut state = self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(instance) = state.instance.take() else {
             return;
         };
 
-        let (context, on_unload, destroy) = match self.abi_parts() {
-            Ok((context, vtable)) => (context, vtable.on_unload, vtable.destroy),
-            Err(_) => {
-                return;
-            }
-        };
-
-        let _ = unsafe { on_unload(context) };
-        self.instance = None;
-        let _ = unsafe { destroy(instance) };
+        let instance_ref = unsafe { &*instance };
+        if instance_ref.vtable.is_null() || instance_ref.context.is_null() {
+            return;
+        }
+        let vtable = unsafe { &*instance_ref.vtable };
+        let _ = unsafe { (vtable.on_unload)(instance_ref.context) };
+        let _ = unsafe { (vtable.destroy)(instance) };
     }
 }
 
@@ -340,63 +350,43 @@ impl Drop for PluginRuntime {
 /// dynamic-library boundary is represented only by `PluginRuntime` and the stable ABI.
 #[derive(Clone)]
 pub struct PluginProxy {
-    runtime: Arc<Mutex<PluginRuntime>>,
+    runtime: Arc<PluginRuntime>,
 }
 
 impl PluginProxy {
-    pub(crate) fn new(runtime: Arc<Mutex<PluginRuntime>>) -> Self {
+    pub(crate) fn new(runtime: Arc<PluginRuntime>) -> Self {
         Self { runtime }
     }
 }
 
 impl IPlugin for PluginProxy {
     fn execute_database(
-        &mut self,
+        &self,
         request: DatabaseContracts::DatabaseRequest
     ) -> Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> {
-        PluginRuntime::execute(&self.runtime, |runtime|
-            runtime.execute_database(request)
-        ).unwrap_or_else(||
-            Err(DatabaseContracts::DatabaseError::unsupported("plugin runtime is unavailable"))
-        )
+        self.runtime.execute_database(request)
     }
 
     fn isLoaded(&self) -> bool {
-        PluginRuntime::execute(&self.runtime, |runtime| runtime.is_loaded())
-            .and_then(Result::ok)
-            .unwrap_or(false)
+        self.runtime.is_loaded().unwrap_or(false)
     }
 
     fn manifest(&self) -> PluginManifest {
-        PluginRuntime::execute(&self.runtime, |runtime| runtime.manifest())
-            .and_then(Result::ok)
-            .unwrap_or_else(|| PluginManifest::without_api("UnavailablePlugin"))
+        self.runtime.manifest().unwrap_or_else(|_| PluginManifest::without_api("UnavailablePlugin"))
     }
 
     fn handle_endpoint(
-        &mut self,
+        &self,
         request: PluginContracts::ApiContract::PluginEndpointRequest
     ) -> Result<
         PluginContracts::ApiContract::PluginEndpointResponse,
         PluginContracts::ApiContract::PluginEndpointError
     > {
-        PluginRuntime::execute(&self.runtime, |runtime|
-            runtime.handle_endpoint(request)
-        ).unwrap_or_else(||
-            Err(
-                PluginContracts::ApiContract::PluginEndpointError::internal(
-                    "plugin_unavailable",
-                    "The plugin is no longer available",
-                    "plugin runtime is unavailable"
-                )
-            )
-        )
+        self.runtime.handle_endpoint(request)
     }
 
     fn name(&self) -> String {
-        PluginRuntime::execute(&self.runtime, |runtime| runtime.name())
-            .and_then(Result::ok)
-            .unwrap_or_else(|| "UnavailablePlugin".to_owned())
+        self.runtime.name().unwrap_or_else(|_| "UnavailablePlugin".to_owned())
     }
 
     fn to_box(&self) -> Box<dyn IPlugin> {
@@ -415,30 +405,21 @@ impl IPlugin for PluginProxy {
     }
 
     fn on_unload(&mut self) -> bool {
-        PluginRuntime::execute(&self.runtime, |runtime| runtime.unload()).unwrap_or(false)
+        self.runtime.unload()
     }
 
     fn on_session_closed(
-        &mut self,
+        &self,
         context: &PluginContracts::ApiContract::PluginSessionContext
     ) -> Result<(), PluginContracts::ApiContract::PluginLifecycleError> {
-        PluginRuntime::execute(&self.runtime, |runtime|
-            runtime.on_session_closed(context)
-        ).unwrap_or_else(||
-            Err(
-                PluginContracts::ApiContract::PluginLifecycleError::new(
-                    "plugin_unavailable",
-                    "plugin runtime is unavailable"
-                )
-            )
-        )
+        self.runtime.on_session_closed(context)
     }
 }
 
 pub(crate) struct PluginItem {
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     manifest: PluginManifest,
-    runtime: Arc<Mutex<PluginRuntime>>,
+    runtime: Arc<PluginRuntime>,
 }
 
 impl PluginItem {
@@ -446,13 +427,12 @@ impl PluginItem {
         &self.manifest
     }
 
-    pub(crate) fn runtime(&self) -> Arc<Mutex<PluginRuntime>> {
+    pub(crate) fn runtime(&self) -> Arc<PluginRuntime> {
         Arc::clone(&self.runtime)
     }
 
     pub(crate) fn unload(&mut self) -> bool {
-        let mut runtime = self.runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        runtime.unload()
+        self.runtime.unload()
     }
 }
 
@@ -472,7 +452,7 @@ impl PluginManager {
         self.plugins.len()
     }
 
-    pub(crate) fn get_runtime(&self, id: i64) -> Option<Arc<Mutex<PluginRuntime>>> {
+    pub(crate) fn get_runtime(&self, id: i64) -> Option<Arc<PluginRuntime>> {
         self.plugins.get(&id).map(PluginItem::runtime)
     }
 
@@ -547,7 +527,7 @@ impl PluginManager {
         let item = PluginItem {
             path: canonical_path.to_path_buf(),
             manifest: loaded.manifest.clone(),
-            runtime: Arc::new(Mutex::new(loaded.runtime)),
+            runtime: Arc::new(loaded.runtime),
         };
 
         self.plugins.insert(id, item);

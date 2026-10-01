@@ -222,3 +222,105 @@ fn loading_is_deterministic_and_optional_failures_are_reported_without_aborting(
 
     let _ = fs::remove_dir_all(&empty);
 }
+
+#[test]
+fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
+    let _test_guard = TEST_LOCK.lock().expect("test lock must not be poisoned");
+    let library = build_fixture();
+    let id = Factory::load_plugin_file(&library).expect("fixture library must load");
+
+    fn slow_request() -> PluginEndpointRequest {
+        PluginEndpointRequest {
+            endpoint_id: "slow".to_owned(),
+            method: PluginHttpMethod::Get,
+            raw_path: "/pluginhost-integration/slow".to_owned(),
+            base_path: "/".to_owned(),
+            raw_query: None,
+            content_type: None,
+            body: Vec::new(),
+            principal: PluginPrincipal {
+                user_id: "integration-test".to_owned(),
+                username: "integration-test".to_owned(),
+                given_name: "Integration".to_owned(),
+                family_name: "Test".to_owned(),
+                groups: Vec::new(),
+                session_id: "integration-session".to_owned(),
+            },
+        }
+    }
+
+    let first = std::thread::spawn(move || {
+        Factory::handle_endpoint("PluginHostIntegration", slow_request())
+            .expect("first concurrent endpoint call must succeed")
+    });
+    let second = std::thread::spawn(move || {
+        Factory::handle_endpoint("PluginHostIntegration", slow_request())
+            .expect("second concurrent endpoint call must succeed")
+    });
+
+    let first_response = first.join().expect("first endpoint thread must finish");
+    let second_response = second.join().expect("second endpoint thread must finish");
+
+    for response in [first_response, second_response] {
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body)
+            .expect("slow endpoint response must contain valid JSON");
+        assert!(body["peak_active"].as_u64().unwrap_or_default() >= 2);
+    }
+
+    cleanup_plugin(id);
+    let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn unload_waits_for_in_flight_plugin_calls_before_destroying_the_instance() {
+    let _test_guard = TEST_LOCK.lock().expect("test lock must not be poisoned");
+    let library = build_fixture();
+    let id = Factory::load_plugin_file(&library).expect("fixture library must load");
+
+    fn slow_request() -> PluginEndpointRequest {
+        PluginEndpointRequest {
+            endpoint_id: "slow".to_owned(),
+            method: PluginHttpMethod::Get,
+            raw_path: "/pluginhost-integration/slow".to_owned(),
+            base_path: "/".to_owned(),
+            raw_query: None,
+            content_type: None,
+            body: Vec::new(),
+            principal: PluginPrincipal {
+                user_id: "integration-test".to_owned(),
+                username: "integration-test".to_owned(),
+                given_name: "Integration".to_owned(),
+                family_name: "Test".to_owned(),
+                groups: Vec::new(),
+                session_id: "integration-session".to_owned(),
+            },
+        }
+    }
+
+    let marker = library.parent().unwrap().join("slow-entered.marker");
+    let _ = std::fs::remove_file(&marker);
+
+    let worker = std::thread::spawn(move || {
+        Factory::handle_endpoint("PluginHostIntegration", slow_request())
+            .expect("in-flight endpoint call must succeed")
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker.is_file() {
+        assert!(std::time::Instant::now() < deadline, "slow endpoint did not signal entry");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let started = std::time::Instant::now();
+    Factory::unload_plugin(id).expect("unload must wait for the active call");
+    let elapsed = started.elapsed();
+
+    let response = worker.join().expect("endpoint thread must finish");
+    assert_eq!(response.status, 200);
+    assert!(elapsed >= std::time::Duration::from_millis(150),
+        "unload returned before the in-flight call drained: {:?}", elapsed);
+    assert_eq!(Factory::plugin_count(), 0);
+
+    let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}

@@ -34,17 +34,18 @@
 //!
 //! # Concurrency notes
 //!
-//! The global mutex protects only plugin-manager state (registration, lookup,
-//! catalog and lifecycle bookkeeping). Plugin execution is synchronized by a
-//! per-plugin mutex after the manager lock has been released. This is important
-//! because a plugin may legitimately call back into the factory for another
-//! plugin, for example a domain plugin using the database plugin.
+//! The global mutex protects only plugin-manager state (registration, lookup, catalog and lifecycle
+//! bookkeeping). Each loaded plugin has its own read/write runtime gate: normal ABI calls take a
+//! shared read lock and can execute concurrently, while unload marks the runtime as quiescing,
+//! rejects new calls, and takes the exclusive write lock to drain all in-flight calls before
+//! lifecycle callbacks and instance destruction. A per-library lifecycle-operation guard also
+//! prevents load/unload races for the same dynamic library path.
 //!
 //! # Behavior notes
 //!
 //! - `load_plugin_if_missing` attempts lazy loading from the plugin root path.
 //! - Name-based lookup is the canonical way to select a plugin at runtime.
-//! - `with_plugin_by_name`, `with_all_plugins`, and `with_database_plugin` provide scoped mutable
+//! - `with_plugin_by_name`, `with_all_plugins`, and `with_database_plugin` provide scoped shared
 //!   access to plugin instances via closures. Database execution is selected by manifest capability.
 //!
 //! # Return conventions
@@ -356,7 +357,20 @@ pub mod Factory {
 
     #[allow(unused)]
     pub fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
-        // Detach under the manager lock, execute on_unload() without it, and only restore on failure.
+        // Reserve the library path for the whole unload operation. This prevents a concurrent
+        // reload/load of the same path from racing the final `Library` drop after quiescing.
+        let canonical_path = {
+            let singleton = instance();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            manager.plugins
+                .get(&id)
+                .map(|item| item.path.clone())
+                .ok_or(PluginManagerError::PluginNotFound { id })?
+        };
+        let _operation_guard = begin_plugin_operation(&canonical_path)?;
+
+        // Re-check membership after acquiring the operation guard because another lifecycle
+        // operation may have completed between the initial lookup and reservation.
         let mut item = {
             let singleton = instance();
             let mut manager = singleton.inner
@@ -402,34 +416,34 @@ pub mod Factory {
             )
     }
 
-    static PLUGIN_LOADS_IN_PROGRESS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    static PLUGIN_OPERATIONS_IN_PROGRESS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
-    fn loads_in_progress() -> &'static Mutex<BTreeSet<PathBuf>> {
-        PLUGIN_LOADS_IN_PROGRESS.get_or_init(|| Mutex::new(BTreeSet::new()))
+    fn plugin_operations_in_progress() -> &'static Mutex<BTreeSet<PathBuf>> {
+        PLUGIN_OPERATIONS_IN_PROGRESS.get_or_init(|| Mutex::new(BTreeSet::new()))
     }
 
-    struct PluginLoadGuard {
+    struct PluginOperationGuard {
         path: PathBuf,
     }
 
-    impl Drop for PluginLoadGuard {
+    impl Drop for PluginOperationGuard {
         fn drop(&mut self) {
-            let mut paths = loads_in_progress()
+            let mut paths = plugin_operations_in_progress()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             paths.remove(&self.path);
         }
     }
 
-    fn begin_plugin_load(path: &Path) -> Result<PluginLoadGuard, PluginManagerError> {
+    fn begin_plugin_operation(path: &Path) -> Result<PluginOperationGuard, PluginManagerError> {
         let canonical_path = PluginManager::normalize_path(path);
-        let mut paths = loads_in_progress()
+        let mut paths = plugin_operations_in_progress()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !paths.insert(canonical_path.clone()) {
             return Err(PluginManagerError::PluginLoadInProgress { path: canonical_path });
         }
-        Ok(PluginLoadGuard { path: canonical_path })
+        Ok(PluginOperationGuard { path: canonical_path })
     }
 
     pub fn load_plugin_file(path: &Path) -> Result<i64, PluginManagerError> {
@@ -450,7 +464,19 @@ pub mod Factory {
             }
         }
 
-        let _load_guard = begin_plugin_load(&canonical_path)?;
+        let _operation_guard = begin_plugin_operation(&canonical_path)?;
+
+        {
+            let singleton = instance();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
+                return Err(PluginManagerError::PluginAlreadyLoaded {
+                    path: canonical_path,
+                    id: existing_id,
+                });
+            }
+        }
+
         let loaded = PluginManager::load_plugin(&canonical_path)?;
         let plugin_manifest = loaded.manifest().clone();
 
@@ -519,7 +545,7 @@ pub mod Factory {
             }
 
             let path_requirement = policy.requirement_for_path(&canonical_path);
-            let _load_guard = match begin_plugin_load(&canonical_path) {
+            let _operation_guard = match begin_plugin_operation(&canonical_path) {
                 Ok(guard) => guard,
                 Err(error) => {
                     report.failures.push(PluginLoadFailure {
@@ -699,7 +725,7 @@ pub mod Factory {
     /// data-source plugins are loaded. Silent first-match selection would make the
     /// active database depend on plugin discovery order.
     pub fn with_database_plugin<R, F>(func: F) -> Result<R, String>
-        where F: FnOnce(&mut dyn IPlugin) -> R
+        where F: FnOnce(&dyn IPlugin) -> R
     {
         let (runtimes, names) = {
             let singleton = instance();
@@ -730,8 +756,8 @@ pub mod Factory {
         match runtimes.len() {
             0 => Err("no database data-source plugin is loaded".to_owned()),
             1 => {
-                let mut proxy = PluginProxy::new(runtimes[0].clone());
-                Ok(func(&mut proxy))
+                let proxy = PluginProxy::new(runtimes[0].clone());
+                Ok(func(&proxy))
             }
             _ =>
                 Err(
@@ -786,7 +812,7 @@ pub mod Factory {
     }
 
     pub fn with_plugin_by_name<R, F>(plugin_name: &str, func: F) -> Option<R>
-        where F: FnOnce(&mut dyn IPlugin) -> R
+        where F: FnOnce(&dyn IPlugin) -> R
     {
         if plugin_name.is_empty() {
             return None;
@@ -805,8 +831,8 @@ pub mod Factory {
         };
 
         {
-            let mut proxy = PluginProxy::new(runtime);
-            Some(func(&mut proxy))
+            let proxy = PluginProxy::new(runtime);
+            Some(func(&proxy))
         }
     }
 
@@ -818,7 +844,7 @@ pub mod Factory {
         catalog
     }
 
-    pub fn with_all_plugins<R, F>(func: F) -> Option<Vec<R>> where F: Fn(&mut dyn IPlugin) -> R {
+    pub fn with_all_plugins<R, F>(func: F) -> Option<Vec<R>> where F: Fn(&dyn IPlugin) -> R {
         let runtimes = {
             let singleton = instance();
             let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -835,8 +861,8 @@ pub mod Factory {
         let results = runtimes
             .into_iter()
             .filter_map(|runtime| {
-                let mut proxy = PluginProxy::new(runtime);
-                Some(func(&mut proxy))
+                let proxy = PluginProxy::new(runtime);
+                Some(func(&proxy))
             })
             .collect::<Vec<_>>();
 
@@ -869,7 +895,7 @@ pub mod Factory {
         for (plugin_name, runtime) in runtimes {
             let notification = catch_unwind(
                 AssertUnwindSafe(|| {
-                    let mut proxy = PluginProxy::new(runtime.clone());
+                    let proxy = PluginProxy::new(runtime.clone());
                     proxy.on_session_closed(context)
                 })
             );
@@ -976,15 +1002,7 @@ pub mod Factory {
                 )?
         };
 
-        crate::PluginManager::PluginRuntime
-            ::execute(&runtime, |plugin| plugin.handle_endpoint(request))
-            .ok_or_else(||
-                PluginEndpointError::not_found(
-                    "plugin_not_found",
-                    "The specified plugin could not be found",
-                    &format!("Plugin '{}' is not available in the system", plugin_name)
-                )
-            )?
+        runtime.handle_endpoint(request)
     }
 }
 

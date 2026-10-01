@@ -2,13 +2,13 @@
 use serde_json::Value;
 use serde::{ Deserialize, Serialize };
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterRoot {
     pub tablefilterquery: Tablefilterquery,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tablefilterquery {
     #[serde(rename = "type")]
@@ -17,7 +17,7 @@ pub struct Tablefilterquery {
     pub required: Vec<Value>,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Properties {
     pub sorting: Option<Sorting>,
@@ -26,7 +26,7 @@ pub struct Properties {
     pub endrow: Option<Endrow>,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sorting {
     #[serde(rename = "type")]
@@ -35,7 +35,7 @@ pub struct Sorting {
     pub order: String,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Filtering {
     #[serde(rename = "type")]
@@ -45,7 +45,7 @@ pub struct Filtering {
     pub columns: Vec<Column>,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Column {
     #[serde(rename = "type")]
@@ -55,7 +55,7 @@ pub struct Column {
     pub expression: String,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Startrow {
     #[serde(rename = "type")]
@@ -64,7 +64,7 @@ pub struct Startrow {
     pub minimum: i64,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Endrow {
     #[serde(rename = "type")]

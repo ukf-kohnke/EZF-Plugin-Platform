@@ -362,8 +362,12 @@ pub mod Factory {
 
     #[allow(unused)]
     pub fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
-        // Reserve the library path for the whole unload operation. This prevents a concurrent
-        // reload/load of the same path from racing the final `Library` drop after quiescing.
+        // Keep the plugin registered for the complete unload operation. `PluginRuntime::unload`
+        // transitions its health to `Stopping` before waiting for in-flight calls to drain.
+        // Keeping the registry entry visible makes that transient state observable through the
+        // public readiness/health APIs and prevents an active unload from looking like an empty,
+        // ready host. The operation guard still prevents a concurrent load/reload of the same
+        // canonical library path.
         let canonical_path = {
             let singleton = instance();
             let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -375,32 +379,37 @@ pub mod Factory {
         let _operation_guard = begin_plugin_operation(&canonical_path)?;
 
         // Re-check membership after acquiring the operation guard because another lifecycle
-        // operation may have completed between the initial lookup and reservation.
-        let mut item = {
+        // operation may have completed between the initial lookup and reservation. Only the
+        // runtime Arc is borrowed here; the registry entry itself stays in place until unload
+        // succeeds, so health snapshots can expose `Stopping`/failure states during the operation.
+        let runtime = {
             let singleton = instance();
-            let mut manager = singleton.inner
+            let manager = singleton.inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            manager.detach_plugin(id)?
+            manager.get_runtime(id).ok_or(PluginManagerError::PluginNotFound { id })?
         };
 
         let started = std::time::Instant::now();
-        if item.unload() {
+        if runtime.unload() {
             let elapsed = started.elapsed();
+            let removed_item = {
+                let singleton = instance();
+                let mut manager = singleton.inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                manager.detach_plugin(id)?
+            };
+
             Common::Logging::Logger::Log::Dump(
                 "{}",
                 Common::Logging::LogConstants::LOGGERDEF,
                 log::LevelFilter::Info,
                 &[&format!("Plugin unloaded successfully: id={} after {:?}", id, elapsed)]
             );
-            drop(item);
+            drop(removed_item);
             Ok(())
         } else {
-            let singleton = instance();
-            let mut manager = singleton.inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            manager.restore_plugin(id, item);
             Common::Logging::Logger::Log::Dump(
                 "{}",
                 Common::Logging::LogConstants::LOGGERDEF,
@@ -484,17 +493,9 @@ pub mod Factory {
     ) -> Result<i64, PluginManagerError> {
         let canonical_path = PluginManager::normalize_path(path);
 
-        {
-            let singleton = instance();
-            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
-                return Err(PluginManagerError::PluginAlreadyLoaded {
-                    path: canonical_path,
-                    id: existing_id,
-                });
-            }
-        }
-
+        // Reserve the canonical library path before inspecting the registry. This closes the
+        // unload/load race where an unload could remove the registry entry between the initial
+        // duplicate check and acquisition of the lifecycle operation guard.
         let _operation_guard = begin_plugin_operation(&canonical_path)?;
 
         {
@@ -593,18 +594,9 @@ pub mod Factory {
             };
             report.discovered.push(canonical_path.clone());
 
-            {
-                let singleton = instance();
-                let manager = singleton.inner
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if manager.paths.contains_key(&canonical_path) {
-                    report.skipped_already_loaded.push(canonical_path);
-                    continue;
-                }
-            }
-
             let path_requirement = policy.requirement_for_path(&canonical_path);
+            // Reserve the path before checking the registry for the same reason as the direct
+            // file-load path: a concurrent unload must not be able to create a reload window.
             let _operation_guard = match begin_plugin_operation(&canonical_path) {
                 Ok(guard) => guard,
                 Err(error) => {
@@ -617,6 +609,17 @@ pub mod Factory {
                     continue;
                 }
             };
+
+            {
+                let singleton = instance();
+                let manager = singleton.inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if manager.paths.contains_key(&canonical_path) {
+                    report.skipped_already_loaded.push(canonical_path);
+                    continue;
+                }
+            }
 
             let loaded = match PluginManager::load_plugin(&canonical_path, config) {
                 Ok(loaded) => loaded,

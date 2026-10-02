@@ -1,4 +1,9 @@
-use PluginContracts::ApiContract::{ PluginHttpMethod, PluginEndpointRequest, PluginPrincipal };
+use PluginContracts::ApiContract::{
+    PluginEndpointRequest,
+    PluginHttpMethod,
+    PluginPrincipal,
+    PluginSessionContext,
+};
 use PluginHost::Factory::{
     self,
     PluginHealthState,
@@ -493,6 +498,252 @@ fn unload_waits_for_in_flight_plugin_calls_before_destroying_the_instance() {
     let _ = std::fs::remove_dir_all(library.parent().unwrap());
 }
 
+#[test]
+fn p1_session_lifecycle_is_delivered_and_failures_are_reported() {
+    let _test_guard = lock_test();
+
+    let library = build_fixture();
+    let id = Factory::load_plugin_file(&library).expect("fixture library must load");
+    let context = PluginSessionContext::new("p1-session-123");
+
+    let report = Factory::notify_session_closed(&context);
+    assert_eq!(report.notified_plugins, vec!["PluginHostIntegration"]);
+    assert!(report.failures.is_empty());
+    assert!(
+        library
+            .parent()
+            .unwrap()
+            .join("session-closed-p1-session-123.marker")
+            .is_file(),
+        "the dynamic plugin must receive the sanitized session-close callback"
+    );
+
+    cleanup_plugin(id);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+
+    let library = build_fixture();
+    let previous = fixture_mode(Some("session_failure"));
+    let id = Factory::load_plugin_file(&library).expect("failure fixture must load");
+    restore_fixture_mode(previous);
+
+    let report = Factory::notify_session_closed(&PluginSessionContext::new("p1-session-failure"));
+    assert_eq!(report.notified_plugins, vec!["PluginHostIntegration"]);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].plugin_name, "PluginHostIntegration");
+    assert_eq!(report.failures[0].error.code, "fixture_session_failure");
+
+    cleanup_plugin(id);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn p1_readiness_state_matrix_covers_ready_stopping_failed_and_empty() {
+    let _test_guard = lock_test();
+
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_secs(2),
+        unload_timeout: std::time::Duration::from_secs(2),
+        max_concurrent_calls: 2,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config).expect("fixture library must load");
+    assert_eq!(
+        Factory::plugin_health_by_name("PluginHostIntegration").unwrap().state,
+        PluginHealthState::Ready
+    );
+    Factory::check_readiness().expect("ready plugin must pass readiness");
+
+    let marker = library.parent().unwrap().join("slow-entered.marker");
+    let _ = fs::remove_file(&marker);
+    let worker = std::thread::spawn(|| {
+        let mut request = ping_request();
+        request.endpoint_id = "slow".to_owned();
+        request.raw_path = "/pluginhost-integration/slow".to_owned();
+        Factory::handle_endpoint("PluginHostIntegration", request)
+            .expect("slow endpoint must remain valid while unload waits")
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker.is_file() {
+        assert!(std::time::Instant::now() < deadline, "slow endpoint did not signal entry");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let unload_thread = std::thread::spawn(move || Factory::unload_plugin(id));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut observed_stopping = false;
+    while std::time::Instant::now() < deadline {
+        if let Some(health) = Factory::plugin_health_by_name("PluginHostIntegration") {
+            if health.state == PluginHealthState::Stopping {
+                observed_stopping = true;
+                assert!(
+                    Factory::check_readiness().is_err(),
+                    "stopping plugin must fail readiness"
+                );
+                break;
+            }
+        }
+        std::thread::yield_now();
+    }
+    assert!(observed_stopping, "readiness matrix must expose the transient stopping state");
+
+    worker.join().expect("slow endpoint worker must finish");
+    unload_thread.join().expect("unload worker must finish").expect("unload must succeed");
+    assert!(Factory::check_readiness().is_ok(), "empty plugin set is ready for the host gate");
+
+    let library = build_fixture();
+    let previous = fixture_mode(Some("on_unload_failure"));
+    let id = Factory::load_plugin_file(&library).expect("failure fixture must load");
+    restore_fixture_mode(previous);
+
+    let unload_error = Factory::unload_plugin(id).expect_err("first unload must fail");
+    assert!(matches!(unload_error, PluginManagerError::PluginUnloadFailed { .. }));
+    let health = Factory::plugin_health_by_name("PluginHostIntegration")
+        .expect("failed plugin must remain registered for readiness inspection");
+    assert_eq!(health.state, PluginHealthState::Failed);
+    assert!(Factory::check_readiness().is_err(), "failed plugin must fail readiness");
+
+    Factory::unload_plugin(id).expect("retry after a failed unload must succeed");
+    assert!(Factory::check_readiness().is_ok(), "empty host must pass the readiness gate");
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn p1_discovery_symlink_and_path_aliases_are_canonicalized_once() {
+    let _test_guard = lock_test();
+
+    let library = build_fixture();
+    let actual_dir = library.parent().unwrap().to_path_buf();
+    let root = std::env::temp_dir().join(format!(
+        "ezf-pluginhost-p1-discovery-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("discovery root must be creatable");
+
+    let alias_dir = root.join("alias");
+    std::os::unix::fs::symlink(&actual_dir, &alias_dir)
+        .expect("unix directory symlink must work");
+
+    let report = Factory::load_plugins_with_policy(
+        alias_dir.to_str().unwrap(),
+        PluginLoadPolicy::required_all()
+    ).expect("aliased discovery must load the required plugin");
+
+    assert_eq!(report.loaded, vec!["PluginHostIntegration"]);
+    assert_eq!(report.discovered.len(), 1);
+    assert_eq!(report.discovered[0], library.canonicalize().unwrap());
+    assert!(report.failures.is_empty());
+
+    let loaded_id = Factory::loaded_plugin_ids()
+        .into_iter()
+        .next()
+        .expect("discovery must register the fixture");
+
+    let lexical_alias = alias_dir.join(".").join(library.file_name().unwrap());
+    let duplicate = Factory::load_plugin_file(&lexical_alias)
+        .expect_err("a lexical/symlink path alias must not load a second instance");
+    assert!(matches!(
+        duplicate,
+        PluginManagerError::PluginAlreadyLoaded { id, .. } if id == loaded_id
+    ));
+
+    cleanup_plugin(loaded_id);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn p1_timeout_recovers_to_ready_without_detaching_the_plugin() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_millis(50),
+        unload_timeout: std::time::Duration::from_secs(2),
+        max_concurrent_calls: 2,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config)
+        .expect("fixture library must load with a short call timeout");
+
+    let mut slow = ping_request();
+    slow.endpoint_id = "slow".to_owned();
+    slow.raw_path = "/pluginhost-integration/slow".to_owned();
+    let error = Factory::handle_endpoint("PluginHostIntegration", slow)
+        .expect_err("slow endpoint must exceed the configured timeout");
+    assert_eq!(error.status, 504);
+    assert_eq!(error.code, "plugin_timeout");
+
+    let degraded = Factory::plugin_health_by_name("PluginHostIntegration")
+        .expect("timed out plugin health must be available");
+    assert_eq!(degraded.state, PluginHealthState::Degraded);
+    assert_eq!(degraded.timed_out_calls, 1);
+    assert_eq!(degraded.active_calls, 1);
+    assert!(Factory::check_readiness().is_err(), "degraded plugin must fail readiness");
+
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    let response = Factory::handle_endpoint("PluginHostIntegration", ping_request())
+        .expect("a healthy call must recover the timed-out plugin");
+    assert_eq!(response.status, 200);
+
+    let recovered = Factory::plugin_health_by_name("PluginHostIntegration")
+        .expect("recovered plugin health must be available");
+    assert_eq!(recovered.state, PluginHealthState::Ready);
+    assert_eq!(recovered.active_calls, 0);
+    assert!(Factory::check_readiness().is_ok(), "recovered plugin must pass readiness");
+
+    cleanup_plugin(id);
+    assert_eq!(Factory::plugin_count(), 0);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn p1_lifetime_ordering_is_on_unload_before_destroy_and_after_quiescing() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let id = Factory::load_plugin_file(&library).expect("fixture library must load");
+
+    let marker = library.parent().unwrap().join("slow-entered.marker");
+    let _ = fs::remove_file(&marker);
+    let exited_marker = library.parent().unwrap().join("slow-exited.marker");
+    let _ = fs::remove_file(&exited_marker);
+    let mut request = ping_request();
+    request.endpoint_id = "slow".to_owned();
+    request.raw_path = "/pluginhost-integration/slow".to_owned();
+
+    let worker = std::thread::spawn(move || {
+        Factory::handle_endpoint("PluginHostIntegration", request)
+            .expect("in-flight request must finish before unload completes")
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker.is_file() {
+        assert!(std::time::Instant::now() < deadline, "slow endpoint did not signal entry");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let started = std::time::Instant::now();
+    Factory::unload_plugin(id).expect("plugin unload must succeed after quiescing");
+    let elapsed = started.elapsed();
+    assert!(
+        exited_marker.is_file(),
+        "unload must not return before the in-flight plugin callback exits"
+    );
+    let response = worker.join().expect("request worker must finish");
+    assert_eq!(response.status, 200);
+    assert!(elapsed >= std::time::Duration::from_millis(150));
+
+    let order_path = library.parent().unwrap().join("lifecycle.order");
+    let order = fs::read_to_string(&order_path).expect("lifecycle order log must exist");
+    let events: Vec<&str> = order.lines().collect();
+    assert_eq!(events, vec!["on_load", "on_unload", "on_destroy"]);
+    assert!(library.parent().unwrap().join("unload.marker").is_file());
+    assert!(library.parent().unwrap().join("destroy.marker").is_file());
+    assert_eq!(Factory::plugin_count(), 0);
+
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
 fn build_malformed_fixture() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
         "tests/pluginhost_malformed_abi_fixture/Cargo.toml"
@@ -951,28 +1202,34 @@ fn concurrent_load_and_unload_for_the_same_library_are_serialized_and_reload_rem
     let unload_id = id;
     let unload_thread = std::thread::spawn(move || Factory::unload_plugin(unload_id));
 
-    let mut observed_load_in_progress = false;
+    // Synchronize with the actual unload transition before attempting the concurrent load.
+    // Without this handshake the unload worker may already have completed its short fixture call
+    // and detached the plugin before the load attempt runs, which would make the test itself race
+    // rather than test serialization.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut observed_stopping = false;
     while std::time::Instant::now() < deadline {
-        match Factory::load_plugin_file_with_config(&library, config) {
-            Ok(new_id) => {
-                panic!("same library loaded concurrently while unload was in progress: {new_id}");
-            }
-            Err(PluginManagerError::PluginLoadInProgress { .. }) => {
-                observed_load_in_progress = true;
+        if let Some(health) = Factory::plugin_health_by_name("PluginHostIntegration") {
+            if health.state == PluginHealthState::Stopping {
+                observed_stopping = true;
                 break;
             }
-            Err(PluginManagerError::PluginAlreadyLoaded { .. }) => {
-                std::thread::yield_now();
-            }
-            Err(other) => panic!("unexpected concurrent load error: {other}"),
         }
+        std::thread::yield_now();
     }
+    assert!(
+        observed_stopping,
+        "unload must expose the transient stopping state before the concurrent load attempt"
+    );
 
     assert!(
-        observed_load_in_progress,
-        "concurrent load must observe the lifecycle operation guard"
+        matches!(
+            Factory::load_plugin_file_with_config(&library, config),
+            Err(PluginManagerError::PluginLoadInProgress { .. })
+        ),
+        "concurrent load must be rejected by the per-library lifecycle guard while unload is stopping"
     );
+
     let unload_result = unload_thread.join().expect("unload worker must finish");
     unload_result.expect("unload must succeed after the in-flight call drains");
     worker.join().expect("in-flight endpoint worker must finish");

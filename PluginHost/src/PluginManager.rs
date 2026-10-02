@@ -686,7 +686,7 @@ impl PluginRuntime {
     /// Quiesces the plugin with a bounded wait. A timeout never forcefully unloads a library while
     /// plugin code is still executing; the manager keeps the plugin registered so the operation
     /// can be retried safely after the in-flight calls drain.
-    fn unload(&self) -> bool {
+    pub(crate) fn unload(&self) -> bool {
         if self.unloading.swap(true, Ordering::AcqRel) {
             return false;
         }
@@ -873,10 +873,6 @@ impl PluginItem {
     pub(crate) fn health(&self) -> PluginHealthSnapshot {
         self.runtime.snapshot()
     }
-
-    pub(crate) fn unload(&mut self) -> bool {
-        self.runtime.unload()
-    }
 }
 
 #[derive(Default)]
@@ -995,25 +991,6 @@ impl PluginManager {
         self.paths.remove(&item.path);
         self.catalog = new_catalog;
         Ok(item)
-    }
-
-    /// Restores a previously detached plugin. No plugin callback is invoked here.
-    pub(crate) fn restore_plugin(&mut self, id: i64, item: PluginItem) {
-        self.paths.insert(item.path.clone(), id);
-        self.plugins.insert(id, item);
-        let _ = self.rebuild_catalog();
-    }
-
-    fn rebuild_catalog(&mut self) -> Result<(), PluginManagerError> {
-        let manifests = self
-            .plugin_ids()
-            .into_iter()
-            .filter_map(|id| self.get_manifest(id).cloned())
-            .collect::<Vec<_>>();
-        self.catalog = PluginCatalog::from_manifests(manifests).map_err(
-            PluginManagerError::InvalidCatalog
-        )?;
-        Ok(())
     }
 
     pub(crate) fn load_plugin(

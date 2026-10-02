@@ -2,7 +2,13 @@
 
 use DatabaseContracts::{ DatabaseError, DatabaseRequest, DatabaseResponse };
 use std::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
-use std::{ path::PathBuf, thread, time::Duration };
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
 
 use PluginContracts::{
     declare_plugin,
@@ -14,6 +20,8 @@ use PluginContracts::{
         PluginKind,
         PluginManifest,
         PluginEndpointDescriptor,
+        PluginLifecycleError,
+        PluginSessionContext,
     },
     IPlugin::IPlugin,
 };
@@ -59,6 +67,7 @@ impl IPlugin for PluginHostIntegration {
     }
 
     fn on_load(&mut self) -> bool {
+        self.record_lifecycle_event("on_load");
         self.loaded = true;
         self.loaded
     }
@@ -79,6 +88,7 @@ impl IPlugin for PluginHostIntegration {
     }
 
     fn on_unload(&mut self) -> bool {
+        self.record_lifecycle_event("on_unload");
         self.write_marker("unload.marker");
         if self.mode == "on_unload_failure" && FAIL_UNLOAD_ONCE.swap(false, Ordering::AcqRel) {
             return false;
@@ -88,6 +98,7 @@ impl IPlugin for PluginHostIntegration {
     }
 
     fn on_destroy(&mut self) -> bool {
+        self.record_lifecycle_event("on_destroy");
         self.write_marker("destroy.marker");
         if self.mode == "destroy_failure" && FAIL_DESTROY_ONCE.swap(false, Ordering::AcqRel) {
             return false;
@@ -97,6 +108,21 @@ impl IPlugin for PluginHostIntegration {
 
     fn isLoaded(&self) -> bool {
         self.loaded
+    }
+
+    fn on_session_closed(
+        &self,
+        context: &PluginSessionContext
+    ) -> Result<(), PluginLifecycleError> {
+        if self.mode == "session_failure" {
+            return Err(PluginLifecycleError::new(
+                "fixture_session_failure",
+                "session cleanup intentionally failed",
+            ));
+        }
+
+        self.write_marker(&format!("session-closed-{}.marker", context.session_id));
+        Ok(())
     }
 
     fn manifest(&self) -> PluginManifest {
@@ -160,6 +186,9 @@ impl IPlugin for PluginHostIntegration {
                     let _ = std::fs::write(directory.join("slow-entered.marker"), b"entered");
                 }
                 thread::sleep(Duration::from_millis(300));
+                if let Some(directory) = &self.plugin_directory {
+                    let _ = std::fs::write(directory.join("slow-exited.marker"), b"exited");
+                }
                 let peak = MAX_ACTIVE_CALLS.load(Ordering::Acquire);
                 ACTIVE_CALLS.fetch_sub(1, Ordering::AcqRel);
                 PluginEndpointResponse::json(
@@ -256,6 +285,17 @@ impl PluginHostIntegration {
         if let Some(directory) = &self.plugin_directory {
             let _ = std::fs::write(directory.join(file_name), b"marker");
         }
+    }
+
+    fn record_lifecycle_event(&self, event: &str) {
+        let Some(directory) = &self.plugin_directory else {
+            return;
+        };
+        let path = directory.join("lifecycle.order");
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+            return;
+        };
+        let _ = writeln!(file, "{event}");
     }
 }
 

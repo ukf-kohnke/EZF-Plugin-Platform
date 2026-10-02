@@ -27,7 +27,8 @@ use std::{
         Mutex,
         RwLock,
         RwLockReadGuard,
-        atomic::{ AtomicBool, AtomicU64, AtomicU8, Ordering },
+        atomic::{ AtomicBool, AtomicU64, Ordering },
+        Condvar,
     },
     thread,
     time::{ Duration, Instant },
@@ -110,35 +111,51 @@ pub enum PluginHealthState {
     Unloaded = 5,
 }
 
-impl PluginHealthState {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Loading,
-            1 => Self::Ready,
-            2 => Self::Degraded,
-            3 => Self::Stopping,
-            4 => Self::Failed,
-            5 => Self::Unloaded,
-            _ => Self::Failed,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginHealthSnapshot {
     pub name: String,
     pub state: PluginHealthState,
+    /// Calls admitted by the runtime that have not yet completed inside the plugin.
     pub active_calls: usize,
-    pub total_calls: u64,
+    /// Admitted calls for which the caller already received a timeout, while the plugin operation
+    /// itself is still running or queued.
+    pub timed_out_active_calls: u64,
+    /// Calls that were actually completed by a plugin worker (success or failure).
+    pub completed_calls: u64,
+    /// Calls whose plugin operation actually failed or panicked. Request timeouts are not counted
+    /// here because a timed-out operation may still complete successfully later.
     pub failed_calls: u64,
+    /// Caller-visible request timeouts. This is a cumulative counter and is independent from the
+    /// eventual outcome of the still-running plugin operation.
     pub timed_out_calls: u64,
+    pub total_calls: u64,
     pub rejected_calls: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct PluginHealthRuntimeState {
+    state: PluginHealthState,
+    timed_out_active_calls: u64,
+    last_failure_call_id: u64,
+    last_error: Option<String>,
+}
+
+impl PluginHealthRuntimeState {
+    fn ready() -> Self {
+        Self {
+            state: PluginHealthState::Ready,
+            timed_out_active_calls: 0,
+            last_failure_call_id: 0,
+            last_error: None,
+        }
+    }
 }
 
 struct PluginCallGate {
     state: Mutex<usize>,
     max_concurrent_calls: usize,
+    idle: Condvar,
 }
 
 impl PluginCallGate {
@@ -146,6 +163,7 @@ impl PluginCallGate {
         Self {
             state: Mutex::new(0),
             max_concurrent_calls: max_concurrent_calls.max(1),
+            idle: Condvar::new(),
         }
     }
 
@@ -164,6 +182,26 @@ impl PluginCallGate {
     fn active_calls(&self) -> usize {
         *self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn wait_until_idle(&self, deadline: Instant) -> bool {
+        let mut active = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *active != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (guard, timeout) = self
+                .idle
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active = guard;
+            if timeout.timed_out() && *active != 0 {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 struct PluginCallPermit {
@@ -174,6 +212,52 @@ impl Drop for PluginCallPermit {
     fn drop(&mut self) {
         let mut active = self.gate.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *active = (*active).saturating_sub(1);
+        if *active == 0 {
+            self.gate.idle.notify_all();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginCallLifecycleState {
+    Pending,
+    TimedOut,
+    Completed,
+}
+
+struct PluginCallTracker {
+    state: Mutex<PluginCallLifecycleState>,
+}
+
+impl PluginCallTracker {
+    fn new() -> Self {
+        Self { state: Mutex::new(PluginCallLifecycleState::Pending) }
+    }
+
+    /// Marks the caller-visible timeout. The callback runs while the call is still protected by
+    /// the lifecycle lock, so the worker cannot complete the same call between the state transition
+    /// and the associated timeout bookkeeping. This makes the timeout/completion race deterministic.
+    fn mark_timed_out<F>(&self, on_marked: F) -> bool
+        where F: FnOnce()
+    {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state != PluginCallLifecycleState::Pending {
+            return false;
+        }
+        *state = PluginCallLifecycleState::TimedOut;
+        on_marked();
+        true
+    }
+
+    /// Completes the underlying plugin operation. Returns whether the caller had already timed
+    /// out, allowing the worker to close the corresponding `timed_out_active_calls` lifecycle.
+    fn complete(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let timed_out = *state == PluginCallLifecycleState::TimedOut;
+        if *state != PluginCallLifecycleState::Completed {
+            *state = PluginCallLifecycleState::Completed;
+        }
+        timed_out
     }
 }
 
@@ -196,21 +280,24 @@ impl std::fmt::Display for PluginCallFailure {
 
 /// Runtime state of one loaded plugin.
 ///
-/// The dynamic library and opaque plugin instance remain together. Request calls hold a shared
-/// read lock, so independent calls can execute concurrently. Unload takes the exclusive write
-/// lock and therefore waits until every in-flight plugin call has returned before invoking
-/// `on_unload`, destroying the instance, and allowing the runtime to be dropped.
+/// The dynamic library and opaque plugin instance remain together. Calls are admitted through a
+/// bounded gate and executed by persistent worker threads, so request traffic does not create a
+/// new OS thread per plugin call. Each worker invocation holds a shared read lock, allowing
+/// independent calls to execute concurrently. Unload first waits for all admitted calls to drain,
+/// then takes the exclusive write lock before invoking `on_unload` and destroying the instance.
 pub(crate) struct PluginRuntime {
     state: RwLock<PluginRuntimeState>,
     unloading: AtomicBool,
     config: PluginRuntimeConfig,
     gate: Arc<PluginCallGate>,
-    health: AtomicU8,
+    worker_pool: PluginWorkerPool,
+    health: Mutex<PluginHealthRuntimeState>,
+    next_call_id: AtomicU64,
     total_calls: AtomicU64,
+    completed_calls: AtomicU64,
     failed_calls: AtomicU64,
     timed_out_calls: AtomicU64,
     rejected_calls: AtomicU64,
-    last_error: Mutex<Option<String>>,
     name: Mutex<Option<String>>,
 }
 
@@ -218,6 +305,106 @@ struct PluginRuntimeState {
     instance: Option<*mut PluginInstanceV1>,
     #[allow(dead_code)]
     library: Library,
+}
+
+type PluginJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct PluginWorkerPool {
+    sender: Mutex<Option<mpsc::SyncSender<PluginJob>>>,
+    workers: Mutex<Option<Vec<thread::JoinHandle<()>>>>,
+}
+
+impl PluginWorkerPool {
+    fn new(worker_count: usize) -> Result<Self, String> {
+        let worker_count = worker_count.max(1);
+        let (sender, receiver) = mpsc::sync_channel::<PluginJob>(worker_count);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            let thread_name = format!("ezf-plugin-worker-{index}");
+            match thread::Builder::new().name(thread_name).spawn(move || loop {
+                let job = {
+                    let receiver = receiver
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    receiver.recv()
+                };
+
+                match job {
+                    Ok(job) => job(),
+                    Err(_) => break,
+                }
+            }) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    drop(sender);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(format!(
+                        "failed to spawn plugin worker {index}: {error}"
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            sender: Mutex::new(Some(sender)),
+            workers: Mutex::new(Some(workers)),
+        })
+    }
+
+    fn submit(&self, job: PluginJob) -> Result<(), PluginJob> {
+        let sender = self.sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(sender) = sender.as_ref() else {
+            return Err(job);
+        };
+
+        match sender.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(job)) |
+            Err(mpsc::TrySendError::Disconnected(job)) => Err(job),
+        }
+    }
+
+    fn shutdown(&self) {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(sender);
+
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(workers) = workers else {
+            return;
+        };
+
+        let current_thread_id = thread::current().id();
+        for worker in workers {
+            // A last Arc<PluginRuntime> can theoretically be released by the worker executing a
+            // timed-out job. Never attempt to join the current worker thread from itself; dropping
+            // that JoinHandle detaches it and it will exit as soon as the queue observes closure.
+            if worker.thread().id() == current_thread_id {
+                continue;
+            }
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for PluginWorkerPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 // Raw instance pointers are only dereferenced while the PluginRuntime state is protected by the
@@ -279,6 +466,11 @@ impl PluginRuntime {
             return Err("plugin vtable contains a null function pointer".to_owned());
         }
 
+        let worker_pool = PluginWorkerPool::new(config.max_concurrent_calls).map_err(|error| {
+            let _ = unsafe { (vtable.destroy)(instance) };
+            error
+        })?;
+
         Ok(
             Arc::new(Self {
                 state: RwLock::new(PluginRuntimeState {
@@ -287,13 +479,15 @@ impl PluginRuntime {
                 }),
                 unloading: AtomicBool::new(false),
                 gate: Arc::new(PluginCallGate::new(config.max_concurrent_calls)),
+                worker_pool,
                 config,
-                health: AtomicU8::new(PluginHealthState::Ready as u8),
+                health: Mutex::new(PluginHealthRuntimeState::ready()),
+                next_call_id: AtomicU64::new(0),
                 total_calls: AtomicU64::new(0),
+                completed_calls: AtomicU64::new(0),
                 failed_calls: AtomicU64::new(0),
                 timed_out_calls: AtomicU64::new(0),
                 rejected_calls: AtomicU64::new(0),
-                last_error: Mutex::new(None),
                 name: Mutex::new(None),
             })
         )
@@ -311,7 +505,8 @@ impl PluginRuntime {
             return Err("plugin runtime is unloading".to_owned());
         }
 
-        match PluginHealthState::from_u8(self.health.load(Ordering::Acquire)) {
+        let health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match health.state {
             PluginHealthState::Ready | PluginHealthState::Degraded => {}
             PluginHealthState::Loading => {
                 return Err("plugin runtime is still loading".to_owned());
@@ -326,6 +521,7 @@ impl PluginRuntime {
                 return Err("plugin runtime is unloaded".to_owned());
             }
         }
+        drop(health);
 
         let instance = state.instance.ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
         let instance_ref = unsafe { &*instance };
@@ -372,45 +568,91 @@ impl PluginRuntime {
     }
 
     fn set_health(&self, state: PluginHealthState) {
-        self.health.store(state as u8, Ordering::Release);
+        let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        health.state = state;
     }
 
-    fn record_success(&self) {
-        self.set_health(PluginHealthState::Ready);
-        let mut error = self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        *error = None;
+    fn set_health_error(&self, state: PluginHealthState, message: impl Into<String>) {
+        let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        health.state = state;
+        health.last_error = Some(message.into());
     }
 
-    fn record_failure(&self, message: impl Into<String>, timed_out: bool) {
-        let message = message.into();
-        self.failed_calls.fetch_add(1, Ordering::Relaxed);
+    fn record_success(&self, call_id: u64, timed_out: bool) {
+        let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if timed_out {
-            self.timed_out_calls.fetch_add(1, Ordering::Relaxed);
+            health.timed_out_active_calls = health.timed_out_active_calls.saturating_sub(1);
         }
-        self.set_health(PluginHealthState::Degraded);
-        let mut error = self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        *error = Some(message);
+
+        if matches!(health.state, PluginHealthState::Ready | PluginHealthState::Degraded)
+            && health.timed_out_active_calls == 0
+            && call_id >= health.last_failure_call_id
+        {
+            health.state = PluginHealthState::Ready;
+            health.last_error = None;
+        }
+        drop(health);
+        self.completed_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an actual plugin-operation failure. This is deliberately separate from a
+    /// request timeout: the latter only means the caller stopped waiting; the plugin operation
+    /// may still finish successfully afterwards.
+    fn record_failure(&self, call_id: u64, message: impl Into<String>, timed_out: bool) {
+        let message = message.into();
+        let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if timed_out {
+            health.timed_out_active_calls = health.timed_out_active_calls.saturating_sub(1);
+        }
+        health.last_failure_call_id = health.last_failure_call_id.max(call_id);
+        if matches!(health.state, PluginHealthState::Ready | PluginHealthState::Degraded) {
+            health.state = PluginHealthState::Degraded;
+            health.last_error = Some(message);
+        }
+        drop(health);
+        self.completed_calls.fetch_add(1, Ordering::Relaxed);
+        self.failed_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_submission_failure(&self, message: impl Into<String>) {
+        let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(health.state, PluginHealthState::Ready | PluginHealthState::Degraded) {
+            health.state = PluginHealthState::Degraded;
+            health.last_error = Some(message.into());
+        }
+        drop(health);
+        self.failed_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_request_timeout(&self, message: impl Into<String>) {
+        let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        health.timed_out_active_calls = health.timed_out_active_calls.saturating_add(1);
+        if matches!(health.state, PluginHealthState::Ready | PluginHealthState::Degraded) {
+            health.state = PluginHealthState::Degraded;
+            health.last_error = Some(message.into());
+        }
+        drop(health);
+        self.timed_out_calls.fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> PluginHealthSnapshot {
-        let state = PluginHealthState::from_u8(self.health.load(Ordering::Acquire));
         let name = self.name
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .unwrap_or_else(|| "<initializing>".to_owned());
+        let health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         PluginHealthSnapshot {
             name,
-            state,
+            state: health.state,
             active_calls: self.gate.active_calls(),
-            total_calls: self.total_calls.load(Ordering::Relaxed),
+            timed_out_active_calls: health.timed_out_active_calls,
+            completed_calls: self.completed_calls.load(Ordering::Relaxed),
             failed_calls: self.failed_calls.load(Ordering::Relaxed),
             timed_out_calls: self.timed_out_calls.load(Ordering::Relaxed),
+            total_calls: self.total_calls.load(Ordering::Relaxed),
             rejected_calls: self.rejected_calls.load(Ordering::Relaxed),
-            last_error: self.last_error
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            last_error: health.last_error.clone(),
         }
     }
 
@@ -423,8 +665,7 @@ impl PluginRuntime {
         self: &Arc<Self>,
         operation: &'static str,
         call: F
-    )
-        -> Result<R, PluginCallFailure>
+    ) -> Result<R, PluginCallFailure>
         where R: Send + 'static, F: FnOnce(&PluginRuntime) -> Result<R, String> + Send + 'static
     {
         let permit = match self.gate.try_acquire() {
@@ -447,63 +688,99 @@ impl PluginRuntime {
             }
         };
 
-        self.total_calls.fetch_add(1, Ordering::Relaxed);
-        let runtime = Arc::clone(self);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let thread_name = format!("ezf-plugin-{operation}");
-
-        if
-            thread::Builder
-                ::new()
-                .name(thread_name)
-                .spawn(move || {
-                    let result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| call(&runtime))
-                    );
-                    let result = match result {
-                        Ok(result) => result,
-                        Err(_) => Err(format!("plugin operation '{operation}' panicked")),
-                    };
-                    // Release admission before publishing completion. Otherwise the caller can
-                    // observe the completed result and immediately submit a new call while the
-                    // previous permit is still held, producing a spurious `Busy` rejection.
-                    drop(permit);
-                    let _ = sender.send(result);
-                })
-                .is_err()
-        {
-            self.record_failure("failed to spawn plugin call worker thread", false);
-            return Err(
-                PluginCallFailure::Failed("failed to spawn plugin call worker thread".to_owned())
-            );
+        if self.unloading.load(Ordering::Acquire) {
+            drop(permit);
+            return Err(PluginCallFailure::Failed(
+                "plugin runtime is unloading".to_owned()
+            ));
         }
 
-        match receiver.recv_timeout(self.config.call_timeout) {
-            Ok(Ok(result)) => {
-                self.record_success();
-                Ok(result)
+        let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        let tracker = Arc::new(PluginCallTracker::new());
+        let runtime = Arc::clone(self);
+        let worker_tracker = Arc::clone(&tracker);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let job: PluginJob = Box::new(move || {
+            let result = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| call(&runtime))
+            );
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => Err(format!("plugin operation '{operation}' panicked")),
+            };
+            let was_timed_out = worker_tracker.complete();
+
+            match &result {
+                Ok(_) => runtime.record_success(call_id, was_timed_out),
+                Err(error) => runtime.record_failure(call_id, error.clone(), was_timed_out),
             }
-            Ok(Err(error)) => {
-                self.record_failure(error.clone(), false);
-                Err(PluginCallFailure::Failed(error))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let message = format!(
-                    "plugin operation '{operation}' timed out after {:?}",
-                    self.config.call_timeout
-                );
-                self.record_failure(message.clone(), true);
+
+            if was_timed_out {
+                let outcome = if result.is_ok() { "success" } else { "failure" };
                 Common::Logging::Logger::Log::Dump(
                     "{}",
                     Common::Logging::LogConstants::LOGGERDEF,
-                    LevelFilter::Warn,
-                    &[message.as_str()]
+                    LevelFilter::Info,
+                    &[
+                        &format!(
+                            "Plugin operation '{}' completed after the caller timed out ({outcome})",
+                            operation
+                        ),
+                    ]
                 );
-                Err(PluginCallFailure::Timeout(self.config.call_timeout))
+            }
+
+            // Release admission before publishing completion. Otherwise the caller can observe
+            // the completed result and immediately submit a new call while the previous permit
+            // is still held, producing a spurious `Busy` rejection.
+            drop(permit);
+            let _ = sender.send(result);
+        });
+
+        if self.worker_pool.submit(job).is_err() {
+            let message = "plugin worker pool rejected an admitted call".to_owned();
+            self.record_submission_failure(message.clone());
+            return Err(PluginCallFailure::Failed(message));
+        }
+
+        match receiver.recv_timeout(self.config.call_timeout) {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(PluginCallFailure::Failed(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if tracker.mark_timed_out(|| {
+                    self.record_request_timeout(format!(
+                        "plugin operation '{operation}' timed out after {:?}; underlying plugin operation remains active",
+                        self.config.call_timeout
+                    ));
+                }) {
+                    let message = format!(
+                        "plugin operation '{operation}' timed out after {:?}; underlying plugin operation remains active",
+                        self.config.call_timeout
+                    );
+                    Common::Logging::Logger::Log::Dump(
+                        "{}",
+                        Common::Logging::LogConstants::LOGGERDEF,
+                        LevelFilter::Warn,
+                        &[message.as_str()]
+                    );
+                    Err(PluginCallFailure::Timeout(self.config.call_timeout))
+                } else {
+                    // The worker won the timeout/completion race. The result is already on the
+                    // completion channel, so consume it instead of manufacturing a false timeout.
+                    match receiver.recv() {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(error)) => Err(PluginCallFailure::Failed(error)),
+                        Err(_) => {
+                            let message =
+                                format!("plugin operation '{operation}' worker disconnected");
+                            Err(PluginCallFailure::Failed(message))
+                        }
+                    }
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let message = format!("plugin operation '{operation}' worker disconnected");
-                self.record_failure(message.clone(), false);
                 Err(PluginCallFailure::Failed(message))
             }
         }
@@ -687,8 +964,8 @@ impl PluginRuntime {
     }
 
     /// Quiesces the plugin with a bounded wait. A timeout never forcefully unloads a library while
-    /// plugin code is still executing; the manager keeps the plugin registered so the operation
-    /// can be retried safely after the in-flight calls drain.
+    /// plugin work is still executing or queued; the manager keeps the plugin registered so the
+    /// operation can be retried safely after all admitted calls drain.
     pub(crate) fn unload(&self) -> bool {
         if self.unloading.swap(true, Ordering::AcqRel) {
             return false;
@@ -696,27 +973,26 @@ impl PluginRuntime {
         self.set_health(PluginHealthState::Stopping);
 
         let deadline = Instant::now() + self.config.unload_timeout;
-        let mut state = loop {
-            match self.state.try_write() {
-                Ok(state) => {
-                    break state;
-                }
-                Err(_) => {
-                    if Instant::now() >= deadline {
-                        self.unloading.store(false, Ordering::Release);
-                        self.set_health(PluginHealthState::Degraded);
-                        let message = format!(
-                            "plugin unload timed out after {:?}",
-                            self.config.unload_timeout
-                        );
-                        let mut error = self.last_error
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        *error = Some(message);
-                        return false;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
+        if !self.gate.wait_until_idle(deadline) {
+            self.unloading.store(false, Ordering::Release);
+            let message = format!(
+                "plugin unload timed out after {:?}",
+                self.config.unload_timeout
+            );
+            self.set_health_error(PluginHealthState::Degraded, message);
+            return false;
+        }
+
+        let mut state = match self.state.try_write() {
+            Ok(state) => state,
+            Err(_) => {
+                self.unloading.store(false, Ordering::Release);
+                let message = format!(
+                    "plugin unload timed out after {:?}",
+                    self.config.unload_timeout
+                );
+                self.set_health_error(PluginHealthState::Degraded, message);
+                return false;
             }
         };
 
@@ -741,18 +1017,20 @@ impl PluginRuntime {
         let status = unsafe { (vtable.on_unload)(instance_ref.context) };
         if status != PLUGIN_STATUS_OK {
             self.unloading.store(false, Ordering::Release);
-            self.set_health(PluginHealthState::Failed);
-            let mut error = self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *error = Some(format!("plugin on_unload returned status {status}"));
+            self.set_health_error(
+                PluginHealthState::Failed,
+                format!("plugin on_unload returned status {status}")
+            );
             return false;
         }
 
         let destroy_status = unsafe { (vtable.destroy)(instance) };
         if destroy_status != PLUGIN_STATUS_OK {
             self.unloading.store(false, Ordering::Release);
-            self.set_health(PluginHealthState::Failed);
-            let mut error = self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *error = Some(format!("plugin destroy returned status {destroy_status}"));
+            self.set_health_error(
+                PluginHealthState::Failed,
+                format!("plugin destroy returned status {destroy_status}")
+            );
             Common::Logging::Logger::Log::Dump(
                 "{}",
                 Common::Logging::LogConstants::LOGGERDEF,
@@ -766,6 +1044,7 @@ impl PluginRuntime {
 
         state.instance = None;
         self.set_health(PluginHealthState::Unloaded);
+        self.worker_pool.shutdown();
         true
     }
 }
@@ -773,6 +1052,7 @@ impl PluginRuntime {
 impl Drop for PluginRuntime {
     fn drop(&mut self) {
         self.unloading.store(true, Ordering::Release);
+        self.worker_pool.shutdown();
         let mut state = self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(instance) = state.instance.take() else {
             return;
@@ -1128,5 +1408,29 @@ fn format_glob_error(error: &GlobError) -> String {
     match error.path().to_str() {
         Some(path) => format!("{} ({})", path, error.error()),
         None => error.error().to_string(),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::PluginCallTracker;
+
+    #[test]
+    fn timed_out_call_lifecycle_is_closed_by_the_worker() {
+        let tracker = PluginCallTracker::new();
+        let mut timeout_bookkeeping = false;
+
+        assert!(tracker.mark_timed_out(|| timeout_bookkeeping = true));
+        assert!(timeout_bookkeeping);
+        assert!(tracker.complete());
+    }
+
+    #[test]
+    fn completed_call_wins_the_timeout_race() {
+        let tracker = PluginCallTracker::new();
+
+        assert!(!tracker.complete());
+        assert!(!tracker.mark_timed_out(|| panic!("completed call must not be timed out")));
     }
 }

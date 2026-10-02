@@ -51,6 +51,10 @@
 //! - Plugin call limits default to 30s call timeout, 10s unload timeout, and 64 concurrent calls.
 //!   They can be overridden with `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`,
 //!   and `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, or supplied explicitly to the `*_with_config` load APIs.
+//! - A call timeout is a caller-side deadline, not a forced cancellation. The underlying plugin
+//!   operation remains active until the worker returns; the runtime keeps that call counted as
+//!   active and unload waits for it to drain safely. Health telemetry distinguishes request
+//!   timeouts from actual plugin-operation failures and from completion after a timeout.
 //!
 //! # Return conventions
 //!

@@ -13,6 +13,7 @@ use PluginHost::Factory::{
     PluginRuntimeConfig,
 };
 use std::{
+    collections::BTreeSet,
     fs,
     path::PathBuf,
     process::Command,
@@ -284,6 +285,43 @@ fn loading_is_deterministic_and_optional_failures_are_reported_without_aborting(
 }
 
 #[test]
+fn plugin_calls_reuse_a_bounded_persistent_worker_pool() {
+    // The fixture is a separately compiled cdylib. Use a fixture-local TLS id to detect reuse of
+    // the same underlying worker thread without relying on Rust thread-name metadata across the ABI boundary.
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_secs(1),
+        unload_timeout: std::time::Duration::from_secs(2),
+        max_concurrent_calls: 2,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config)
+        .expect("fixture library must load with a bounded worker pool");
+
+    let mut worker_threads = BTreeSet::new();
+    for iteration in 0..100 {
+        let response = Factory::handle_endpoint("PluginHostIntegration", ping_request())
+            .unwrap_or_else(|error| panic!("iteration {iteration}: ping failed: {error}"));
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body)
+            .expect("ping response must contain valid JSON");
+        let worker_thread_id = body["worker_thread_id"]
+            .as_u64()
+            .expect("ping response must report the persistent worker thread id");
+        worker_threads.insert(worker_thread_id);
+    }
+
+    assert!(
+        worker_threads.len() <= 2,
+        "bounded worker pool must reuse at most 2 persistent worker threads, observed {:?}",
+        worker_threads
+    );
+
+    cleanup_plugin(id);
+    let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
 fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
     let _test_guard = lock_test();
     let library = build_fixture();
@@ -373,9 +411,23 @@ fn timed_plugin_calls_return_without_detaching_the_running_library() {
     );
     assert_eq!(health.state, PluginHealthState::Degraded);
     assert_eq!(health.timed_out_calls, 1);
+    assert_eq!(health.timed_out_active_calls, 1);
+    assert_eq!(health.completed_calls, 0);
+    assert_eq!(health.failed_calls, 0);
+    assert_eq!(health.total_calls, 1);
     assert_eq!(health.active_calls, 1);
 
     std::thread::sleep(std::time::Duration::from_millis(250));
+    let recovered = Factory::plugin_health_by_name("PluginHostIntegration")
+        .expect("timed-out plugin health must still be available after completion");
+    assert_eq!(recovered.state, PluginHealthState::Ready);
+    assert_eq!(recovered.timed_out_active_calls, 0);
+    assert_eq!(recovered.completed_calls, 1);
+    assert_eq!(recovered.failed_calls, 0);
+    assert_eq!(recovered.total_calls, 1);
+    assert_eq!(recovered.active_calls, 0);
+    assert!(recovered.last_error.is_none());
+
     Factory::unload_plugin(id).expect("library must remain safely unloadable after timeout");
     assert_eq!(Factory::plugin_count(), 0);
     let _ = std::fs::remove_dir_all(library.parent().unwrap());
@@ -679,18 +731,24 @@ fn p1_timeout_recovers_to_ready_without_detaching_the_plugin() {
         .expect("timed out plugin health must be available");
     assert_eq!(degraded.state, PluginHealthState::Degraded);
     assert_eq!(degraded.timed_out_calls, 1);
+    assert_eq!(degraded.timed_out_active_calls, 1);
+    assert_eq!(degraded.completed_calls, 0);
+    assert_eq!(degraded.failed_calls, 0);
     assert_eq!(degraded.active_calls, 1);
     assert!(Factory::check_readiness().is_err(), "degraded plugin must fail readiness");
 
     std::thread::sleep(std::time::Duration::from_millis(350));
-    let response = Factory::handle_endpoint("PluginHostIntegration", ping_request())
-        .expect("a healthy call must recover the timed-out plugin");
-    assert_eq!(response.status, 200);
 
     let recovered = Factory::plugin_health_by_name("PluginHostIntegration")
         .expect("recovered plugin health must be available");
     assert_eq!(recovered.state, PluginHealthState::Ready);
+    assert_eq!(recovered.timed_out_active_calls, 0);
+    assert_eq!(recovered.completed_calls, 1);
+    assert_eq!(recovered.failed_calls, 0);
+    assert_eq!(recovered.total_calls, 1);
     assert_eq!(recovered.active_calls, 0);
+    assert!(recovered.last_error.is_none());
+    assert!(Factory::check_readiness().is_ok(), "completed timeout must recover readiness");
     assert!(Factory::check_readiness().is_ok(), "recovered plugin must pass readiness");
 
     cleanup_plugin(id);

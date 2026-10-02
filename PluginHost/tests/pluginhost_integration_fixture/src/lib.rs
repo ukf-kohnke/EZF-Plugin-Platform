@@ -2,13 +2,7 @@
 
 use DatabaseContracts::{ DatabaseError, DatabaseRequest, DatabaseResponse };
 use std::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
-use std::{
-    fs::OpenOptions,
-    io::Write,
-    path::PathBuf,
-    thread,
-    time::Duration,
-};
+use std::{ fs::OpenOptions, io::Write, path::PathBuf, thread, time::Duration };
 
 use PluginContracts::{
     declare_plugin,
@@ -30,6 +24,15 @@ static ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MAX_ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FAIL_UNLOAD_ONCE: AtomicBool = AtomicBool::new(true);
 static FAIL_DESTROY_ONCE: AtomicBool = AtomicBool::new(true);
+static NEXT_WORKER_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static WORKER_THREAD_ID: usize = NEXT_WORKER_THREAD_ID.fetch_add(1, Ordering::AcqRel);
+}
+
+fn current_worker_thread_id() -> usize {
+    WORKER_THREAD_ID.with(|id| *id)
+}
 
 #[derive(Clone, Default)]
 struct PluginHostIntegration {
@@ -115,10 +118,12 @@ impl IPlugin for PluginHostIntegration {
         context: &PluginSessionContext
     ) -> Result<(), PluginLifecycleError> {
         if self.mode == "session_failure" {
-            return Err(PluginLifecycleError::new(
-                "fixture_session_failure",
-                "session cleanup intentionally failed",
-            ));
+            return Err(
+                PluginLifecycleError::new(
+                    "fixture_session_failure",
+                    "session cleanup intentionally failed"
+                )
+            );
         }
 
         self.write_marker(&format!("session-closed-{}.marker", context.session_id));
@@ -173,7 +178,9 @@ impl IPlugin for PluginHostIntegration {
                     &serde_json::json!({
                         "plugin": self.name(),
                         "loaded": self.loaded,
-                        "endpoint": "ping"
+                        "endpoint": "ping",
+                        "worker_thread": thread::current().name().unwrap_or("unnamed"),
+                        "worker_thread_id": current_worker_thread_id()
                     })
                 ),
             "panic" if self.mode == "panic" => {

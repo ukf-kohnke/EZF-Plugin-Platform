@@ -1,8 +1,8 @@
 #![allow(non_snake_case)]
 
 use DatabaseContracts::{ DatabaseError, DatabaseRequest, DatabaseResponse };
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{path::PathBuf, thread, time::Duration};
+use std::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
+use std::{ path::PathBuf, thread, time::Duration };
 
 use PluginContracts::{
     declare_plugin,
@@ -20,26 +20,38 @@ use PluginContracts::{
 
 static ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MAX_ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static FAIL_UNLOAD_ONCE: AtomicBool = AtomicBool::new(true);
+static FAIL_DESTROY_ONCE: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Default)]
 struct PluginHostIntegration {
     loaded: bool,
     plugin_directory: Option<PathBuf>,
+    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>,
+    mode: String,
 }
 
 fn record_peak_active(active: usize) {
     let mut peak = MAX_ACTIVE_CALLS.load(Ordering::Acquire);
     while active > peak {
         match MAX_ACTIVE_CALLS.compare_exchange(peak, active, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => break,
-            Err(current) => peak = current,
+            Ok(_) => {
+                break;
+            }
+            Err(current) => {
+                peak = current;
+            }
         }
     }
 }
 
 impl IPlugin for PluginHostIntegration {
     fn name(&self) -> String {
-        "PluginHostIntegration".to_owned()
+        match self.mode.as_str() {
+            "catalog_conflict" => "PluginHostIntegrationConflict".to_owned(),
+            "database" => "PluginHostDatabaseBridge".to_owned(),
+            _ => "PluginHostIntegration".to_owned(),
+        }
     }
 
     fn to_box(&self) -> Box<dyn IPlugin> {
@@ -51,14 +63,36 @@ impl IPlugin for PluginHostIntegration {
         self.loaded
     }
 
-    fn on_load_with_host(&mut self, host_services: &PluginContracts::ApiContract::PluginHostServices) -> bool {
+    fn on_load_with_host(
+        &mut self,
+        host_services: &PluginContracts::ApiContract::PluginHostServices
+    ) -> bool {
         self.plugin_directory = host_services.plugin_directory();
+        self.database = host_services.database;
+        self.mode = std::env::var("EZF_PLUGIN_FIXTURE_MODE").unwrap_or_default();
+        if self.mode == "catalog_conflict" {
+            self.write_marker("load-conflict.marker");
+        } else {
+            self.write_marker("load.marker");
+        }
         self.on_load()
     }
 
     fn on_unload(&mut self) -> bool {
+        self.write_marker("unload.marker");
+        if self.mode == "on_unload_failure" && FAIL_UNLOAD_ONCE.swap(false, Ordering::AcqRel) {
+            return false;
+        }
         self.loaded = false;
-        !self.loaded
+        true
+    }
+
+    fn on_destroy(&mut self) -> bool {
+        self.write_marker("destroy.marker");
+        if self.mode == "destroy_failure" && FAIL_DESTROY_ONCE.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        true
     }
 
     fn isLoaded(&self) -> bool {
@@ -66,12 +100,26 @@ impl IPlugin for PluginHostIntegration {
     }
 
     fn manifest(&self) -> PluginManifest {
-        let mut manifest = PluginManifest::new(self.name(), "0.0.1", PluginKind::Domain);
+        let (name, kind) = if self.mode == "catalog_conflict" {
+            ("PluginHostIntegrationConflict".to_owned(), PluginKind::Domain)
+        } else if self.mode == "database" {
+            ("PluginHostDatabaseBridge".to_owned(), PluginKind::DataSource)
+        } else {
+            (self.name(), PluginKind::Domain)
+        };
+        let mut manifest = PluginManifest::new(name, "0.0.1", kind);
         manifest.endpoints.push(
             PluginEndpointDescriptor::get("ping", "/pluginhost-integration/ping").documented(
                 "PluginHostIntegration",
                 "Ping",
                 Some("Minimal endpoint used by PluginHost lifecycle integration tests")
+            )
+        );
+        manifest.endpoints.push(
+            PluginEndpointDescriptor::get("panic", "/pluginhost-integration/panic").documented(
+                "PluginHostIntegration",
+                "Panic",
+                Some("Endpoint used to verify ABI panic isolation")
             )
         );
         manifest.endpoints.push(
@@ -88,9 +136,7 @@ impl IPlugin for PluginHostIntegration {
         &self,
         request: PluginEndpointRequest
     ) -> Result<PluginEndpointResponse, PluginEndpointError> {
-        if
-            request.method != PluginHttpMethod::Get
-        {
+        if request.method != PluginHttpMethod::Get {
             return Err(PluginEndpointError::not_supported(&request.endpoint_id));
         }
 
@@ -104,6 +150,9 @@ impl IPlugin for PluginHostIntegration {
                         "endpoint": "ping"
                     })
                 ),
+            "panic" if self.mode == "panic" => {
+                panic!("intentional PluginHost integration panic");
+            }
             "slow" if request.raw_path == "/pluginhost-integration/slow" => {
                 let active = ACTIVE_CALLS.fetch_add(1, Ordering::AcqRel) + 1;
                 record_peak_active(active);
@@ -129,19 +178,84 @@ impl IPlugin for PluginHostIntegration {
 
     fn execute_database(
         &self,
-        _request: DatabaseRequest
+        request: DatabaseRequest
     ) -> Result<DatabaseResponse, DatabaseError> {
-        Err(
-            DatabaseError::unsupported(
-                "PluginHostIntegration test fixture does not implement database execution"
+        if self.mode != "database" {
+            return Err(
+                DatabaseError::unsupported(
+                    "PluginHostIntegration test fixture does not implement database execution"
+                )
+            );
+        }
+
+        let Some(database) = self.database else {
+            return Err(
+                DatabaseError::unsupported(
+                    "database host capability was not supplied to the plugin"
+                )
+            );
+        };
+
+        let request_bytes = serde_json
+            ::to_vec(&request)
+            .map_err(|error|
+                DatabaseError::new(
+                    DatabaseContracts::DatabaseErrorKind::InvalidRequest,
+                    error.to_string()
+                )
+            )?;
+        let mut response = PluginContracts::PluginAbi::AbiBuffer::EMPTY;
+        let status = unsafe {
+            (database.execute)(
+                PluginContracts::PluginAbi::AbiSlice::from_bytes(&request_bytes),
+                &mut response
             )
-        )
+        };
+        if status != PluginContracts::PluginAbi::PLUGIN_STATUS_OK {
+            if !response.ptr.is_null() {
+                unsafe {
+                    (database.free)(response);
+                }
+            }
+            return Err(
+                DatabaseError::new(
+                    DatabaseContracts::DatabaseErrorKind::Query,
+                    format!("host database capability returned ABI status {status}")
+                )
+            );
+        }
+
+        let bytes = (unsafe { response.to_vec() }).ok_or_else(||
+            DatabaseError::new(
+                DatabaseContracts::DatabaseErrorKind::Decode,
+                "invalid host database response buffer"
+            )
+        )?;
+        unsafe {
+            (database.free)(response);
+        }
+        serde_json
+            ::from_slice::<Result<DatabaseResponse, DatabaseError>>(&bytes)
+            .map_err(|error|
+                DatabaseError::new(DatabaseContracts::DatabaseErrorKind::Decode, error.to_string())
+            )?
     }
 }
 
 impl PluginHostIntegration {
     fn new() -> Self {
-        Self::default()
+        Self {
+            loaded: false,
+            plugin_directory: None,
+            database: None,
+            mode: String::new(),
+        }
+    }
+
+    fn write_marker(&self, file_name: &str) {
+        if let Some(directory) = &self.plugin_directory {
+            let _ = std::fs::write(directory.join(file_name), b"marker");
+        }
     }
 }
 

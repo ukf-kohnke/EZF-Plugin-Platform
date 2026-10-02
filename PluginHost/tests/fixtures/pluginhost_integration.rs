@@ -1,6 +1,12 @@
 #![allow(non_snake_case)]
 
-use std::ffi::c_void;
+use std::{
+    ffi::c_void,
+    path::PathBuf,
+    sync::atomic::{ AtomicUsize, Ordering },
+    thread,
+    time::Duration,
+};
 
 const PLUGIN_ABI_VERSION_V1: u32 = 1;
 const PLUGIN_STATUS_OK: i32 = 0;
@@ -109,7 +115,11 @@ struct PluginInstanceV1 {
 
 struct Context {
     loaded: bool,
+    plugin_directory: PathBuf,
 }
+
+static ACTIVE_SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PEAK_SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn plugin_name(_context: *mut c_void, response_out: *mut AbiBuffer) -> i32 {
     if response_out.is_null() {
@@ -129,7 +139,7 @@ unsafe extern "C" fn plugin_manifest(_context: *mut c_void, response_out: *mut A
     }
     unsafe {
         *response_out = AbiBuffer::json(
-            r#"{"contract_version":6,"name":"PluginHostIntegration","version":"0.0.1","kind":"Domain","functions":[],"endpoints":[{"id":"ping","method":"Get","path":"/pluginhost-integration/ping","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}]}"#
+            r#"{"contract_version":6,"name":"PluginHostIntegration","version":"0.0.1","kind":"Domain","functions":[],"endpoints":[{"id":"ping","method":"Get","path":"/pluginhost-integration/ping","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null},{"id":"slow","method":"Get","path":"/pluginhost-integration/slow","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}]}"#
         );
     }
 
@@ -164,21 +174,50 @@ unsafe extern "C" fn plugin_is_loaded(context: *mut c_void) -> i32 {
 
 unsafe extern "C" fn plugin_handle_endpoint(
     context: *mut c_void,
-    _request: AbiSlice,
+    request: AbiSlice,
     response_out: *mut AbiBuffer
 ) -> i32 {
     if context.is_null() || response_out.is_null() {
         return -1;
     }
-    let loaded = unsafe { (*(context as *mut Context)).loaded };
+    let context = unsafe { &*(context as *mut Context) };
+    let request = (unsafe { request.to_vec() }).and_then(|bytes|
+        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+    );
+    let endpoint_id = request
+        .as_ref()
+        .and_then(|value| value.get("endpoint_id"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("ping");
 
-    let response =
-        format!(r#"{{"plugin":"PluginHostIntegration","loaded":{},"endpoint":"ping"}}"#, loaded);
+    if endpoint_id == "slow" {
+        let active = ACTIVE_SLOW_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK_SLOW_CALLS.fetch_max(active, Ordering::SeqCst);
+        let marker = context.plugin_directory.join("slow-entered.marker");
+        let _ = std::fs::write(marker, b"entered");
+        thread::sleep(Duration::from_millis(200));
+        ACTIVE_SLOW_CALLS.fetch_sub(1, Ordering::SeqCst);
+
+        let peak = PEAK_SLOW_CALLS.load(Ordering::SeqCst);
+        let response = format!(
+            r#"{{"plugin":"PluginHostIntegration","loaded":{},"endpoint":"slow","peak_active":{}}}"#,
+            context.loaded,
+            peak
+        );
+        unsafe {
+            *response_out = AbiBuffer::json(&response);
+        }
+        return PLUGIN_STATUS_OK;
+    }
+
+    let response = format!(
+        r#"{{"plugin":"PluginHostIntegration","loaded":{},"endpoint":"ping"}}"#,
+        context.loaded
+    );
 
     unsafe {
         *response_out = AbiBuffer::json(&response);
     }
-
     PLUGIN_STATUS_OK
 }
 
@@ -278,7 +317,23 @@ unsafe extern "C" fn InstantiateV1(
             return std::ptr::null_mut();
         }
 
-        let context = Box::into_raw(Box::new(Context { loaded: false })) as *mut c_void;
+        let plugin_directory = if host.plugin_directory.len == 0 {
+            PathBuf::from(".")
+        } else {
+            let bytes = match host.plugin_directory.to_vec() {
+                Some(bytes) => bytes,
+                None => {
+                    return std::ptr::null_mut();
+                }
+            };
+            PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let context = Box::into_raw(
+            Box::new(Context {
+                loaded: false,
+                plugin_directory,
+            })
+        ) as *mut c_void;
         let instance = Box::new(PluginInstanceV1 {
             abi_version: PLUGIN_ABI_VERSION_V1,
             struct_size: std::mem::size_of::<PluginInstanceV1>() as u32,

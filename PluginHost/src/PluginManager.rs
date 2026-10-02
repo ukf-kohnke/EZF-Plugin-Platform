@@ -3,7 +3,7 @@ use super::Factory::PluginManagerError;
 use glob::{ glob, GlobError };
 use libloading::{ Library, Symbol };
 use log::LevelFilter;
-use serde::{ de::DeserializeOwned, Serialize };
+use serde::de::DeserializeOwned;
 use PluginAbi::{
     AbiBuffer,
     AbiSlice,
@@ -21,10 +21,178 @@ use PluginAbi::{
 use std::{
     collections::HashMap,
     path::{ Path, PathBuf },
-    sync::{ Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, atomic::{ AtomicBool, Ordering } },
+    sync::{
+        mpsc,
+        Arc,
+        Mutex,
+        RwLock,
+        RwLockReadGuard,
+        atomic::{ AtomicBool, AtomicU64, AtomicU8, Ordering },
+    },
+    thread,
+    time::{ Duration, Instant },
 };
 
 const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
+const DEFAULT_PLUGIN_CALL_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_PLUGIN_UNLOAD_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS: usize = 64;
+const MIN_PLUGIN_TIMEOUT_MS: u64 = 1;
+const MAX_PLUGIN_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
+const MAX_PLUGIN_CONCURRENT_CALLS: usize = 1_024;
+
+/// Runtime behavior limits for one plugin.
+///
+/// The defaults are intentionally conservative enough for normal API/database work while still
+/// bounding the amount of work a misbehaving plugin can consume. Production deployments may
+/// override them globally through environment variables:
+/// `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`, and
+/// `EZF_PLUGIN_MAX_CONCURRENT_CALLS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginRuntimeConfig {
+    pub call_timeout: Duration,
+    pub unload_timeout: Duration,
+    pub max_concurrent_calls: usize,
+}
+
+impl Default for PluginRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            call_timeout: Duration::from_millis(DEFAULT_PLUGIN_CALL_TIMEOUT_MS),
+            unload_timeout: Duration::from_millis(DEFAULT_PLUGIN_UNLOAD_TIMEOUT_MS),
+            max_concurrent_calls: DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS,
+        }
+    }
+}
+
+impl PluginRuntimeConfig {
+    pub fn from_environment() -> Self {
+        let defaults = Self::default();
+        Self {
+            call_timeout: env_duration("EZF_PLUGIN_CALL_TIMEOUT_MS", defaults.call_timeout),
+            unload_timeout: env_duration("EZF_PLUGIN_UNLOAD_TIMEOUT_MS", defaults.unload_timeout),
+            max_concurrent_calls: env_usize(
+                "EZF_PLUGIN_MAX_CONCURRENT_CALLS",
+                defaults.max_concurrent_calls
+            ),
+        }
+    }
+}
+
+fn env_duration(name: &str, default: Duration) -> Duration {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    let Ok(ms) = raw.trim().parse::<u64>() else {
+        return default;
+    };
+    Duration::from_millis(ms.clamp(MIN_PLUGIN_TIMEOUT_MS, MAX_PLUGIN_TIMEOUT_MS))
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    let Ok(value) = raw.trim().parse::<usize>() else {
+        return default;
+    };
+    value.clamp(1, MAX_PLUGIN_CONCURRENT_CALLS)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PluginHealthState {
+    Loading = 0,
+    Ready = 1,
+    Degraded = 2,
+    Stopping = 3,
+    Failed = 4,
+    Unloaded = 5,
+}
+
+impl PluginHealthState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Loading,
+            1 => Self::Ready,
+            2 => Self::Degraded,
+            3 => Self::Stopping,
+            4 => Self::Failed,
+            5 => Self::Unloaded,
+            _ => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginHealthSnapshot {
+    pub name: String,
+    pub state: PluginHealthState,
+    pub active_calls: usize,
+    pub total_calls: u64,
+    pub failed_calls: u64,
+    pub timed_out_calls: u64,
+    pub rejected_calls: u64,
+    pub last_error: Option<String>,
+}
+
+struct PluginCallGate {
+    state: Mutex<usize>,
+    max_concurrent_calls: usize,
+}
+
+impl PluginCallGate {
+    fn new(max_concurrent_calls: usize) -> Self {
+        Self {
+            state: Mutex::new(0),
+            max_concurrent_calls: max_concurrent_calls.max(1),
+        }
+    }
+
+    /// Admission is deliberately non-blocking. A full plugin is considered overloaded instead
+    /// of making a caller wait behind already admitted work. Request execution still has its own
+    /// timeout after admission.
+    fn try_acquire(self: &Arc<Self>) -> Result<PluginCallPermit, ()> {
+        let mut active = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *active >= self.max_concurrent_calls {
+            return Err(());
+        }
+        *active += 1;
+        Ok(PluginCallPermit { gate: Arc::clone(self) })
+    }
+
+    fn active_calls(&self) -> usize {
+        *self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct PluginCallPermit {
+    gate: Arc<PluginCallGate>,
+}
+
+impl Drop for PluginCallPermit {
+    fn drop(&mut self) {
+        let mut active = self.gate.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = (*active).saturating_sub(1);
+    }
+}
+
+#[derive(Debug)]
+enum PluginCallFailure {
+    Busy,
+    Timeout(Duration),
+    Failed(String),
+}
+
+impl std::fmt::Display for PluginCallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(f, "plugin call concurrency limit reached"),
+            Self::Timeout(timeout) => write!(f, "plugin call timed out after {:?}", timeout),
+            Self::Failed(message) => write!(f, "{message}"),
+        }
+    }
+}
 
 /// Runtime state of one loaded plugin.
 ///
@@ -35,6 +203,15 @@ const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
 pub(crate) struct PluginRuntime {
     state: RwLock<PluginRuntimeState>,
     unloading: AtomicBool,
+    config: PluginRuntimeConfig,
+    gate: Arc<PluginCallGate>,
+    health: AtomicU8,
+    total_calls: AtomicU64,
+    failed_calls: AtomicU64,
+    timed_out_calls: AtomicU64,
+    rejected_calls: AtomicU64,
+    last_error: Mutex<Option<String>>,
+    name: Mutex<Option<String>>,
 }
 
 struct PluginRuntimeState {
@@ -62,7 +239,11 @@ impl PluginRuntime {
             buffer.capacity <= MAX_ABI_BUFFER_BYTES
     }
 
-    fn new(instance: *mut PluginInstanceV1, library: Library) -> Result<Self, String> {
+    fn new(
+        instance: *mut PluginInstanceV1,
+        library: Library,
+        config: PluginRuntimeConfig
+    ) -> Result<Arc<Self>, String> {
         if instance.is_null() {
             return Err("plugin constructor returned a null instance".to_owned());
         }
@@ -98,21 +279,28 @@ impl PluginRuntime {
             return Err("plugin vtable contains a null function pointer".to_owned());
         }
 
-        Ok(Self {
-            state: RwLock::new(PluginRuntimeState {
-                instance: Some(instance),
-                library,
-            }),
-            unloading: AtomicBool::new(false),
-        })
+        Ok(
+            Arc::new(Self {
+                state: RwLock::new(PluginRuntimeState {
+                    instance: Some(instance),
+                    library,
+                }),
+                unloading: AtomicBool::new(false),
+                gate: Arc::new(PluginCallGate::new(config.max_concurrent_calls)),
+                config,
+                health: AtomicU8::new(PluginHealthState::Ready as u8),
+                total_calls: AtomicU64::new(0),
+                failed_calls: AtomicU64::new(0),
+                timed_out_calls: AtomicU64::new(0),
+                rejected_calls: AtomicU64::new(0),
+                last_error: Mutex::new(None),
+                name: Mutex::new(None),
+            })
+        )
     }
 
     fn read_state(&self) -> RwLockReadGuard<'_, PluginRuntimeState> {
         self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn write_state(&self) -> RwLockWriteGuard<'_, PluginRuntimeState> {
-        self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn with_instance<R, F>(&self, func: F) -> Result<R, String>
@@ -121,6 +309,22 @@ impl PluginRuntime {
         let state = self.read_state();
         if self.unloading.load(Ordering::Acquire) {
             return Err("plugin runtime is unloading".to_owned());
+        }
+
+        match PluginHealthState::from_u8(self.health.load(Ordering::Acquire)) {
+            PluginHealthState::Ready | PluginHealthState::Degraded => {}
+            PluginHealthState::Loading => {
+                return Err("plugin runtime is still loading".to_owned());
+            }
+            PluginHealthState::Stopping => {
+                return Err("plugin runtime is stopping".to_owned());
+            }
+            PluginHealthState::Failed => {
+                return Err("plugin runtime is failed".to_owned());
+            }
+            PluginHealthState::Unloaded => {
+                return Err("plugin runtime is unloaded".to_owned());
+            }
         }
 
         let instance = state.instance.ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
@@ -167,21 +371,152 @@ impl PluginRuntime {
         })?
     }
 
-    fn call_json<T: Serialize, R: DeserializeOwned, F>(
+    fn set_health(&self, state: PluginHealthState) {
+        self.health.store(state as u8, Ordering::Release);
+    }
+
+    fn record_success(&self) {
+        self.set_health(PluginHealthState::Ready);
+        let mut error = self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *error = None;
+    }
+
+    fn record_failure(&self, message: impl Into<String>, timed_out: bool) {
+        let message = message.into();
+        self.failed_calls.fetch_add(1, Ordering::Relaxed);
+        if timed_out {
+            self.timed_out_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        self.set_health(PluginHealthState::Degraded);
+        let mut error = self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *error = Some(message);
+    }
+
+    fn snapshot(&self) -> PluginHealthSnapshot {
+        let state = PluginHealthState::from_u8(self.health.load(Ordering::Acquire));
+        let name = self.name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| "<initializing>".to_owned());
+        PluginHealthSnapshot {
+            name,
+            state,
+            active_calls: self.gate.active_calls(),
+            total_calls: self.total_calls.load(Ordering::Relaxed),
+            failed_calls: self.failed_calls.load(Ordering::Relaxed),
+            timed_out_calls: self.timed_out_calls.load(Ordering::Relaxed),
+            rejected_calls: self.rejected_calls.load(Ordering::Relaxed),
+            last_error: self.last_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        }
+    }
+
+    fn set_name(&self, name: String) {
+        let mut value = self.name.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *value = Some(name);
+    }
+
+    fn call_with_timeout<R, F>(
+        self: &Arc<Self>,
+        operation: &'static str,
+        call: F
+    )
+        -> Result<R, PluginCallFailure>
+        where R: Send + 'static, F: FnOnce(&PluginRuntime) -> Result<R, String> + Send + 'static
+    {
+        let permit = match self.gate.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.rejected_calls.fetch_add(1, Ordering::Relaxed);
+                Common::Logging::Logger::Log::Dump(
+                    "{}",
+                    Common::Logging::LogConstants::LOGGERDEF,
+                    LevelFilter::Warn,
+                    &[
+                        &format!(
+                            "Plugin operation '{}' rejected: concurrency limit {} reached",
+                            operation,
+                            self.config.max_concurrent_calls
+                        ),
+                    ]
+                );
+                return Err(PluginCallFailure::Busy);
+            }
+        };
+
+        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        let runtime = Arc::clone(self);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let thread_name = format!("ezf-plugin-{operation}");
+
+        if
+            thread::Builder
+                ::new()
+                .name(thread_name)
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| call(&runtime))
+                    );
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(_) => Err(format!("plugin operation '{operation}' panicked")),
+                    };
+                    let _ = sender.send(result);
+                    drop(permit);
+                })
+                .is_err()
+        {
+            self.record_failure("failed to spawn plugin call worker thread", false);
+            return Err(
+                PluginCallFailure::Failed("failed to spawn plugin call worker thread".to_owned())
+            );
+        }
+
+        match receiver.recv_timeout(self.config.call_timeout) {
+            Ok(Ok(result)) => {
+                self.record_success();
+                Ok(result)
+            }
+            Ok(Err(error)) => {
+                self.record_failure(error.clone(), false);
+                Err(PluginCallFailure::Failed(error))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let message = format!(
+                    "plugin operation '{operation}' timed out after {:?}",
+                    self.config.call_timeout
+                );
+                self.record_failure(message.clone(), true);
+                Common::Logging::Logger::Log::Dump(
+                    "{}",
+                    Common::Logging::LogConstants::LOGGERDEF,
+                    LevelFilter::Warn,
+                    &[message.as_str()]
+                );
+                Err(PluginCallFailure::Timeout(self.config.call_timeout))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let message = format!("plugin operation '{operation}' worker disconnected");
+                self.record_failure(message.clone(), false);
+                Err(PluginCallFailure::Failed(message))
+            }
+        }
+    }
+
+    fn call_json_direct_from_bytes<R: DeserializeOwned, F>(
         &self,
-        request: &T,
+        request_bytes: &[u8],
         select_call: F
     ) -> Result<R, String>
         where F: FnOnce(&PluginVTableV1) -> PluginEndpointFnV1
     {
-        let request_bytes = serde_json
-            ::to_vec(request)
-            .map_err(|error| format!("failed to encode plugin request: {error}"))?;
-
         self.with_instance(|context, vtable| {
             let mut response = AbiBuffer::EMPTY;
             let status = unsafe {
-                select_call(vtable)(context, AbiSlice::from_bytes(&request_bytes), &mut response)
+                select_call(vtable)(context, AbiSlice::from_bytes(request_bytes), &mut response)
             };
             if status != PLUGIN_STATUS_OK {
                 if Self::is_valid_buffer(response) && !response.ptr.is_null() {
@@ -191,11 +526,9 @@ impl PluginRuntime {
                 }
                 return Err(format!("plugin ABI call failed with status {status}"));
             }
-
             if !Self::is_valid_buffer(response) {
                 return Err("plugin returned an invalid response buffer".to_owned());
             }
-
             let bytes = (unsafe { response.to_vec() }).ok_or_else(||
                 "plugin returned an invalid response buffer".to_owned()
             )?;
@@ -210,9 +543,11 @@ impl PluginRuntime {
 
     pub(crate) fn name(&self) -> Result<String, String> {
         let bytes = self.call_buffer(|vtable| vtable.name)?;
-        serde_json
-            ::from_slice(&bytes)
-            .map_err(|error| format!("failed to decode plugin name: {error}"))
+        let name = serde_json
+            ::from_slice::<String>(&bytes)
+            .map_err(|error| format!("failed to decode plugin name: {error}"))?;
+        self.set_name(name.clone());
+        Ok(name)
     }
 
     pub(crate) fn manifest(&self) -> Result<PluginManifest, String> {
@@ -222,108 +557,212 @@ impl PluginRuntime {
             .map_err(|error| format!("failed to decode plugin manifest: {error}"))
     }
 
-    pub(crate) fn is_loaded(&self) -> Result<bool, String> {
-        self.with_instance(|context, vtable| {
-            let status = unsafe { (vtable.is_loaded)(context) };
-            match status {
-                PLUGIN_STATUS_OK => Ok(true),
-                PLUGIN_STATUS_NOT_INITIALIZED => Ok(false),
-                _ => Err(format!("plugin ABI is_loaded call failed with status {status}")),
-            }
-        })?
+    pub(crate) fn is_loaded(self: &Arc<Self>) -> Result<bool, String> {
+        self.call_with_timeout("is_loaded", |runtime| {
+            runtime.with_instance(|context, vtable| {
+                let status = unsafe { (vtable.is_loaded)(context) };
+                match status {
+                    PLUGIN_STATUS_OK => Ok(true),
+                    PLUGIN_STATUS_NOT_INITIALIZED => Ok(false),
+                    _ => Err(format!("plugin ABI is_loaded call failed with status {status}")),
+                }
+            })?
+        }).map_err(|error| error.to_string())
     }
 
     pub(crate) fn handle_endpoint(
-        &self,
+        self: &Arc<Self>,
         request: PluginContracts::ApiContract::PluginEndpointRequest
     ) -> Result<
         PluginContracts::ApiContract::PluginEndpointResponse,
         PluginContracts::ApiContract::PluginEndpointError
     > {
         self
-            .call_json::<_, Result<_, _>, _>(&request, |vtable| vtable.handle_endpoint)
-            .map_err(|error|
-                PluginContracts::ApiContract::PluginEndpointError::internal(
-                    "plugin_abi_error",
-                    "The plugin ABI call failed",
-                    &error
-                )
-            )?
+            .call_with_timeout("handle_endpoint", move |runtime| {
+                let request_bytes = serde_json
+                    ::to_vec(&request)
+                    .map_err(|error| format!("failed to encode plugin request: {error}"))?;
+                runtime.call_json_direct_from_bytes(&request_bytes, |vtable| vtable.handle_endpoint)
+            })
+            .map_err(|error| {
+                match error {
+                    PluginCallFailure::Timeout(timeout) =>
+                        PluginContracts::ApiContract::PluginEndpointError::new(
+                            504,
+                            "plugin_timeout",
+                            "The plugin did not respond within the configured timeout",
+                            Some(format!("plugin call timeout: {:?}", timeout))
+                        ),
+                    PluginCallFailure::Busy =>
+                        PluginContracts::ApiContract::PluginEndpointError::new(
+                            503,
+                            "plugin_overloaded",
+                            "The plugin is currently handling its maximum number of concurrent calls",
+                            None
+                        ),
+                    PluginCallFailure::Failed(message) =>
+                        PluginContracts::ApiContract::PluginEndpointError::internal(
+                            "plugin_abi_error",
+                            "The plugin ABI call failed",
+                            message
+                        ),
+                }
+            })?
     }
 
     pub(crate) fn on_session_closed(
-        &self,
+        self: &Arc<Self>,
         context: &PluginContracts::ApiContract::PluginSessionContext
     ) -> Result<(), PluginContracts::ApiContract::PluginLifecycleError> {
+        let context = context.clone();
         self
-            .call_json::<_, Result<(), PluginContracts::ApiContract::PluginLifecycleError>, _>(
-                context,
-                |vtable| vtable.on_session_closed
-            )
-            .map_err(|error|
-                PluginContracts::ApiContract::PluginLifecycleError::new("plugin_abi_error", error)
-            )?
+            .call_with_timeout("on_session_closed", move |runtime| {
+                let request_bytes = serde_json
+                    ::to_vec(&context)
+                    .map_err(|error|
+                        format!("failed to encode session lifecycle request: {error}")
+                    )?;
+                runtime.call_json_direct_from_bytes(
+                    &request_bytes,
+                    |vtable| vtable.on_session_closed
+                )
+            })
+            .map_err(|error| {
+                match error {
+                    PluginCallFailure::Timeout(_) =>
+                        PluginContracts::ApiContract::PluginLifecycleError::new(
+                            "plugin_timeout",
+                            "Plugin session cleanup exceeded the configured timeout"
+                        ),
+                    PluginCallFailure::Busy =>
+                        PluginContracts::ApiContract::PluginLifecycleError::new(
+                            "plugin_overloaded",
+                            "Plugin session cleanup was rejected because the plugin is overloaded"
+                        ),
+                    PluginCallFailure::Failed(message) =>
+                        PluginContracts::ApiContract::PluginLifecycleError::new(
+                            "plugin_abi_error",
+                            message
+                        ),
+                }
+            })?
     }
 
     pub(crate) fn execute_database(
-        &self,
+        self: &Arc<Self>,
         request: DatabaseContracts::DatabaseRequest
     ) -> Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> {
         self
-            .call_json::<_, Result<_, _>, _>(&request, |vtable| vtable.execute_database)
-            .map_err(|error|
-                DatabaseContracts::DatabaseError::new(
-                    DatabaseContracts::DatabaseErrorKind::Decode,
-                    error
+            .call_with_timeout("execute_database", move |runtime| {
+                let request_bytes = serde_json
+                    ::to_vec(&request)
+                    .map_err(|error| format!("failed to encode database request: {error}"))?;
+                runtime.call_json_direct_from_bytes(
+                    &request_bytes,
+                    |vtable| vtable.execute_database
                 )
-            )?
+            })
+            .map_err(|error| {
+                match error {
+                    PluginCallFailure::Timeout(timeout) =>
+                        DatabaseContracts::DatabaseError::new(
+                            DatabaseContracts::DatabaseErrorKind::Query,
+                            format!("plugin database call timed out after {:?}", timeout)
+                        ),
+                    PluginCallFailure::Busy =>
+                        DatabaseContracts::DatabaseError::new(
+                            DatabaseContracts::DatabaseErrorKind::Query,
+                            "plugin database concurrency limit reached"
+                        ),
+                    PluginCallFailure::Failed(message) =>
+                        DatabaseContracts::DatabaseError::new(
+                            DatabaseContracts::DatabaseErrorKind::Decode,
+                            message
+                        ),
+                }
+            })?
     }
 
-    /// Quiesces the plugin by taking the exclusive runtime lock. Existing calls complete before
-    /// `on_unload` runs, and no new call can enter while unload is in progress.
+    /// Quiesces the plugin with a bounded wait. A timeout never forcefully unloads a library while
+    /// plugin code is still executing; the manager keeps the plugin registered so the operation
+    /// can be retried safely after the in-flight calls drain.
     fn unload(&self) -> bool {
         if self.unloading.swap(true, Ordering::AcqRel) {
-            return self.state
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .instance.is_none();
+            return false;
         }
+        self.set_health(PluginHealthState::Stopping);
 
-        // The write lock is the quiescing barrier: every call that acquired the read lock before
-        // the unload marker was set must finish before this point. Calls starting afterwards see
-        // the marker in `with_instance` and are rejected without entering plugin code.
-        let mut state = self.write_state();
+        let deadline = Instant::now() + self.config.unload_timeout;
+        let mut state = loop {
+            match self.state.try_write() {
+                Ok(state) => {
+                    break state;
+                }
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        self.unloading.store(false, Ordering::Release);
+                        self.set_health(PluginHealthState::Degraded);
+                        let message = format!(
+                            "plugin unload timed out after {:?}",
+                            self.config.unload_timeout
+                        );
+                        let mut error = self.last_error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *error = Some(message);
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+
         let Some(instance) = state.instance else {
+            self.set_health(PluginHealthState::Unloaded);
             return true;
         };
 
         let instance_ref = unsafe { &*instance };
         if instance_ref.vtable.is_null() || instance_ref.context.is_null() {
             self.unloading.store(false, Ordering::Release);
+            self.set_health(PluginHealthState::Failed);
             return false;
         }
         let vtable = unsafe { &*instance_ref.vtable };
         if !vtable.is_compatible() {
             self.unloading.store(false, Ordering::Release);
+            self.set_health(PluginHealthState::Failed);
             return false;
         }
 
         let status = unsafe { (vtable.on_unload)(instance_ref.context) };
         if status != PLUGIN_STATUS_OK {
             self.unloading.store(false, Ordering::Release);
+            self.set_health(PluginHealthState::Failed);
+            let mut error = self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *error = Some(format!("plugin on_unload returned status {status}"));
+            return false;
+        }
+
+        let destroy_status = unsafe { (vtable.destroy)(instance) };
+        if destroy_status != PLUGIN_STATUS_OK {
+            self.unloading.store(false, Ordering::Release);
+            self.set_health(PluginHealthState::Failed);
+            let mut error = self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *error = Some(format!("plugin destroy returned status {destroy_status}"));
+            Common::Logging::Logger::Log::Dump(
+                "{}",
+                Common::Logging::LogConstants::LOGGERDEF,
+                LevelFilter::Error,
+                &[
+                    "Plugin instance destruction reported an ABI error; runtime stays loaded for retry.",
+                ]
+            );
             return false;
         }
 
         state.instance = None;
-        let destroy_status = unsafe { (vtable.destroy)(instance) };
-        if destroy_status != PLUGIN_STATUS_OK {
-            Common::Logging::Logger::Log::Dump(
-                "{}",
-                Common::Logging::LogConstants::LOGGERDEF,
-                LevelFilter::Warn,
-                &["Plugin instance destruction reported an ABI error."]
-            );
-        }
+        self.set_health(PluginHealthState::Unloaded);
         true
     }
 }
@@ -431,6 +870,10 @@ impl PluginItem {
         Arc::clone(&self.runtime)
     }
 
+    pub(crate) fn health(&self) -> PluginHealthSnapshot {
+        self.runtime.snapshot()
+    }
+
     pub(crate) fn unload(&mut self) -> bool {
         self.runtime.unload()
     }
@@ -527,7 +970,7 @@ impl PluginManager {
         let item = PluginItem {
             path: canonical_path.to_path_buf(),
             manifest: loaded.manifest.clone(),
-            runtime: Arc::new(loaded.runtime),
+            runtime: loaded.runtime,
         };
 
         self.plugins.insert(id, item);
@@ -573,7 +1016,10 @@ impl PluginManager {
         Ok(())
     }
 
-    pub(crate) fn load_plugin(path: &Path) -> Result<LoadedPlugin, PluginManagerError> {
+    pub(crate) fn load_plugin(
+        path: &Path,
+        config: PluginRuntimeConfig
+    ) -> Result<LoadedPlugin, PluginManagerError> {
         let library = (unsafe { Library::new(path) }).map_err(|source| {
             PluginManagerError::LibraryLoad {
                 path: path.to_path_buf(),
@@ -606,7 +1052,7 @@ impl PluginManager {
         // plugin directory therefore remains valid for every initialization callback without
         // requiring the plugin to retain host-owned memory.
         let instance = unsafe { constructor(&host_services) };
-        let runtime = PluginRuntime::new(instance, library).map_err(|message| {
+        let runtime = PluginRuntime::new(instance, library, config).map_err(|message| {
             PluginManagerError::PluginAbiIncompatible {
                 path: path.to_path_buf(),
                 message,
@@ -688,7 +1134,7 @@ unsafe extern "C" fn host_log(level: u8, message: PluginAbi::AbiSlice) {
 }
 
 pub(crate) struct LoadedPlugin {
-    runtime: PluginRuntime,
+    runtime: Arc<PluginRuntime>,
     manifest: PluginManifest,
 }
 

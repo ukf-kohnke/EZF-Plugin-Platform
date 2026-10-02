@@ -14,6 +14,7 @@
 //! - Broadcast sanitized backend-session lifecycle events to loaded plugins.
 //! - Expose inspection helpers (loaded names/ids, count, catalog, `has_plugins`).
 //! - Unload a single plugin or all plugins.
+//! - Expose bounded runtime execution, health snapshots, and a readiness gate.
 //!
 //! # Error model
 //!
@@ -47,6 +48,9 @@
 //! - Name-based lookup is the canonical way to select a plugin at runtime.
 //! - `with_plugin_by_name`, `with_all_plugins`, and `with_database_plugin` provide scoped shared
 //!   access to plugin instances via closures. Database execution is selected by manifest capability.
+//! - Plugin call limits default to 30s call timeout, 10s unload timeout, and 64 concurrent calls.
+//!   They can be overridden with `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`,
+//!   and `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, or supplied explicitly to the `*_with_config` load APIs.
 //!
 //! # Return conventions
 //!
@@ -59,6 +63,7 @@
 mod PluginManager;
 pub mod Factory {
     use super::PluginManager::{ PluginManager, PluginProxy };
+    pub use super::PluginManager::{ PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
     use PluginContracts::{
         IPlugin::IPlugin,
         ApiContract::{
@@ -379,7 +384,15 @@ pub mod Factory {
             manager.detach_plugin(id)?
         };
 
+        let started = std::time::Instant::now();
         if item.unload() {
+            let elapsed = started.elapsed();
+            Common::Logging::Logger::Log::Dump(
+                "{}",
+                Common::Logging::LogConstants::LOGGERDEF,
+                log::LevelFilter::Info,
+                &[&format!("Plugin unloaded successfully: id={} after {:?}", id, elapsed)]
+            );
             drop(item);
             Ok(())
         } else {
@@ -388,6 +401,12 @@ pub mod Factory {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             manager.restore_plugin(id, item);
+            Common::Logging::Logger::Log::Dump(
+                "{}",
+                Common::Logging::LogConstants::LOGGERDEF,
+                log::LevelFilter::Error,
+                &[&format!("Plugin unload failed or timed out: id={}", id)]
+            );
             Err(PluginManagerError::PluginUnloadFailed { id })
         }
     }
@@ -412,7 +431,9 @@ pub mod Factory {
             .plugin_ids()
             .into_iter()
             .find(|id|
-                manager.get_manifest(*id).is_some_and(|manifest| manifest.name == plugin_name)
+                manager
+                    .get_manifest(*id)
+                    .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(plugin_name))
             )
     }
 
@@ -447,10 +468,20 @@ pub mod Factory {
     }
 
     pub fn load_plugin_file(path: &Path) -> Result<i64, PluginManagerError> {
-        load_plugin_file_inner(path)
+        load_plugin_file_with_config(path, PluginRuntimeConfig::from_environment())
     }
 
-    fn load_plugin_file_inner(path: &Path) -> Result<i64, PluginManagerError> {
+    pub fn load_plugin_file_with_config(
+        path: &Path,
+        config: PluginRuntimeConfig
+    ) -> Result<i64, PluginManagerError> {
+        load_plugin_file_inner(path, config)
+    }
+
+    fn load_plugin_file_inner(
+        path: &Path,
+        config: PluginRuntimeConfig
+    ) -> Result<i64, PluginManagerError> {
         let canonical_path = PluginManager::normalize_path(path);
 
         {
@@ -477,7 +508,7 @@ pub mod Factory {
             }
         }
 
-        let loaded = PluginManager::load_plugin(&canonical_path)?;
+        let loaded = PluginManager::load_plugin(&canonical_path, config)?;
         let plugin_manifest = loaded.manifest().clone();
 
         let result = {
@@ -500,17 +531,46 @@ pub mod Factory {
             }
         };
 
+        if let Ok(id) = result.as_ref() {
+            Common::Logging::Logger::Log::Dump(
+                "{}",
+                Common::Logging::LogConstants::LOGGERDEF,
+                log::LevelFilter::Info,
+                &[&format!(
+                    "Plugin loaded successfully: '{}' (id={}) from '{}'",
+                    plugin_manifest.name,
+                    id,
+                    canonical_path.display()
+                )]
+            );
+        }
         result
     }
 
     pub fn load_plugins(plugin_path: &str) -> Result<usize, PluginManagerError> {
-        let report = load_plugins_with_policy(plugin_path, PluginLoadPolicy::required_all())?;
+        let report = load_plugins_with_policy_and_config(
+            plugin_path,
+            PluginLoadPolicy::required_all(),
+            PluginRuntimeConfig::from_environment()
+        )?;
         Ok(report.loaded_count())
     }
 
     pub fn load_plugins_with_policy(
         plugin_path: &str,
         policy: PluginLoadPolicy
+    ) -> Result<PluginLoadReport, PluginManagerError> {
+        load_plugins_with_policy_and_config(
+            plugin_path,
+            policy,
+            PluginRuntimeConfig::from_environment()
+        )
+    }
+
+    pub fn load_plugins_with_policy_and_config(
+        plugin_path: &str,
+        policy: PluginLoadPolicy,
+        config: PluginRuntimeConfig
     ) -> Result<PluginLoadReport, PluginManagerError> {
         let entries = PluginManager::discover_plugin_paths(plugin_path)?;
         let mut report = PluginLoadReport {
@@ -558,7 +618,7 @@ pub mod Factory {
                 }
             };
 
-            let loaded = match PluginManager::load_plugin(&canonical_path) {
+            let loaded = match PluginManager::load_plugin(&canonical_path, config) {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     let error_text = error.to_string();
@@ -630,7 +690,32 @@ pub mod Factory {
                     .iter()
                     .any(|loaded_name| normalize_plugin_name(loaded_name) == *configured_name);
 
-            if !present {
+            let matching_failure_index = report.failures.iter().position(|failure| {
+                failure
+                    .plugin_name
+                    .as_deref()
+                    .is_some_and(|name| normalize_plugin_name(name) == *configured_name)
+                    || failure
+                        .path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| normalize_plugin_name(stem) == *configured_name)
+            });
+
+            // A required plugin may fail before its manifest can be read (for example,
+            // when the DLL is not a valid dynamic library). In that case we still want
+            // the load report to identify the failed required plugin when the configured
+            // name unambiguously matches the failing file, without creating a duplicate
+            // synthetic failure for the same root cause.
+            if let Some(index) = matching_failure_index {
+                if report.failures[index].plugin_name.is_none() {
+                    report.failures[index].plugin_name = Some(configured_name.clone());
+                }
+            }
+
+            let already_reported_for_name = matching_failure_index.is_some();
+
+            if !present && !already_reported_for_name {
                 report.failures.push(PluginLoadFailure {
                     path: PathBuf::from(plugin_path),
                     plugin_name: Some(configured_name.clone()),
@@ -640,6 +725,10 @@ pub mod Factory {
             }
         }
 
+        // A required plugin load failure already represents the missing/unusable plugin.
+        // Do not add a second synthetic "not discovered or loaded" failure for the same
+        // configured name; that would double-count one root cause and make the load report
+        // misleading.
         if report.discovered.is_empty() && report.failures.is_empty() {
             Common::Logging::Logger::Log::Dump(
                 "{}",
@@ -698,6 +787,46 @@ pub mod Factory {
         plugin_path: &str
     ) -> Result<bool, PluginManagerError> {
         is_plugin_loaded(plugin_name, plugin_path)
+    }
+
+    /// Returns health/telemetry snapshots for all loaded plugins in deterministic plugin-id order.
+    pub fn plugin_health() -> Vec<PluginHealthSnapshot> {
+        let singleton = instance();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        manager
+            .plugin_ids()
+            .into_iter()
+            .filter_map(|id| manager.plugins.get(&id).map(|item| item.health()))
+            .collect()
+    }
+
+    /// Returns the health snapshot for a specific plugin using case-insensitive name matching.
+    pub fn plugin_health_by_name(plugin_name: &str) -> Option<PluginHealthSnapshot> {
+        let singleton = instance();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        manager
+            .plugin_ids()
+            .into_iter()
+            .find_map(|id| {
+                let item = manager.plugins.get(&id)?;
+                item.manifest().name.eq_ignore_ascii_case(plugin_name).then(|| item.health())
+            })
+    }
+
+    /// Returns an error unless every loaded plugin is currently ready. This can be used as a
+    /// startup/readiness gate after plugin discovery and before serving traffic.
+    pub fn check_readiness() -> Result<(), String> {
+        let health = plugin_health();
+        let degraded = health
+            .iter()
+            .filter(|snapshot| snapshot.state != PluginHealthState::Ready)
+            .map(|snapshot| format!("{}={:?}", snapshot.name, snapshot.state))
+            .collect::<Vec<_>>();
+        if degraded.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("plugin readiness check failed: {}", degraded.join(", ")))
+        }
     }
 
     /// Returns whether a database-capable data-source plugin is currently loaded.
@@ -825,7 +954,9 @@ pub mod Factory {
                 .plugin_ids()
                 .into_iter()
                 .find(|id|
-                    manager.get_manifest(*id).is_some_and(|manifest| manifest.name == plugin_name)
+                    manager
+                    .get_manifest(*id)
+                    .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(plugin_name))
                 )?;
             manager.get_runtime(id)?
         };
@@ -982,7 +1113,9 @@ pub mod Factory {
                 .plugin_ids()
                 .into_iter()
                 .find(|id|
-                    manager.get_manifest(*id).is_some_and(|manifest| manifest.name == plugin_name)
+                    manager
+                    .get_manifest(*id)
+                    .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(plugin_name))
                 )
                 .ok_or_else(||
                     PluginEndpointError::not_found(

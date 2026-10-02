@@ -1,6 +1,18 @@
 use PluginContracts::ApiContract::{ PluginHttpMethod, PluginEndpointRequest, PluginPrincipal };
-use PluginHost::Factory::{ self, PluginLoadPolicy, PluginManagerError, PluginRequirement };
-use std::{ fs, path::PathBuf, process::Command, sync::Mutex };
+use PluginHost::Factory::{
+    self,
+    PluginHealthState,
+    PluginLoadPolicy,
+    PluginManagerError,
+    PluginRequirement,
+    PluginRuntimeConfig,
+};
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::{ atomic::{ AtomicUsize, Ordering }, Mutex, MutexGuard },
+};
 
 fn fixture_manifest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
@@ -27,9 +39,11 @@ fn build_fixture() -> PathBuf {
     let manifest = fixture_manifest_path();
     assert!(manifest.is_file(), "dedicated PluginHost test-plugin manifest must exist");
 
+    static BUILD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let build_id = BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp_dir = std::env
         ::temp_dir()
-        .join(format!("ezf-pluginhost-dylib-{}", std::process::id()));
+        .join(format!("ezf-pluginhost-dylib-{}-{}", std::process::id(), build_id));
     let target_dir = temp_dir.join("target");
     fs::create_dir_all(&target_dir).expect("fixture target directory must be creatable");
 
@@ -70,13 +84,45 @@ fn ping_request() -> PluginEndpointRequest {
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+struct TestGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        // Dynamic-library tests share PluginHost's process-global registry. Always tear down
+        // anything left by a failed test so one panic cannot contaminate later tests.
+        for _ in 0..3 {
+            let ids = Factory::loaded_plugin_ids();
+            if ids.is_empty() {
+                break;
+            }
+            let mut remaining = false;
+            for id in ids {
+                if Factory::unload_plugin(id).is_err() {
+                    remaining = true;
+                }
+            }
+            if !remaining {
+                break;
+            }
+        }
+    }
+}
+
+fn lock_test() -> TestGuard {
+    TestGuard {
+        _lock: TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+    }
+}
+
 fn cleanup_plugin(id: i64) {
     Factory::unload_plugin(id).expect("test plugin must unload cleanly");
 }
 
 #[test]
 fn loads_executes_unloads_and_reloads_a_real_dynamic_library() {
-    let _test_guard = TEST_LOCK.lock().expect("test lock must not be poisoned");
+    let _test_guard = lock_test();
     let library = build_fixture();
     let id = Factory::load_plugin_file(&library).expect("fixture library must load");
 
@@ -93,6 +139,14 @@ fn loads_executes_unloads_and_reloads_a_real_dynamic_library() {
     assert_eq!(body["plugin"], "PluginHostIntegration");
     assert_eq!(body["loaded"], true);
     assert_eq!(body["endpoint"], "ping");
+
+    let health = Factory::plugin_health_by_name("pluginhostintegration").expect(
+        "loaded fixture health must be available"
+    );
+    assert_eq!(health.state, PluginHealthState::Ready);
+    assert!(health.total_calls >= 1);
+    assert_eq!(health.failed_calls, 0);
+    Factory::check_readiness().expect("healthy loaded plugin must pass the readiness gate");
 
     cleanup_plugin(id);
     assert_eq!(Factory::plugin_count(), 0);
@@ -153,7 +207,7 @@ fn loads_executes_unloads_and_reloads_a_real_dynamic_library() {
 
 #[test]
 fn loading_is_deterministic_and_optional_failures_are_reported_without_aborting() {
-    let _test_guard = TEST_LOCK.lock().expect("test lock must not be poisoned");
+    let _test_guard = lock_test();
     let library = build_fixture();
     let temp = std::env
         ::temp_dir()
@@ -225,7 +279,7 @@ fn loading_is_deterministic_and_optional_failures_are_reported_without_aborting(
 
 #[test]
 fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
-    let _test_guard = TEST_LOCK.lock().expect("test lock must not be poisoned");
+    let _test_guard = lock_test();
     let library = build_fixture();
     let id = Factory::load_plugin_file(&library).expect("fixture library must load");
 
@@ -250,12 +304,14 @@ fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
     }
 
     let first = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", slow_request())
-            .expect("first concurrent endpoint call must succeed")
+        Factory::handle_endpoint("PluginHostIntegration", slow_request()).expect(
+            "first concurrent endpoint call must succeed"
+        )
     });
     let second = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", slow_request())
-            .expect("second concurrent endpoint call must succeed")
+        Factory::handle_endpoint("PluginHostIntegration", slow_request()).expect(
+            "second concurrent endpoint call must succeed"
+        )
     });
 
     let first_response = first.join().expect("first endpoint thread must finish");
@@ -263,7 +319,8 @@ fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
 
     for response in [first_response, second_response] {
         assert_eq!(response.status, 200);
-        let body: serde_json::Value = serde_json::from_slice(&response.body)
+        let body: serde_json::Value = serde_json
+            ::from_slice(&response.body)
             .expect("slow endpoint response must contain valid JSON");
         assert!(body["peak_active"].as_u64().unwrap_or_default() >= 2);
     }
@@ -273,8 +330,115 @@ fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
 }
 
 #[test]
+fn timed_plugin_calls_return_without_detaching_the_running_library() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_millis(50),
+        unload_timeout: std::time::Duration::from_secs(2),
+        max_concurrent_calls: 2,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config).expect(
+        "fixture library must load with custom runtime limits"
+    );
+
+    let response = Factory::handle_endpoint("PluginHostIntegration", { PluginEndpointRequest {
+            endpoint_id: "slow".to_owned(),
+            method: PluginHttpMethod::Get,
+            raw_path: "/pluginhost-integration/slow".to_owned(),
+            base_path: "/".to_owned(),
+            raw_query: None,
+            content_type: None,
+            body: Vec::new(),
+            principal: PluginPrincipal {
+                user_id: "integration-test".to_owned(),
+                username: "integration-test".to_owned(),
+                given_name: "Integration".to_owned(),
+                family_name: "Test".to_owned(),
+                groups: Vec::new(),
+                session_id: "integration-session".to_owned(),
+            },
+        } }).expect_err("slow plugin call must exceed the custom timeout");
+
+    assert_eq!(response.status, 504);
+    assert_eq!(response.code, "plugin_timeout");
+    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "timed-out fixture health must be available"
+    );
+    assert_eq!(health.state, PluginHealthState::Degraded);
+    assert_eq!(health.timed_out_calls, 1);
+    assert_eq!(health.active_calls, 1);
+
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    Factory::unload_plugin(id).expect("library must remain safely unloadable after timeout");
+    assert_eq!(Factory::plugin_count(), 0);
+    let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn unload_timeout_keeps_the_plugin_registered_until_quiescing_succeeds() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_secs(2),
+        unload_timeout: std::time::Duration::from_millis(25),
+        max_concurrent_calls: 2,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config).expect(
+        "fixture library must load with bounded unload timeout"
+    );
+
+    let request = PluginEndpointRequest {
+        endpoint_id: "slow".to_owned(),
+        method: PluginHttpMethod::Get,
+        raw_path: "/pluginhost-integration/slow".to_owned(),
+        base_path: "/".to_owned(),
+        raw_query: None,
+        content_type: None,
+        body: Vec::new(),
+        principal: PluginPrincipal {
+            user_id: "integration-test".to_owned(),
+            username: "integration-test".to_owned(),
+            given_name: "Integration".to_owned(),
+            family_name: "Test".to_owned(),
+            groups: Vec::new(),
+            session_id: "integration-session".to_owned(),
+        },
+    };
+
+    let worker = std::thread::spawn(move || {
+        Factory::handle_endpoint("PluginHostIntegration", request).expect(
+            "slow endpoint call must remain valid while unload is blocked"
+        )
+    });
+
+    let marker = library.parent().unwrap().join("slow-entered.marker");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker.is_file() {
+        assert!(std::time::Instant::now() < deadline, "slow endpoint did not signal entry");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let error = Factory::unload_plugin(id).expect_err(
+        "unload must respect the configured quiescing timeout"
+    );
+    assert!(matches!(error, PluginManagerError::PluginUnloadFailed { .. }));
+    assert_eq!(Factory::plugin_count(), 1);
+    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "plugin must stay registered after bounded unload failure"
+    );
+    assert_eq!(health.state, PluginHealthState::Degraded);
+
+    let response = worker.join().expect("slow endpoint worker must finish");
+    assert_eq!(response.status, 200);
+    Factory::unload_plugin(id).expect("plugin must be unloadable after the call drains");
+    assert_eq!(Factory::plugin_count(), 0);
+    let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
 fn unload_waits_for_in_flight_plugin_calls_before_destroying_the_instance() {
-    let _test_guard = TEST_LOCK.lock().expect("test lock must not be poisoned");
+    let _test_guard = lock_test();
     let library = build_fixture();
     let id = Factory::load_plugin_file(&library).expect("fixture library must load");
 
@@ -302,8 +466,9 @@ fn unload_waits_for_in_flight_plugin_calls_before_destroying_the_instance() {
     let _ = std::fs::remove_file(&marker);
 
     let worker = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", slow_request())
-            .expect("in-flight endpoint call must succeed")
+        Factory::handle_endpoint("PluginHostIntegration", slow_request()).expect(
+            "in-flight endpoint call must succeed"
+        )
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -318,9 +483,504 @@ fn unload_waits_for_in_flight_plugin_calls_before_destroying_the_instance() {
 
     let response = worker.join().expect("endpoint thread must finish");
     assert_eq!(response.status, 200);
-    assert!(elapsed >= std::time::Duration::from_millis(150),
-        "unload returned before the in-flight call drained: {:?}", elapsed);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "unload returned before the in-flight call drained: {:?}",
+        elapsed
+    );
     assert_eq!(Factory::plugin_count(), 0);
 
     let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}
+
+fn build_malformed_fixture() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/pluginhost_malformed_abi_fixture/Cargo.toml"
+    );
+    assert!(manifest.is_file(), "malformed ABI fixture manifest must exist");
+
+    let temp_dir = std::env
+        ::temp_dir()
+        .join(format!("ezf-pluginhost-malformed-{}", std::process::id()));
+    let target_dir = temp_dir.join("target");
+    fs::create_dir_all(&target_dir).expect("malformed fixture target directory must be creatable");
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .arg("--quiet")
+        .status()
+        .expect("cargo must be available to build the malformed ABI fixture");
+    assert!(status.success(), "malformed ABI fixture failed to build");
+
+    target_dir.join("debug").join(match std::env::consts::DLL_EXTENSION {
+        "dll" => "pluginhost_malformed_abi_fixture.dll",
+        "dylib" => "libpluginhost_malformed_abi_fixture.dylib",
+        _ => "libpluginhost_malformed_abi_fixture.so",
+    })
+}
+
+fn fixture_mode(mode: Option<&str>) -> Option<String> {
+    let previous = std::env::var("EZF_PLUGIN_FIXTURE_MODE").ok();
+    unsafe {
+        match mode {
+            Some(value) => std::env::set_var("EZF_PLUGIN_FIXTURE_MODE", value),
+            None => std::env::remove_var("EZF_PLUGIN_FIXTURE_MODE"),
+        }
+    }
+    previous
+}
+
+fn restore_fixture_mode(previous: Option<String>) {
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("EZF_PLUGIN_FIXTURE_MODE", value),
+            None => std::env::remove_var("EZF_PLUGIN_FIXTURE_MODE"),
+        }
+    }
+}
+
+#[test]
+fn malformed_abi_dynamic_libraries_are_rejected_without_registration() {
+    let _test_guard = lock_test();
+    let library = build_malformed_fixture();
+    let cases = [
+        "constructor_null",
+        "bad_instance_version",
+        "bad_instance_size",
+        "null_context",
+        "null_vtable",
+        "bad_vtable_version",
+        "bad_vtable_size",
+    ];
+
+    for case in cases {
+        let previous = {
+            let old = std::env::var("EZF_MALFORMED_ABI_KIND").ok();
+            unsafe {
+                std::env::set_var("EZF_MALFORMED_ABI_KIND", case);
+            }
+            old
+        };
+
+        let error = Factory::load_plugin_file(&library).expect_err(
+            "malformed ABI library must be rejected"
+        );
+        assert!(
+            matches!(error, PluginManagerError::PluginAbiIncompatible { .. }),
+            "unexpected error for malformed ABI case {case}: {error}"
+        );
+        assert_eq!(Factory::plugin_count(), 0, "malformed case {case} must not register a plugin");
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("EZF_MALFORMED_ABI_KIND", value),
+                None => std::env::remove_var("EZF_MALFORMED_ABI_KIND"),
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn plugin_panic_is_isolated_and_the_runtime_can_continue_serving_requests() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let previous = fixture_mode(Some("panic"));
+    let id = Factory::load_plugin_file(&library).expect("panic fixture must load");
+    restore_fixture_mode(previous);
+
+    let mut request = ping_request();
+    request.endpoint_id = "panic".to_owned();
+    request.raw_path = "/pluginhost-integration/panic".to_owned();
+
+    let error = Factory::handle_endpoint("PluginHostIntegration", request).expect_err(
+        "intentional plugin panic must cross the ABI as an error"
+    );
+    assert_eq!(error.status, 500);
+    assert_eq!(error.code, "plugin_abi_error");
+
+    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "panicked plugin health must be available"
+    );
+    assert_eq!(health.state, PluginHealthState::Degraded);
+    assert_eq!(health.failed_calls, 1);
+
+    let response = Factory::handle_endpoint("PluginHostIntegration", ping_request()).expect(
+        "a subsequent non-panicking call must still succeed"
+    );
+    assert_eq!(response.status, 200);
+
+    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "healthy follow-up health must be available"
+    );
+    assert_eq!(health.state, PluginHealthState::Ready);
+    assert_eq!(health.failed_calls, 1);
+
+    cleanup_plugin(id);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn on_unload_failure_keeps_the_plugin_registered_and_allows_retry() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let previous = fixture_mode(Some("on_unload_failure"));
+    let id = Factory::load_plugin_file(&library).expect("unload-failure fixture must load");
+    restore_fixture_mode(previous);
+
+    let error = Factory::unload_plugin(id).expect_err("first unload must fail deliberately");
+    assert!(matches!(error, PluginManagerError::PluginUnloadFailed { .. }));
+    assert_eq!(Factory::plugin_count(), 1);
+
+    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "failed unload health must be available"
+    );
+    assert_eq!(health.state, PluginHealthState::Failed);
+    assert!(library.parent().unwrap().join("unload.marker").is_file());
+
+    Factory::unload_plugin(id).expect("second unload must succeed after the one-shot failure");
+    assert_eq!(Factory::plugin_count(), 0);
+    assert!(library.parent().unwrap().join("destroy.marker").is_file());
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn destroy_failure_keeps_the_instance_and_library_loaded_until_retry_succeeds() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let previous = fixture_mode(Some("destroy_failure"));
+    let id = Factory::load_plugin_file(&library).expect("destroy-failure fixture must load");
+    restore_fixture_mode(previous);
+
+    let error = Factory::unload_plugin(id).expect_err("first destroy must fail deliberately");
+    assert!(matches!(error, PluginManagerError::PluginUnloadFailed { .. }));
+    assert_eq!(Factory::plugin_count(), 1);
+
+    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "failed destroy health must be available"
+    );
+    assert_eq!(health.state, PluginHealthState::Failed);
+    assert!(
+        health.last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("destroy returned status"))
+    );
+
+    Factory::unload_plugin(id).expect("second destroy must succeed after the one-shot failure");
+    assert_eq!(Factory::plugin_count(), 0);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn catalog_registration_failure_rolls_back_the_loaded_library_and_instance() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let first = Factory::load_plugin_file(&library).expect("base fixture must load");
+
+    let conflict_dir = std::env
+        ::temp_dir()
+        .join(format!("ezf-pluginhost-catalog-rollback-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&conflict_dir);
+    fs::create_dir_all(&conflict_dir).expect("catalog rollback directory must be creatable");
+    let conflict_library = conflict_dir.join(match std::env::consts::DLL_EXTENSION {
+        "dll" => "conflict.dll",
+        "dylib" => "conflict.dylib",
+        _ => "conflict.so",
+    });
+    fs::copy(&library, &conflict_library).expect("conflict fixture must be copied");
+
+    let previous = fixture_mode(Some("catalog_conflict"));
+    let error = Factory::load_plugin_file(&conflict_library).expect_err(
+        "catalog route conflict must reject registration"
+    );
+    restore_fixture_mode(previous);
+
+    assert!(matches!(error, PluginManagerError::InvalidCatalog(_)));
+    assert_eq!(Factory::plugin_count(), 1, "rollback must preserve the already loaded plugin");
+    assert!(conflict_dir.join("load-conflict.marker").is_file());
+    assert!(conflict_dir.join("unload.marker").is_file());
+    assert!(conflict_dir.join("destroy.marker").is_file());
+
+    cleanup_plugin(first);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+    let _ = fs::remove_dir_all(conflict_dir);
+}
+
+#[test]
+fn required_and_optional_loading_policy_covers_success_failure_and_missing_plugin_cases() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let root = std::env
+        ::temp_dir()
+        .join(format!("ezf-pluginhost-policy-matrix-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("policy matrix root must be creatable");
+
+    let good = root.join("PluginHostIntegration");
+    let good_file = good.with_extension(std::env::consts::DLL_EXTENSION);
+    fs::copy(&library, &good_file).expect("good plugin must be copied");
+
+    let report = Factory::load_plugins_with_policy(
+        root.to_str().unwrap(),
+        PluginLoadPolicy::required_all()
+    ).expect("required valid plugin must load");
+    assert_eq!(report.loaded, vec!["PluginHostIntegration"]);
+    assert!(report.failures.is_empty());
+    let id = Factory::loaded_plugin_ids().into_iter().next().expect("plugin id must exist");
+    cleanup_plugin(id);
+
+    let optional_broken = root.join(format!("optional_broken.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&optional_broken, b"not a dynamic library").expect(
+        "optional broken file must be written"
+    );
+    let report = Factory::load_plugins_with_policy(
+        root.to_str().unwrap(),
+        PluginLoadPolicy::optional_all()
+    ).expect("optional broken plugin must not abort loading");
+    assert_eq!(report.loaded, vec!["PluginHostIntegration"]);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].requirement, PluginRequirement::Optional);
+    let id = Factory::loaded_plugin_ids().into_iter().next().expect("plugin id must exist");
+    cleanup_plugin(id);
+    fs::remove_file(&good_file).expect("good fixture must be removable");
+
+    let required_broken = root.join(format!("requiredbroken.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&required_broken, b"not a dynamic library").expect(
+        "required broken file must be written"
+    );
+    let error = Factory::load_plugins_with_policy(
+        root.to_str().unwrap(),
+        PluginLoadPolicy::optional_all().require("requiredbroken")
+    ).expect_err("required broken plugin must abort loading");
+    match error {
+        PluginManagerError::PluginLoadPolicyViolation { report } => {
+            assert!(report.has_required_failures());
+            assert_eq!(report.required_failures().len(), 1);
+            assert_eq!(
+                report.required_failures()[0].plugin_name.as_deref(),
+                Some("requiredbroken")
+            );
+        }
+        other => panic!("unexpected required broken policy error: {other}"),
+    }
+    fs::remove_file(&required_broken).expect("required broken fixture must be removable");
+
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).expect("empty policy directory must be creatable");
+    let error = Factory::load_plugins_with_policy(
+        empty.to_str().unwrap(),
+        PluginLoadPolicy::optional_all().require("MissingRequiredPlugin")
+    ).expect_err("missing required plugin must abort loading");
+    match error {
+        PluginManagerError::PluginLoadPolicyViolation { report } => {
+            assert!(report.has_required_failures());
+            assert_eq!(
+                report.required_failures()[0].plugin_name.as_deref(),
+                Some("missingrequiredplugin")
+            );
+        }
+        other => panic!("unexpected missing required policy error: {other}"),
+    }
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+static DATABASE_CAPABILITY_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(
+    0
+);
+
+unsafe extern "C" fn test_database_execute(
+    request: PluginContracts::PluginAbi::AbiSlice,
+    response_out: *mut PluginContracts::PluginAbi::AbiBuffer
+) -> i32 {
+    if response_out.is_null() {
+        return PluginContracts::PluginAbi::PLUGIN_STATUS_INVALID_ARGUMENT;
+    }
+
+    let request = (unsafe { request.to_vec() }).and_then(|bytes|
+        serde_json::from_slice::<DatabaseContracts::DatabaseRequest>(&bytes).ok()
+    );
+    if request.is_none() {
+        return PluginContracts::PluginAbi::PLUGIN_STATUS_INVALID_ARGUMENT;
+    }
+
+    DATABASE_CAPABILITY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let result: Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> = Ok(
+        DatabaseContracts::DatabaseResponse::Execute(DatabaseContracts::ExecutionResult {
+            rows_affected: 42,
+        })
+    );
+    let bytes = serde_json::to_vec(&result).expect("test database response must serialize");
+    unsafe {
+        *response_out = PluginContracts::PluginAbi::AbiBuffer::from_vec(bytes);
+    }
+    PluginContracts::PluginAbi::PLUGIN_STATUS_OK
+}
+
+unsafe extern "C" fn test_database_free(buffer: PluginContracts::PluginAbi::AbiBuffer) {
+    unsafe {
+        buffer.free();
+    }
+}
+
+#[test]
+fn database_capability_crosses_the_real_plugin_abi_boundary() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+
+    DATABASE_CAPABILITY_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    Factory::register_database_executor(test_database_execute, test_database_free).expect(
+        "test database capability must be registered once"
+    );
+
+    let previous = fixture_mode(Some("database"));
+    let id = Factory::load_plugin_file(&library).expect("database bridge fixture must load");
+    restore_fixture_mode(previous);
+
+    let request = DatabaseContracts::DatabaseRequest::Execute(DatabaseContracts::ExecuteRequest {
+        statement: "UPDATE test_table SET value = 1".to_owned(),
+        parameters: Vec::new(),
+    });
+    let response = Factory::with_database_plugin(|plugin| plugin.execute_database(request.clone()))
+        .expect("exactly one database plugin must be selected")
+        .expect("plugin database bridge must execute through host capability");
+
+    assert_eq!(DATABASE_CAPABILITY_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        response,
+        DatabaseContracts::DatabaseResponse::Execute(DatabaseContracts::ExecutionResult {
+            rows_affected: 42,
+        })
+    );
+
+    cleanup_plugin(id);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn plugin_concurrency_limit_rejects_excess_calls_and_reports_overload() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        // The fixture deliberately sleeps for 200 ms. Keep the execution timeout above that
+        // duration so this test isolates the admission/concurrency limit rather than timing out
+        // the admitted call itself.
+        call_timeout: std::time::Duration::from_secs(1),
+        unload_timeout: std::time::Duration::from_secs(2),
+        max_concurrent_calls: 1,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config).expect(
+        "fixture library must load with a single-call concurrency limit"
+    );
+
+    let marker = library.parent().unwrap().join("slow-entered.marker");
+    let _ = fs::remove_file(&marker);
+    let first = std::thread::spawn(|| {
+        let mut request = ping_request();
+        request.endpoint_id = "slow".to_owned();
+        request.raw_path = "/pluginhost-integration/slow".to_owned();
+        Factory::handle_endpoint("PluginHostIntegration", request).expect(
+            "first slow call must succeed"
+        )
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker.is_file() {
+        assert!(std::time::Instant::now() < deadline, "first slow call did not signal entry");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let mut second_request = ping_request();
+    second_request.endpoint_id = "slow".to_owned();
+    second_request.raw_path = "/pluginhost-integration/slow".to_owned();
+    let error = Factory::handle_endpoint("PluginHostIntegration", second_request).expect_err(
+        "second call must be rejected while the concurrency limit is full"
+    );
+    assert_eq!(error.status, 503);
+    assert_eq!(error.code, "plugin_overloaded");
+
+    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "overloaded plugin health must be available"
+    );
+    assert_eq!(health.active_calls, 1);
+    assert_eq!(health.rejected_calls, 1);
+
+    let first_response = first.join().expect("first slow call worker must finish");
+    assert_eq!(first_response.status, 200);
+    cleanup_plugin(id);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn concurrent_load_and_unload_for_the_same_library_are_serialized_and_reload_remains_possible() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_secs(2),
+        unload_timeout: std::time::Duration::from_secs(2),
+        max_concurrent_calls: 2,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config).expect(
+        "fixture library must load before concurrent lifecycle test"
+    );
+
+    let marker = library.parent().unwrap().join("slow-entered.marker");
+    let _ = fs::remove_file(&marker);
+    let worker = std::thread::spawn(|| {
+        let mut request = ping_request();
+        request.endpoint_id = "slow".to_owned();
+        request.raw_path = "/pluginhost-integration/slow".to_owned();
+        Factory::handle_endpoint("PluginHostIntegration", request).expect(
+            "slow endpoint must remain valid during unload"
+        )
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker.is_file() {
+        assert!(std::time::Instant::now() < deadline, "slow endpoint did not signal entry");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let unload_id = id;
+    let unload_thread = std::thread::spawn(move || Factory::unload_plugin(unload_id));
+
+    let mut observed_load_in_progress = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match Factory::load_plugin_file_with_config(&library, config) {
+            Ok(new_id) => {
+                panic!("same library loaded concurrently while unload was in progress: {new_id}");
+            }
+            Err(PluginManagerError::PluginLoadInProgress { .. }) => {
+                observed_load_in_progress = true;
+                break;
+            }
+            Err(PluginManagerError::PluginAlreadyLoaded { .. }) => {
+                std::thread::yield_now();
+            }
+            Err(other) => panic!("unexpected concurrent load error: {other}"),
+        }
+    }
+
+    assert!(
+        observed_load_in_progress,
+        "concurrent load must observe the lifecycle operation guard"
+    );
+    let unload_result = unload_thread.join().expect("unload worker must finish");
+    unload_result.expect("unload must succeed after the in-flight call drains");
+    worker.join().expect("in-flight endpoint worker must finish");
+    assert_eq!(Factory::plugin_count(), 0);
+
+    let reloaded_id = Factory::load_plugin_file_with_config(&library, config).expect(
+        "library must be reloadable after serialized unload"
+    );
+    cleanup_plugin(reloaded_id);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
 }

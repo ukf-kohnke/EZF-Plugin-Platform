@@ -210,6 +210,7 @@ fn p2_long_running_plugin_stress() {
     let config = PluginRuntimeConfig {
         call_timeout: Duration::from_secs(5),
         unload_timeout: Duration::from_secs(5),
+        lifecycle_timeout: Duration::from_secs(5),
         max_concurrent_calls: workers.max(1),
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
@@ -368,6 +369,7 @@ fn p2_multi_plugin_load_and_call_stress() {
     let config = PluginRuntimeConfig {
         call_timeout: Duration::from_secs(5),
         unload_timeout: Duration::from_secs(5),
+        lifecycle_timeout: Duration::from_secs(5),
         max_concurrent_calls: workers_per_plugin.max(1),
     };
     let load_handles = libraries

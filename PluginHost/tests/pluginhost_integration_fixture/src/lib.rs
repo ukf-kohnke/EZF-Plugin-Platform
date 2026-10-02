@@ -2,13 +2,7 @@
 
 use DatabaseContracts::{ DatabaseError, DatabaseRequest, DatabaseResponse };
 use std::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
-use std::{
-    fs::OpenOptions,
-    io::Write,
-    path::PathBuf,
-    thread,
-    time::Duration,
-};
+use std::{ fs::OpenOptions, io::Write, path::PathBuf, thread, time::Duration };
 
 use PluginContracts::{
     declare_plugin,
@@ -30,6 +24,8 @@ static ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MAX_ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FAIL_UNLOAD_ONCE: AtomicBool = AtomicBool::new(true);
 static FAIL_DESTROY_ONCE: AtomicBool = AtomicBool::new(true);
+static SLOW_ON_UNLOAD_ONCE: AtomicBool = AtomicBool::new(true);
+static SLOW_DESTROY_ONCE: AtomicBool = AtomicBool::new(true);
 static NEXT_WORKER_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
@@ -102,6 +98,9 @@ impl IPlugin for PluginHostIntegration {
     fn on_unload(&mut self) -> bool {
         self.record_lifecycle_event("on_unload");
         self.write_marker("unload.marker");
+        if self.mode == "slow_on_unload" && SLOW_ON_UNLOAD_ONCE.swap(false, Ordering::AcqRel) {
+            thread::sleep(Duration::from_millis(150));
+        }
         if self.mode == "on_unload_failure" && FAIL_UNLOAD_ONCE.swap(false, Ordering::AcqRel) {
             return false;
         }
@@ -112,6 +111,9 @@ impl IPlugin for PluginHostIntegration {
     fn on_destroy(&mut self) -> bool {
         self.record_lifecycle_event("on_destroy");
         self.write_marker("destroy.marker");
+        if self.mode == "slow_destroy" && SLOW_DESTROY_ONCE.swap(false, Ordering::AcqRel) {
+            thread::sleep(Duration::from_millis(150));
+        }
         if self.mode == "destroy_failure" && FAIL_DESTROY_ONCE.swap(false, Ordering::AcqRel) {
             return false;
         }
@@ -127,10 +129,12 @@ impl IPlugin for PluginHostIntegration {
         context: &PluginSessionContext
     ) -> Result<(), PluginLifecycleError> {
         if self.mode == "session_failure" {
-            return Err(PluginLifecycleError::new(
-                "fixture_session_failure",
-                "session cleanup intentionally failed",
-            ));
+            return Err(
+                PluginLifecycleError::new(
+                    "fixture_session_failure",
+                    "session cleanup intentionally failed"
+                )
+            );
         }
 
         self.write_marker(&format!("session-closed-{}.marker", context.session_id));

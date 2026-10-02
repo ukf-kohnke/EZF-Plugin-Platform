@@ -55,6 +55,10 @@
 //!   operation remains active until the worker returns; the runtime keeps that call counted as
 //!   active and unload waits for it to drain safely. Health telemetry distinguishes request
 //!   timeouts from actual plugin-operation failures and from completion after a timeout.
+//! - `on_unload` and `destroy` run on a dedicated persistent lifecycle worker after quiescing.
+//!   `EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS` bounds how long the unload caller waits for each callback;
+//!   a timed-out callback is never forcefully cancelled. The runtime remains registered and a
+//!   subsequent unload retry observes the callback's actual result before invoking the next stage.
 //!
 //! # Return conventions
 //!
@@ -388,9 +392,7 @@ pub mod Factory {
         // succeeds, so health snapshots can expose `Stopping`/failure states during the operation.
         let runtime = {
             let singleton = instance();
-            let manager = singleton.inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             manager.get_runtime(id).ok_or(PluginManagerError::PluginNotFound { id })?
         };
 
@@ -541,12 +543,14 @@ pub mod Factory {
                 "{}",
                 Common::Logging::LogConstants::LOGGERDEF,
                 log::LevelFilter::Info,
-                &[&format!(
-                    "Plugin loaded successfully: '{}' (id={}) from '{}'",
-                    plugin_manifest.name,
-                    id,
-                    canonical_path.display()
-                )]
+                &[
+                    &format!(
+                        "Plugin loaded successfully: '{}' (id={}) from '{}'",
+                        plugin_manifest.name,
+                        id,
+                        canonical_path.display()
+                    ),
+                ]
             );
         }
         result
@@ -698,12 +702,10 @@ pub mod Factory {
                     .any(|loaded_name| normalize_plugin_name(loaded_name) == *configured_name);
 
             let matching_failure_index = report.failures.iter().position(|failure| {
-                failure
-                    .plugin_name
+                failure.plugin_name
                     .as_deref()
-                    .is_some_and(|name| normalize_plugin_name(name) == *configured_name)
-                    || failure
-                        .path
+                    .is_some_and(|name| normalize_plugin_name(name) == *configured_name) ||
+                    failure.path
                         .file_stem()
                         .and_then(|stem| stem.to_str())
                         .is_some_and(|stem| normalize_plugin_name(stem) == *configured_name)
@@ -816,7 +818,9 @@ pub mod Factory {
             .into_iter()
             .find_map(|id| {
                 let item = manager.plugins.get(&id)?;
-                item.manifest().name.eq_ignore_ascii_case(plugin_name).then(|| item.health())
+                item.manifest()
+                    .name.eq_ignore_ascii_case(plugin_name)
+                    .then(|| item.health())
             })
     }
 
@@ -962,8 +966,8 @@ pub mod Factory {
                 .into_iter()
                 .find(|id|
                     manager
-                    .get_manifest(*id)
-                    .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(plugin_name))
+                        .get_manifest(*id)
+                        .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(plugin_name))
                 )?;
             manager.get_runtime(id)?
         };
@@ -1121,8 +1125,8 @@ pub mod Factory {
                 .into_iter()
                 .find(|id|
                     manager
-                    .get_manifest(*id)
-                    .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(plugin_name))
+                        .get_manifest(*id)
+                        .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(plugin_name))
                 )
                 .ok_or_else(||
                     PluginEndpointError::not_found(

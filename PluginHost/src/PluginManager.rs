@@ -464,8 +464,11 @@ impl PluginRuntime {
                         Ok(result) => result,
                         Err(_) => Err(format!("plugin operation '{operation}' panicked")),
                     };
-                    let _ = sender.send(result);
+                    // Release admission before publishing completion. Otherwise the caller can
+                    // observe the completed result and immediately submit a new call while the
+                    // previous permit is still held, producing a spurious `Busy` rejection.
                     drop(permit);
+                    let _ = sender.send(result);
                 })
                 .is_err()
         {

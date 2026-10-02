@@ -54,6 +54,7 @@ fn build_fixture() -> PathBuf {
 
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(cargo)
+        .env_remove("EZF_TEST_PLUGIN_NAME")
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest)
@@ -1167,6 +1168,40 @@ fn plugin_concurrency_limit_rejects_excess_calls_and_reports_overload() {
     assert_eq!(first_response.status, 200);
     cleanup_plugin(id);
     let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn completed_plugin_call_releases_its_concurrency_slot_before_result_is_observed() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_secs(1),
+        unload_timeout: std::time::Duration::from_secs(2),
+        max_concurrent_calls: 1,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config).expect(
+        "fixture library must load with a single-call concurrency limit"
+    );
+
+    // Run a sustained sequence of short calls. The next call must never observe the previous
+    // call as still occupying the single admission slot after its result was returned.
+    for iteration in 0..1_000 {
+        let response = Factory::handle_endpoint("PluginHostIntegration", ping_request())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "iteration {iteration}: completed call left the concurrency slot occupied: {error}"
+                )
+            });
+        assert_eq!(response.status, 200);
+    }
+
+    let health = Factory::plugin_health_by_name("PluginHostIntegration")
+        .expect("plugin health must remain available");
+    assert_eq!(health.rejected_calls, 0);
+    assert_eq!(health.active_calls, 0);
+
+    Factory::unload_plugin(id).expect("single-call fixture must unload cleanly");
+    let _ = std::fs::remove_dir_all(library.parent().unwrap());
 }
 
 #[test]

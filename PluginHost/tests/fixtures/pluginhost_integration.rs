@@ -11,6 +11,10 @@ use std::{
 const PLUGIN_ABI_VERSION_V1: u32 = 1;
 const PLUGIN_STATUS_OK: i32 = 0;
 const PLUGIN_STATUS_NOT_INITIALIZED: i32 = -3;
+const PLUGIN_NAME: &str = match option_env!("EZF_TEST_PLUGIN_NAME") {
+    Some(name) => name,
+    None => "PluginHostIntegration",
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -127,7 +131,7 @@ unsafe extern "C" fn plugin_name(_context: *mut c_void, response_out: *mut AbiBu
     }
 
     unsafe {
-        *response_out = AbiBuffer::json(r#""PluginHostIntegration""#);
+        *response_out = AbiBuffer::json(&format!(r#""{}""#, PLUGIN_NAME));
     }
 
     PLUGIN_STATUS_OK
@@ -138,9 +142,9 @@ unsafe extern "C" fn plugin_manifest(_context: *mut c_void, response_out: *mut A
         return -1;
     }
     unsafe {
-        *response_out = AbiBuffer::json(
-            r#"{"contract_version":6,"name":"PluginHostIntegration","version":"0.0.1","kind":"Domain","functions":[],"endpoints":[{"id":"ping","method":"Get","path":"/pluginhost-integration/ping","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null},{"id":"slow","method":"Get","path":"/pluginhost-integration/slow","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}]}"#
-        );
+        let manifest =
+            format!(r#"{{"contract_version":6,"name":"{}","version":"0.0.1","kind":"Domain","functions":[],"endpoints":[{{"id":"ping","method":"Get","path":"/pluginhost-integration/ping","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}},{{"id":"slow","method":"Get","path":"/pluginhost-integration/slow","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}}]}}"#, PLUGIN_NAME);
+        *response_out = AbiBuffer::json(&manifest);
     }
 
     PLUGIN_STATUS_OK
@@ -200,7 +204,8 @@ unsafe extern "C" fn plugin_handle_endpoint(
 
         let peak = PEAK_SLOW_CALLS.load(Ordering::SeqCst);
         let response = format!(
-            r#"{{"plugin":"PluginHostIntegration","loaded":{},"endpoint":"slow","peak_active":{}}}"#,
+            r#"{{"plugin":"{}","loaded":{},"endpoint":"slow","peak_active":{}}}"#,
+            PLUGIN_NAME,
             context.loaded,
             peak
         );
@@ -211,7 +216,8 @@ unsafe extern "C" fn plugin_handle_endpoint(
     }
 
     let response = format!(
-        r#"{{"plugin":"PluginHostIntegration","loaded":{},"endpoint":"ping"}}"#,
+        r#"{{"plugin":"{}","loaded":{},"endpoint":"ping"}}"#,
+        PLUGIN_NAME,
         context.loaded
     );
 

@@ -261,6 +261,17 @@ impl PluginCallTracker {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginCallAccounting {
+    /// A caller-visible plugin operation. These calls contribute to runtime health and call
+    /// counters because they represent productive plugin traffic.
+    Observed,
+    /// Loader-internal plugin execution (currently `name` and `manifest`). These operations still
+    /// use the full bounded/timeout/panic-isolated execution path, but must not pollute productive
+    /// call counters because they happen before the plugin is registered.
+    Internal,
+}
+
 #[derive(Debug)]
 enum PluginCallFailure {
     Busy,
@@ -535,6 +546,9 @@ impl PluginRuntime {
         Ok(func(instance_ref.context, vtable))
     }
 
+    /// Executes a raw ABI buffer-returning call. Lifecycle, timeout, panic isolation, accounting,
+    /// and admission control are provided by `call_with_timeout`; this helper must only be invoked
+    /// from inside that guarded execution path.
     fn call_buffer<F>(&self, select_call: F) -> Result<Vec<u8>, String>
         where
             F: FnOnce(
@@ -668,6 +682,27 @@ impl PluginRuntime {
     ) -> Result<R, PluginCallFailure>
         where R: Send + 'static, F: FnOnce(&PluginRuntime) -> Result<R, String> + Send + 'static
     {
+        self.call_with_timeout_accounted(operation, PluginCallAccounting::Observed, call)
+    }
+
+    fn call_with_timeout_internal<R, F>(
+        self: &Arc<Self>,
+        operation: &'static str,
+        call: F
+    ) -> Result<R, PluginCallFailure>
+        where R: Send + 'static, F: FnOnce(&PluginRuntime) -> Result<R, String> + Send + 'static
+    {
+        self.call_with_timeout_accounted(operation, PluginCallAccounting::Internal, call)
+    }
+
+    fn call_with_timeout_accounted<R, F>(
+        self: &Arc<Self>,
+        operation: &'static str,
+        accounting: PluginCallAccounting,
+        call: F
+    ) -> Result<R, PluginCallFailure>
+        where R: Send + 'static, F: FnOnce(&PluginRuntime) -> Result<R, String> + Send + 'static
+    {
         let permit = match self.gate.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
@@ -696,7 +731,9 @@ impl PluginRuntime {
         }
 
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        if accounting == PluginCallAccounting::Observed {
+            self.total_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let tracker = Arc::new(PluginCallTracker::new());
         let runtime = Arc::clone(self);
         let worker_tracker = Arc::clone(&tracker);
@@ -711,9 +748,11 @@ impl PluginRuntime {
             };
             let was_timed_out = worker_tracker.complete();
 
-            match &result {
-                Ok(_) => runtime.record_success(call_id, was_timed_out),
-                Err(error) => runtime.record_failure(call_id, error.clone(), was_timed_out),
+            if accounting == PluginCallAccounting::Observed {
+                match &result {
+                    Ok(_) => runtime.record_success(call_id, was_timed_out),
+                    Err(error) => runtime.record_failure(call_id, error.clone(), was_timed_out),
+                }
             }
 
             if was_timed_out {
@@ -740,7 +779,9 @@ impl PluginRuntime {
 
         if self.worker_pool.submit(job).is_err() {
             let message = "plugin worker pool rejected an admitted call".to_owned();
-            self.record_submission_failure(message.clone());
+            if accounting == PluginCallAccounting::Observed {
+                self.record_submission_failure(message.clone());
+            }
             return Err(PluginCallFailure::Failed(message));
         }
 
@@ -748,12 +789,17 @@ impl PluginRuntime {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(PluginCallFailure::Failed(error)),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if tracker.mark_timed_out(|| {
-                    self.record_request_timeout(format!(
-                        "plugin operation '{operation}' timed out after {:?}; underlying plugin operation remains active",
-                        self.config.call_timeout
-                    ));
-                }) {
+                let timed_out = if accounting == PluginCallAccounting::Observed {
+                    tracker.mark_timed_out(|| {
+                        self.record_request_timeout(format!(
+                            "plugin operation '{operation}' timed out after {:?}; underlying plugin operation remains active",
+                            self.config.call_timeout
+                        ));
+                    })
+                } else {
+                    tracker.mark_timed_out(|| {})
+                };
+                if timed_out {
                     let message = format!(
                         "plugin operation '{operation}' timed out after {:?}; underlying plugin operation remains active",
                         self.config.call_timeout
@@ -821,8 +867,12 @@ impl PluginRuntime {
         })?
     }
 
-    pub(crate) fn name(&self) -> Result<String, String> {
-        let bytes = self.call_buffer(|vtable| vtable.name)?;
+    pub(crate) fn name(self: &Arc<Self>) -> Result<String, String> {
+        let bytes = self
+            .call_with_timeout_internal("name", |runtime| {
+                runtime.call_buffer(|vtable| vtable.name)
+            })
+            .map_err(|error| error.to_string())?;
         let name = serde_json
             ::from_slice::<String>(&bytes)
             .map_err(|error| format!("failed to decode plugin name: {error}"))?;
@@ -830,8 +880,12 @@ impl PluginRuntime {
         Ok(name)
     }
 
-    pub(crate) fn manifest(&self) -> Result<PluginManifest, String> {
-        let bytes = self.call_buffer(|vtable| vtable.manifest)?;
+    pub(crate) fn manifest(self: &Arc<Self>) -> Result<PluginManifest, String> {
+        let bytes = self
+            .call_with_timeout_internal("manifest", |runtime| {
+                runtime.call_buffer(|vtable| vtable.manifest)
+            })
+            .map_err(|error| error.to_string())?;
         serde_json
             ::from_slice(&bytes)
             .map_err(|error| format!("failed to decode plugin manifest: {error}"))
@@ -1319,6 +1373,8 @@ impl PluginManager {
             }
         })?;
 
+        // Metadata is untrusted plugin code too. Both calls execute through the same bounded
+        // worker pool, timeout, panic-isolation, and lifecycle/accounting path as endpoint calls.
         let plugin_name = runtime.name().map_err(|message| PluginManagerError::PluginAbiCall {
             path: path.to_path_buf(),
             message,

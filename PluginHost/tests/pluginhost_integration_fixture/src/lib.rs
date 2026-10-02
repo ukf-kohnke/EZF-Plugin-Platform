@@ -2,7 +2,13 @@
 
 use DatabaseContracts::{ DatabaseError, DatabaseRequest, DatabaseResponse };
 use std::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
-use std::{ fs::OpenOptions, io::Write, path::PathBuf, thread, time::Duration };
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
 
 use PluginContracts::{
     declare_plugin,
@@ -58,6 +64,9 @@ fn record_peak_active(active: usize) {
 
 impl IPlugin for PluginHostIntegration {
     fn name(&self) -> String {
+        if self.mode == "slow_name" {
+            thread::sleep(Duration::from_millis(150));
+        }
         match self.mode.as_str() {
             "catalog_conflict" => "PluginHostIntegrationConflict".to_owned(),
             "database" => "PluginHostDatabaseBridge".to_owned(),
@@ -118,12 +127,10 @@ impl IPlugin for PluginHostIntegration {
         context: &PluginSessionContext
     ) -> Result<(), PluginLifecycleError> {
         if self.mode == "session_failure" {
-            return Err(
-                PluginLifecycleError::new(
-                    "fixture_session_failure",
-                    "session cleanup intentionally failed"
-                )
-            );
+            return Err(PluginLifecycleError::new(
+                "fixture_session_failure",
+                "session cleanup intentionally failed",
+            ));
         }
 
         self.write_marker(&format!("session-closed-{}.marker", context.session_id));
@@ -131,6 +138,9 @@ impl IPlugin for PluginHostIntegration {
     }
 
     fn manifest(&self) -> PluginManifest {
+        if self.mode == "slow_manifest" {
+            thread::sleep(Duration::from_millis(150));
+        }
         let (name, kind) = if self.mode == "catalog_conflict" {
             ("PluginHostIntegrationConflict".to_owned(), PluginKind::Domain)
         } else if self.mode == "database" {

@@ -127,6 +127,30 @@ fn cleanup_plugin(id: i64) {
     Factory::unload_plugin(id).expect("test plugin must unload cleanly");
 }
 
+struct EnvironmentVariableGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvironmentVariableGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value); }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvironmentVariableGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 #[test]
 fn loads_executes_unloads_and_reloads_a_real_dynamic_library() {
     let _test_guard = lock_test();
@@ -135,6 +159,14 @@ fn loads_executes_unloads_and_reloads_a_real_dynamic_library() {
 
     assert_eq!(Factory::plugin_count(), 1);
     assert_eq!(Factory::loaded_plugin_names(), vec!["PluginHostIntegration"]);
+
+    let initial_health = Factory::plugin_health_by_name("PluginHostIntegration")
+        .expect("loaded fixture health must be available before productive calls");
+    assert_eq!(initial_health.total_calls, 0);
+    assert_eq!(initial_health.completed_calls, 0);
+    assert_eq!(initial_health.failed_calls, 0);
+    assert_eq!(initial_health.timed_out_calls, 0);
+    assert_eq!(initial_health.timed_out_active_calls, 0);
 
     let response = Factory::handle_endpoint("PluginHostIntegration", ping_request()).expect(
         "dynamic endpoint call must cross the ABI boundary"
@@ -319,6 +351,41 @@ fn plugin_calls_reuse_a_bounded_persistent_worker_pool() {
 
     cleanup_plugin(id);
     let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn plugin_name_and_manifest_use_the_bounded_timeout_execution_path() {
+    let _test_guard = lock_test();
+
+    for mode in ["slow_name", "slow_manifest"] {
+        let _environment = EnvironmentVariableGuard::set("EZF_PLUGIN_FIXTURE_MODE", mode);
+        let library = build_fixture();
+        let config = PluginRuntimeConfig {
+            call_timeout: std::time::Duration::from_millis(25),
+            unload_timeout: std::time::Duration::from_secs(1),
+            max_concurrent_calls: 1,
+        };
+
+        let result = Factory::load_plugin_file_with_config(&library, config);
+
+        let error = result.expect_err("slow plugin metadata call must time out during loading");
+        match error {
+            PluginManagerError::PluginAbiCall { message, .. } => {
+                assert!(
+                    message.contains("timed out"),
+                    "metadata call must report the configured timeout, got: {message}"
+                );
+            }
+            other => panic!("unexpected metadata timeout error: {other}"),
+        }
+
+        assert!(
+            Factory::loaded_plugin_ids().is_empty(),
+            "a timed-out metadata call must not register a plugin"
+        );
+
+        let _ = std::fs::remove_dir_all(library.parent().unwrap());
+    }
 }
 
 #[test]

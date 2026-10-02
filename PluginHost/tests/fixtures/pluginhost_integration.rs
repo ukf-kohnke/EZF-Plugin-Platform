@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-const PLUGIN_ABI_VERSION_V1: u32 = 1;
+const PLUGIN_ABI_VERSION_V2: u32 = 2;
 const PLUGIN_STATUS_OK: i32 = 0;
 const PLUGIN_STATUS_NOT_INITIALIZED: i32 = -3;
 const PLUGIN_NAME: &str = match option_env!("EZF_TEST_PLUGIN_NAME") {
@@ -51,50 +51,82 @@ impl AbiBuffer {
     }
 }
 
+type PluginIsCancelledFnV2 = unsafe extern "C" fn(context: *const c_void) -> bool;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PluginCancellationV2 {
+    context: *const c_void,
+    is_cancelled: PluginIsCancelledFnV2,
+}
+
 type PluginLogFn = unsafe extern "C" fn(level: u8, message: AbiSlice);
 type PluginDatabaseExecuteFn = unsafe extern "C" fn(
     request: AbiSlice,
+    cancellation: PluginCancellationV2,
+    response_out: *mut AbiBuffer
+) -> i32;
+type PluginDatabaseFn = unsafe extern "C" fn(
+    context: *mut c_void,
+    request: AbiSlice,
+    cancellation: PluginCancellationV2,
     response_out: *mut AbiBuffer
 ) -> i32;
 type PluginFreeBufferFn = unsafe extern "C" fn(buffer: AbiBuffer);
-type PluginNameFn = unsafe extern "C" fn(context: *mut c_void, response_out: *mut AbiBuffer) -> i32;
-type PluginManifestFn = unsafe extern "C" fn(
+type PluginNameFn = unsafe extern "C" fn(
     context: *mut c_void,
+    cancellation: PluginCancellationV2,
     response_out: *mut AbiBuffer
 ) -> i32;
-type PluginLoadFn = unsafe extern "C" fn(context: *mut c_void) -> i32;
-type PluginLoadedFn = unsafe extern "C" fn(context: *mut c_void) -> i32;
+type PluginManifestFn = unsafe extern "C" fn(
+    context: *mut c_void,
+    cancellation: PluginCancellationV2,
+    response_out: *mut AbiBuffer
+) -> i32;
+type PluginLoadFn = unsafe extern "C" fn(
+    context: *mut c_void,
+    cancellation: PluginCancellationV2
+) -> i32;
+type PluginLoadedFn = unsafe extern "C" fn(
+    context: *mut c_void,
+    cancellation: PluginCancellationV2
+) -> i32;
 type PluginEndpointFn = unsafe extern "C" fn(
     context: *mut c_void,
     request: AbiSlice,
+    cancellation: PluginCancellationV2,
     response_out: *mut AbiBuffer
 ) -> i32;
 type PluginSessionClosedFn = unsafe extern "C" fn(
     context: *mut c_void,
     request: AbiSlice,
+    cancellation: PluginCancellationV2,
     response_out: *mut AbiBuffer
 ) -> i32;
-type PluginDestroyFn = unsafe extern "C" fn(instance: *mut PluginInstanceV1) -> i32;
+type PluginDestroyFn = unsafe extern "C" fn(
+    instance: *mut PluginInstanceV2,
+    cancellation: PluginCancellationV2
+) -> i32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct PluginLoggerV1 {
+struct PluginLoggerV2 {
     emit: PluginLogFn,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct PluginHostServicesV1 {
+struct PluginHostServicesV2 {
     abi_version: u32,
     struct_size: u32,
-    logger: PluginLoggerV1,
+    logger: PluginLoggerV2,
     database: Option<PluginDatabaseExecuteFn>,
     database_free: Option<PluginFreeBufferFn>,
     plugin_directory: AbiSlice,
 }
 
 #[repr(C)]
-struct PluginVTableV1 {
+struct PluginVTableV2 {
     abi_version: u32,
     struct_size: u32,
     name: PluginNameFn,
@@ -102,7 +134,7 @@ struct PluginVTableV1 {
     on_load: PluginLoadFn,
     is_loaded: PluginLoadedFn,
     handle_endpoint: PluginEndpointFn,
-    execute_database: PluginEndpointFn,
+    execute_database: PluginDatabaseFn,
     on_session_closed: PluginSessionClosedFn,
     on_unload: PluginLoadFn,
     free_buffer: PluginFreeBufferFn,
@@ -110,11 +142,11 @@ struct PluginVTableV1 {
 }
 
 #[repr(C)]
-struct PluginInstanceV1 {
+struct PluginInstanceV2 {
     abi_version: u32,
     struct_size: u32,
     context: *mut c_void,
-    vtable: *const PluginVTableV1,
+    vtable: *const PluginVTableV2,
 }
 
 struct Context {
@@ -125,7 +157,7 @@ struct Context {
 static ACTIVE_SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PEAK_SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-unsafe extern "C" fn plugin_name(_context: *mut c_void, response_out: *mut AbiBuffer) -> i32 {
+unsafe extern "C" fn plugin_name(_context: *mut c_void, _cancellation: PluginCancellationV2, response_out: *mut AbiBuffer) -> i32 {
     if response_out.is_null() {
         return -1;
     }
@@ -137,7 +169,7 @@ unsafe extern "C" fn plugin_name(_context: *mut c_void, response_out: *mut AbiBu
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_manifest(_context: *mut c_void, response_out: *mut AbiBuffer) -> i32 {
+unsafe extern "C" fn plugin_manifest(_context: *mut c_void, _cancellation: PluginCancellationV2, response_out: *mut AbiBuffer) -> i32 {
     if response_out.is_null() {
         return -1;
     }
@@ -150,7 +182,7 @@ unsafe extern "C" fn plugin_manifest(_context: *mut c_void, response_out: *mut A
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_on_load(context: *mut c_void) -> i32 {
+unsafe extern "C" fn plugin_on_load(context: *mut c_void, _cancellation: PluginCancellationV2) -> i32 {
     if context.is_null() {
         return -1;
     }
@@ -162,7 +194,7 @@ unsafe extern "C" fn plugin_on_load(context: *mut c_void) -> i32 {
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_is_loaded(context: *mut c_void) -> i32 {
+unsafe extern "C" fn plugin_is_loaded(context: *mut c_void, _cancellation: PluginCancellationV2) -> i32 {
     if context.is_null() {
         return -1;
     }
@@ -179,6 +211,7 @@ unsafe extern "C" fn plugin_is_loaded(context: *mut c_void) -> i32 {
 unsafe extern "C" fn plugin_handle_endpoint(
     context: *mut c_void,
     request: AbiSlice,
+    cancellation: PluginCancellationV2,
     response_out: *mut AbiBuffer
 ) -> i32 {
     if context.is_null() || response_out.is_null() {
@@ -199,7 +232,14 @@ unsafe extern "C" fn plugin_handle_endpoint(
         PEAK_SLOW_CALLS.fetch_max(active, Ordering::SeqCst);
         let marker = context.plugin_directory.join("slow-entered.marker");
         let _ = std::fs::write(marker, b"entered");
-        thread::sleep(Duration::from_millis(200));
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(200) {
+            if unsafe { (cancellation.is_cancelled)(cancellation.context) } {
+                ACTIVE_SLOW_CALLS.fetch_sub(1, Ordering::SeqCst);
+                return -6;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
         ACTIVE_SLOW_CALLS.fetch_sub(1, Ordering::SeqCst);
 
         let peak = PEAK_SLOW_CALLS.load(Ordering::SeqCst);
@@ -230,6 +270,7 @@ unsafe extern "C" fn plugin_handle_endpoint(
 unsafe extern "C" fn plugin_execute_database(
     _context: *mut c_void,
     _request: AbiSlice,
+    _cancellation: PluginCancellationV2,
     response_out: *mut AbiBuffer
 ) -> i32 {
     if response_out.is_null() {
@@ -246,6 +287,7 @@ unsafe extern "C" fn plugin_execute_database(
 unsafe extern "C" fn plugin_on_session_closed(
     _context: *mut c_void,
     _request: AbiSlice,
+    _cancellation: PluginCancellationV2,
     response_out: *mut AbiBuffer
 ) -> i32 {
     if response_out.is_null() {
@@ -259,7 +301,7 @@ unsafe extern "C" fn plugin_on_session_closed(
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_on_unload(context: *mut c_void) -> i32 {
+unsafe extern "C" fn plugin_on_unload(context: *mut c_void, _cancellation: PluginCancellationV2) -> i32 {
     if context.is_null() {
         return -1;
     }
@@ -275,7 +317,7 @@ unsafe extern "C" fn plugin_free_buffer(buffer: AbiBuffer) {
     buffer.free()
 }
 
-unsafe extern "C" fn plugin_destroy(instance: *mut PluginInstanceV1) -> i32 {
+unsafe extern "C" fn plugin_destroy(instance: *mut PluginInstanceV2, _cancellation: PluginCancellationV2) -> i32 {
     if instance.is_null() {
         return -1;
     }
@@ -290,9 +332,9 @@ unsafe extern "C" fn plugin_destroy(instance: *mut PluginInstanceV1) -> i32 {
     PLUGIN_STATUS_OK
 }
 
-static PLUGIN_VTABLE: PluginVTableV1 = PluginVTableV1 {
-    abi_version: PLUGIN_ABI_VERSION_V1,
-    struct_size: std::mem::size_of::<PluginVTableV1>() as u32,
+static PLUGIN_VTABLE: PluginVTableV2 = PluginVTableV2 {
+    abi_version: PLUGIN_ABI_VERSION_V2,
+    struct_size: std::mem::size_of::<PluginVTableV2>() as u32,
     name: plugin_name,
     manifest: plugin_manifest,
     on_load: plugin_on_load,
@@ -305,10 +347,14 @@ static PLUGIN_VTABLE: PluginVTableV1 = PluginVTableV1 {
     destroy: plugin_destroy,
 };
 
+unsafe extern "C" fn never_cancelled(_context: *const c_void) -> bool {
+    false
+}
+
 #[unsafe(no_mangle)]
-unsafe extern "C" fn InstantiateV1(
-    host_services: *const PluginHostServicesV1
-) -> *mut PluginInstanceV1 {
+unsafe extern "C" fn InstantiateV2(
+    host_services: *const PluginHostServicesV2
+) -> *mut PluginInstanceV2 {
     if host_services.is_null() {
         return std::ptr::null_mut();
     }
@@ -317,8 +363,8 @@ unsafe extern "C" fn InstantiateV1(
         let host = &*host_services;
 
         if
-            host.abi_version != PLUGIN_ABI_VERSION_V1 ||
-            host.struct_size < (std::mem::size_of::<PluginHostServicesV1>() as u32)
+            host.abi_version != PLUGIN_ABI_VERSION_V2 ||
+            host.struct_size < (std::mem::size_of::<PluginHostServicesV2>() as u32)
         {
             return std::ptr::null_mut();
         }
@@ -340,15 +386,15 @@ unsafe extern "C" fn InstantiateV1(
                 plugin_directory,
             })
         ) as *mut c_void;
-        let instance = Box::new(PluginInstanceV1 {
-            abi_version: PLUGIN_ABI_VERSION_V1,
-            struct_size: std::mem::size_of::<PluginInstanceV1>() as u32,
+        let instance = Box::new(PluginInstanceV2 {
+            abi_version: PLUGIN_ABI_VERSION_V2,
+            struct_size: std::mem::size_of::<PluginInstanceV2>() as u32,
             context,
             vtable: &PLUGIN_VTABLE,
         });
         let instance = Box::into_raw(instance);
 
-        if plugin_on_load(context) != PLUGIN_STATUS_OK {
+        if plugin_on_load(context, PluginCancellationV2 { context: std::ptr::null(), is_cancelled: never_cancelled }) != PLUGIN_STATUS_OK {
             drop(Box::from_raw(context as *mut Context));
 
             drop(Box::from_raw(instance));

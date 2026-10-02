@@ -13,6 +13,7 @@ use PluginContracts::{
         PluginHttpMethod,
         PluginKind,
         PluginManifest,
+        PluginCancellation,
         PluginEndpointDescriptor,
         PluginLifecycleError,
         PluginSessionContext,
@@ -61,7 +62,14 @@ fn record_peak_active(active: usize) {
 impl IPlugin for PluginHostIntegration {
     fn name(&self) -> String {
         if self.mode == "slow_name" {
-            thread::sleep(Duration::from_millis(150));
+            for _ in 0..30 {
+                if PluginContracts::ApiContract::current_plugin_cancellation()
+                    .is_some_and(|cancellation| cancellation.is_cancelled())
+                {
+                    return "PluginHostIntegration".to_owned();
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
         }
         match self.mode.as_str() {
             "catalog_conflict" => "PluginHostIntegrationConflict".to_owned(),
@@ -95,11 +103,17 @@ impl IPlugin for PluginHostIntegration {
         self.on_load()
     }
 
-    fn on_unload(&mut self) -> bool {
+    fn on_unload(&mut self, cancellation: &PluginCancellation) -> bool {
         self.record_lifecycle_event("on_unload");
         self.write_marker("unload.marker");
         if self.mode == "slow_on_unload" && SLOW_ON_UNLOAD_ONCE.swap(false, Ordering::AcqRel) {
-            thread::sleep(Duration::from_millis(150));
+            for _ in 0..30 {
+                if cancellation.is_cancelled() {
+                    self.write_marker("unload-cancelled.marker");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
         }
         if self.mode == "on_unload_failure" && FAIL_UNLOAD_ONCE.swap(false, Ordering::AcqRel) {
             return false;
@@ -108,11 +122,17 @@ impl IPlugin for PluginHostIntegration {
         true
     }
 
-    fn on_destroy(&mut self) -> bool {
+    fn on_destroy(&mut self, cancellation: &PluginCancellation) -> bool {
         self.record_lifecycle_event("on_destroy");
         self.write_marker("destroy.marker");
         if self.mode == "slow_destroy" && SLOW_DESTROY_ONCE.swap(false, Ordering::AcqRel) {
-            thread::sleep(Duration::from_millis(150));
+            for _ in 0..30 {
+                if cancellation.is_cancelled() {
+                    self.write_marker("destroy-cancelled.marker");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
         }
         if self.mode == "destroy_failure" && FAIL_DESTROY_ONCE.swap(false, Ordering::AcqRel) {
             return false;
@@ -126,8 +146,13 @@ impl IPlugin for PluginHostIntegration {
 
     fn on_session_closed(
         &self,
-        context: &PluginSessionContext
+        context: &PluginSessionContext,
+        cancellation: &PluginCancellation
     ) -> Result<(), PluginLifecycleError> {
+        if cancellation.is_cancelled() {
+            self.write_marker("session-cancelled.marker");
+            return Err(PluginLifecycleError::new("plugin_cancelled", "session cleanup cancelled"));
+        }
         if self.mode == "session_failure" {
             return Err(
                 PluginLifecycleError::new(
@@ -143,7 +168,14 @@ impl IPlugin for PluginHostIntegration {
 
     fn manifest(&self) -> PluginManifest {
         if self.mode == "slow_manifest" {
-            thread::sleep(Duration::from_millis(150));
+            for _ in 0..30 {
+                if PluginContracts::ApiContract::current_plugin_cancellation()
+                    .is_some_and(|cancellation| cancellation.is_cancelled())
+                {
+                    return PluginManifest::without_api("PluginHostIntegration");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
         }
         let (name, kind) = if self.mode == "catalog_conflict" {
             ("PluginHostIntegrationConflict".to_owned(), PluginKind::Domain)
@@ -179,7 +211,8 @@ impl IPlugin for PluginHostIntegration {
 
     fn handle_endpoint(
         &self,
-        request: PluginEndpointRequest
+        request: PluginEndpointRequest,
+        cancellation: &PluginCancellation
     ) -> Result<PluginEndpointResponse, PluginEndpointError> {
         if request.method != PluginHttpMethod::Get {
             return Err(PluginEndpointError::not_supported(&request.endpoint_id));
@@ -206,7 +239,17 @@ impl IPlugin for PluginHostIntegration {
                 if let Some(directory) = &self.plugin_directory {
                     let _ = std::fs::write(directory.join("slow-entered.marker"), b"entered");
                 }
-                thread::sleep(Duration::from_millis(300));
+                let ignore_cancellation = self.mode == "slow_ignore_cancel";
+                for _ in 0..60 {
+                    if !ignore_cancellation && cancellation.is_cancelled() {
+                        if let Some(directory) = &self.plugin_directory {
+                            let _ = std::fs::write(directory.join("slow-cancelled.marker"), b"cancelled");
+                        }
+                        ACTIVE_CALLS.fetch_sub(1, Ordering::AcqRel);
+                        return Err(PluginEndpointError::new(499, "plugin_cancelled", "plugin call cancelled", None));
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
                 if let Some(directory) = &self.plugin_directory {
                     let _ = std::fs::write(directory.join("slow-exited.marker"), b"exited");
                 }
@@ -228,7 +271,8 @@ impl IPlugin for PluginHostIntegration {
 
     fn execute_database(
         &self,
-        request: DatabaseRequest
+        request: DatabaseRequest,
+        cancellation: &PluginCancellation
     ) -> Result<DatabaseResponse, DatabaseError> {
         if self.mode != "database" {
             return Err(
@@ -258,6 +302,7 @@ impl IPlugin for PluginHostIntegration {
         let status = unsafe {
             (database.execute)(
                 PluginContracts::PluginAbi::AbiSlice::from_bytes(&request_bytes),
+                cancellation.as_abi(),
                 &mut response
             )
         };

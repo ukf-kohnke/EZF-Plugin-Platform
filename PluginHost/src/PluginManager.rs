@@ -1,4 +1,7 @@
-use PluginContracts::{ ApiContract::{ PluginCatalog, PluginManifest }, IPlugin::IPlugin };
+use PluginContracts::{
+    ApiContract::{ PluginCancellation, PluginCatalog, PluginManifest },
+    IPlugin::IPlugin,
+};
 use super::Factory::PluginManagerError;
 use glob::{ glob, GlobError };
 use libloading::{ Library, Symbol };
@@ -7,16 +10,17 @@ use serde::de::DeserializeOwned;
 use PluginAbi::{
     AbiBuffer,
     AbiSlice,
-    PluginCreateFnV1,
-    PluginDestroyFnV1,
-    PluginEndpointFnV1,
-    PluginLoadFnV1,
-    PluginHostServicesV1,
-    PluginInstanceV1,
-    PluginVTableV1,
+    PluginCancellationV2,
+    PluginCreateFnV2,
+    PluginDestroyFnV2,
+    PluginEndpointFnV2,
+    PluginLoadFnV2,
+    PluginHostServicesV2,
+    PluginInstanceV2,
+    PluginVTableV2,
     MAX_ABI_BUFFER_BYTES,
-    PLUGIN_ABI_VERSION_V1,
-    PLUGIN_CONSTRUCTOR_SYMBOL_V1,
+    PLUGIN_ABI_VERSION_V2,
+    PLUGIN_CONSTRUCTOR_SYMBOL_V2,
     PLUGIN_STATUS_NOT_INITIALIZED,
     PLUGIN_STATUS_OK,
 };
@@ -24,13 +28,14 @@ use std::{
     collections::HashMap,
     path::{ Path, PathBuf },
     sync::{
-        mpsc,
         Arc,
+        Condvar,
         Mutex,
         RwLock,
         RwLockReadGuard,
+        Weak,
         atomic::{ AtomicBool, AtomicU64, Ordering },
-        Condvar,
+        mpsc,
     },
     thread,
     time::{ Duration, Instant },
@@ -57,8 +62,9 @@ pub struct PluginRuntimeConfig {
     pub call_timeout: Duration,
     /// Maximum time spent waiting for admitted calls to quiesce before lifecycle callbacks begin.
     pub unload_timeout: Duration,
-    /// Maximum time to wait for one `on_unload` or `destroy` callback. A timeout never cancels
-    /// native code; the callback continues on the dedicated lifecycle worker until it returns.
+    /// Maximum time to wait for one `on_unload` or `destroy` callback. A timeout requests
+    /// cooperative cancellation; the callback remains active on the lifecycle worker until it
+    /// returns and the runtime stays registered until that result is observed.
     pub lifecycle_timeout: Duration,
     pub max_concurrent_calls: usize,
 }
@@ -100,6 +106,33 @@ fn env_duration(name: &str, default: Duration) -> Duration {
         return default;
     };
     Duration::from_millis(ms.clamp(MIN_PLUGIN_TIMEOUT_MS, MAX_PLUGIN_TIMEOUT_MS))
+}
+
+unsafe extern "C" fn plugin_is_cancelled(context: *const std::ffi::c_void) -> bool {
+    if context.is_null() {
+        return true;
+    }
+    let state = unsafe { &*(context as *const PluginCancellationState) };
+    if state.local.load(Ordering::Acquire) {
+        return true;
+    }
+    state.parent.is_some_and(|parent| unsafe { parent.is_cancelled() })
+}
+
+struct PluginCancellationState {
+    local: AtomicBool,
+    parent: Option<PluginCancellationV2>,
+}
+
+fn never_cancelled_abi() -> PluginCancellationV2 {
+    PluginCancellationV2 {
+        context: std::ptr::null(),
+        is_cancelled: never_cancelled,
+    }
+}
+
+unsafe extern "C" fn never_cancelled(_context: *const std::ffi::c_void) -> bool {
+    false
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -166,6 +199,7 @@ impl PluginHealthRuntimeState {
 
 struct PluginCallGate {
     state: Mutex<usize>,
+    active_cancellations: Mutex<Vec<Weak<PluginCancellationState>>>,
     max_concurrent_calls: usize,
     idle: Condvar,
 }
@@ -174,6 +208,7 @@ impl PluginCallGate {
     fn new(max_concurrent_calls: usize) -> Self {
         Self {
             state: Mutex::new(0),
+            active_cancellations: Mutex::new(Vec::new()),
             max_concurrent_calls: max_concurrent_calls.max(1),
             idle: Condvar::new(),
         }
@@ -182,17 +217,42 @@ impl PluginCallGate {
     /// Admission is deliberately non-blocking. A full plugin is considered overloaded instead
     /// of making a caller wait behind already admitted work. Request execution still has its own
     /// timeout after admission.
-    fn try_acquire(self: &Arc<Self>) -> Result<PluginCallPermit, ()> {
+    fn try_acquire(
+        self: &Arc<Self>,
+        cancellation: Arc<PluginCancellationState>
+    ) -> Result<PluginCallPermit, ()> {
         let mut active = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if *active >= self.max_concurrent_calls {
             return Err(());
         }
         *active += 1;
-        Ok(PluginCallPermit { gate: Arc::clone(self) })
+        self.active_cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::downgrade(&cancellation));
+        Ok(PluginCallPermit {
+            gate: Arc::clone(self),
+            cancellation,
+        })
     }
 
     fn active_calls(&self) -> usize {
         *self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Requests cooperative cancellation from every currently admitted plugin operation.
+    /// No native thread is terminated and no memory is invalidated by this operation.
+    fn cancel_all(&self) {
+        let mut cancellations = self.active_cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cancellations.retain(|weak| {
+            let Some(flag) = weak.upgrade() else {
+                return false;
+            };
+            flag.local.store(true, Ordering::Release);
+            true
+        });
     }
 
     fn wait_until_idle(&self, deadline: Instant) -> bool {
@@ -217,15 +277,26 @@ impl PluginCallGate {
 
 struct PluginCallPermit {
     gate: Arc<PluginCallGate>,
+    cancellation: Arc<PluginCancellationState>,
 }
 
 impl Drop for PluginCallPermit {
     fn drop(&mut self) {
+        // Keep the same lock order as `try_acquire` (state -> active_cancellations) to avoid
+        // an ABBA deadlock when admission and completion happen concurrently.
         let mut active = self.gate.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *active = (*active).saturating_sub(1);
         if *active == 0 {
             self.gate.idle.notify_all();
         }
+        drop(active);
+
+        let mut cancellations = self.gate.active_cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cancellations.retain(|weak| {
+            weak.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, &self.cancellation))
+        });
     }
 }
 
@@ -238,21 +309,39 @@ enum PluginCallLifecycleState {
 
 struct PluginCallTracker {
     state: Mutex<PluginCallLifecycleState>,
+    cancellation: Arc<PluginCancellationState>,
 }
 
 impl PluginCallTracker {
-    fn new() -> Self {
-        Self { state: Mutex::new(PluginCallLifecycleState::Pending) }
+    fn new(parent: Option<PluginCancellationV2>) -> Self {
+        Self {
+            state: Mutex::new(PluginCallLifecycleState::Pending),
+            cancellation: Arc::new(PluginCancellationState {
+                local: AtomicBool::new(false),
+                parent,
+            }),
+        }
     }
 
-    /// Marks the caller-visible timeout. The callback runs while the call is still protected by
-    /// the lifecycle lock, so the worker cannot complete the same call between the state transition
-    /// and the associated timeout bookkeeping. This makes the timeout/completion race deterministic.
+    fn cancellation(&self) -> Arc<PluginCancellationState> {
+        Arc::clone(&self.cancellation)
+    }
+
+    fn abi_cancellation(&self) -> PluginCancellationV2 {
+        PluginCancellationV2 {
+            context: Arc::as_ptr(&self.cancellation).cast(),
+            is_cancelled: plugin_is_cancelled,
+        }
+    }
+
+    /// Marks the caller-visible timeout and requests cooperative cancellation atomically with the
+    /// state transition. This closes the timeout/completion race deterministically.
     fn mark_timed_out<F>(&self, on_marked: F) -> bool where F: FnOnce() {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if *state != PluginCallLifecycleState::Pending {
             return false;
         }
+        self.cancellation.local.store(true, Ordering::Release);
         *state = PluginCallLifecycleState::TimedOut;
         on_marked();
         true
@@ -305,7 +394,7 @@ impl std::fmt::Display for PluginCallFailure {
 /// new OS thread per plugin call. Each worker invocation holds a shared read lock, allowing
 /// independent calls to execute concurrently. Unload first waits for all admitted calls to drain,
 /// then invokes `on_unload` and `destroy` on a dedicated single lifecycle worker. Lifecycle callback
-/// timeouts never forcefully cancel native code; the runtime stays registered and the next unload
+/// timeouts request cooperative cancellation; the runtime stays registered and the next unload
 /// attempt observes the actual callback result before progressing.
 pub(crate) struct PluginRuntime {
     state: RwLock<PluginRuntimeState>,
@@ -326,7 +415,7 @@ pub(crate) struct PluginRuntime {
 }
 
 struct PluginRuntimeState {
-    instance: Option<*mut PluginInstanceV1>,
+    instance: Option<*mut PluginInstanceV2>,
     #[allow(dead_code)]
     library: Library,
 }
@@ -443,6 +532,7 @@ enum PluginLifecycleOperation {
 struct PendingPluginLifecycle {
     operation: PluginLifecycleOperation,
     receiver: mpsc::Receiver<Result<i32, String>>,
+    cancellation: Arc<PluginCancellationState>,
 }
 
 type PluginLifecycleJob = Box<dyn (FnOnce() -> Result<i32, String>) + Send + 'static>;
@@ -550,7 +640,7 @@ impl PluginRuntime {
     }
 
     fn new(
-        instance: *mut PluginInstanceV1,
+        instance: *mut PluginInstanceV2,
         library: Library,
         config: PluginRuntimeConfig
     ) -> Result<Arc<Self>, String> {
@@ -560,8 +650,8 @@ impl PluginRuntime {
 
         let instance_ref = unsafe { &*instance };
         if
-            instance_ref.abi_version != PLUGIN_ABI_VERSION_V1 ||
-            instance_ref.struct_size < (std::mem::size_of::<PluginInstanceV1>() as u32) ||
+            instance_ref.abi_version != PLUGIN_ABI_VERSION_V2 ||
+            instance_ref.struct_size < (std::mem::size_of::<PluginInstanceV2>() as u32) ||
             instance_ref.vtable.is_null() ||
             instance_ref.context.is_null()
         {
@@ -590,11 +680,11 @@ impl PluginRuntime {
         }
 
         let worker_pool = PluginWorkerPool::new(config.max_concurrent_calls).map_err(|error| {
-            let _ = unsafe { (vtable.destroy)(instance) };
+            let _ = unsafe { (vtable.destroy)(instance, never_cancelled_abi()) };
             error
         })?;
         let lifecycle_executor = PluginLifecycleExecutor::new().map_err(|error| {
-            let _ = unsafe { (vtable.destroy)(instance) };
+            let _ = unsafe { (vtable.destroy)(instance, never_cancelled_abi()) };
             error
         })?;
 
@@ -627,7 +717,7 @@ impl PluginRuntime {
     }
 
     fn with_instance<R, F>(&self, func: F) -> Result<R, String>
-        where F: FnOnce(*mut std::ffi::c_void, &PluginVTableV1) -> R
+        where F: FnOnce(*mut std::ffi::c_void, &PluginVTableV2) -> R
     {
         let state = self.read_state();
         if self.unloading.load(Ordering::Acquire) {
@@ -667,15 +757,23 @@ impl PluginRuntime {
     /// Executes a raw ABI buffer-returning call. Lifecycle, timeout, panic isolation, accounting,
     /// and admission control are provided by `call_with_timeout`; this helper must only be invoked
     /// from inside that guarded execution path.
-    fn call_buffer<F>(&self, select_call: F) -> Result<Vec<u8>, String>
+    fn call_buffer<F>(
+        &self,
+        cancellation: PluginCancellationV2,
+        select_call: F
+    ) -> Result<Vec<u8>, String>
         where
             F: FnOnce(
-                &PluginVTableV1
-            ) -> unsafe extern "C" fn(*mut std::ffi::c_void, *mut AbiBuffer) -> i32
+                &PluginVTableV2
+            ) -> unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                PluginCancellationV2,
+                *mut AbiBuffer
+            ) -> i32
     {
         self.with_instance(|context, vtable| {
             let mut response = AbiBuffer::EMPTY;
-            let status = unsafe { select_call(vtable)(context, &mut response) };
+            let status = unsafe { select_call(vtable)(context, cancellation, &mut response) };
             if status != PLUGIN_STATUS_OK {
                 if Self::is_valid_buffer(response) && !response.ptr.is_null() {
                     unsafe {
@@ -800,9 +898,35 @@ impl PluginRuntime {
         call: F
     )
         -> Result<R, PluginCallFailure>
-        where R: Send + 'static, F: FnOnce(&PluginRuntime) -> Result<R, String> + Send + 'static
+        where
+            R: Send + 'static,
+            F: FnOnce(&PluginRuntime, PluginCancellationV2) -> Result<R, String> + Send + 'static
     {
-        self.call_with_timeout_accounted(operation, PluginCallAccounting::Observed, call)
+        self.call_with_timeout_accounted_parent(
+            operation,
+            PluginCallAccounting::Observed,
+            None,
+            call
+        )
+    }
+
+    fn call_with_timeout_parent<R, F>(
+        self: &Arc<Self>,
+        operation: &'static str,
+        parent_cancellation: PluginCancellationV2,
+        call: F
+    )
+        -> Result<R, PluginCallFailure>
+        where
+            R: Send + 'static,
+            F: FnOnce(&PluginRuntime, PluginCancellationV2) -> Result<R, String> + Send + 'static
+    {
+        self.call_with_timeout_accounted_parent(
+            operation,
+            PluginCallAccounting::Observed,
+            Some(parent_cancellation),
+            call
+        )
     }
 
     fn call_with_timeout_internal<R, F>(
@@ -811,21 +935,32 @@ impl PluginRuntime {
         call: F
     )
         -> Result<R, PluginCallFailure>
-        where R: Send + 'static, F: FnOnce(&PluginRuntime) -> Result<R, String> + Send + 'static
+        where
+            R: Send + 'static,
+            F: FnOnce(&PluginRuntime, PluginCancellationV2) -> Result<R, String> + Send + 'static
     {
-        self.call_with_timeout_accounted(operation, PluginCallAccounting::Internal, call)
+        self.call_with_timeout_accounted_parent(
+            operation,
+            PluginCallAccounting::Internal,
+            None,
+            call
+        )
     }
 
-    fn call_with_timeout_accounted<R, F>(
+    fn call_with_timeout_accounted_parent<R, F>(
         self: &Arc<Self>,
         operation: &'static str,
         accounting: PluginCallAccounting,
+        parent_cancellation: Option<PluginCancellationV2>,
         call: F
     )
         -> Result<R, PluginCallFailure>
-        where R: Send + 'static, F: FnOnce(&PluginRuntime) -> Result<R, String> + Send + 'static
+        where
+            R: Send + 'static,
+            F: FnOnce(&PluginRuntime, PluginCancellationV2) -> Result<R, String> + Send + 'static
     {
-        let permit = match self.gate.try_acquire() {
+        let tracker = Arc::new(PluginCallTracker::new(parent_cancellation));
+        let permit = match self.gate.try_acquire(tracker.cancellation()) {
             Ok(permit) => permit,
             Err(_) => {
                 self.rejected_calls.fetch_add(1, Ordering::Relaxed);
@@ -854,12 +989,14 @@ impl PluginRuntime {
         if accounting == PluginCallAccounting::Observed {
             self.total_calls.fetch_add(1, Ordering::Relaxed);
         }
-        let tracker = Arc::new(PluginCallTracker::new());
         let runtime = Arc::clone(self);
         let worker_tracker = Arc::clone(&tracker);
         let (sender, receiver) = mpsc::sync_channel(1);
         let job: PluginJob = Box::new(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(&runtime)));
+            let cancellation = worker_tracker.abi_cancellation();
+            let result = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| call(&runtime, cancellation))
+            );
             let result = match result {
                 Ok(result) => result,
                 Err(_) => Err(format!("plugin operation '{operation}' panicked")),
@@ -908,7 +1045,7 @@ impl PluginRuntime {
                     tracker.mark_timed_out(|| {
                         self.record_request_timeout(
                             format!(
-                                "plugin operation '{operation}' timed out after {:?}; underlying plugin operation remains active",
+                                "plugin operation '{operation}' timed out after {:?}; cooperative cancellation requested; operation remains active until it returns",
                                 self.config.call_timeout
                             )
                         );
@@ -918,7 +1055,7 @@ impl PluginRuntime {
                 };
                 if timed_out {
                     let message = format!(
-                        "plugin operation '{operation}' timed out after {:?}; underlying plugin operation remains active",
+                        "plugin operation '{operation}' timed out after {:?}; cooperative cancellation requested; operation remains active until it returns",
                         self.config.call_timeout
                     );
                     Common::Logging::Logger::Log::Dump(
@@ -953,14 +1090,20 @@ impl PluginRuntime {
     fn call_json_direct_from_bytes<R: DeserializeOwned, F>(
         &self,
         request_bytes: &[u8],
+        cancellation: PluginCancellationV2,
         select_call: F
     ) -> Result<R, String>
-        where F: FnOnce(&PluginVTableV1) -> PluginEndpointFnV1
+        where F: FnOnce(&PluginVTableV2) -> PluginEndpointFnV2
     {
         self.with_instance(|context, vtable| {
             let mut response = AbiBuffer::EMPTY;
             let status = unsafe {
-                select_call(vtable)(context, AbiSlice::from_bytes(request_bytes), &mut response)
+                select_call(vtable)(
+                    context,
+                    AbiSlice::from_bytes(request_bytes),
+                    cancellation,
+                    &mut response
+                )
             };
             if status != PLUGIN_STATUS_OK {
                 if Self::is_valid_buffer(response) && !response.ptr.is_null() {
@@ -987,8 +1130,8 @@ impl PluginRuntime {
 
     pub(crate) fn name(self: &Arc<Self>) -> Result<String, String> {
         let bytes = self
-            .call_with_timeout_internal("name", |runtime| {
-                runtime.call_buffer(|vtable| vtable.name)
+            .call_with_timeout_internal("name", |runtime, cancellation| {
+                runtime.call_buffer(cancellation, |vtable| vtable.name)
             })
             .map_err(|error| error.to_string())?;
         let name = serde_json
@@ -1000,8 +1143,8 @@ impl PluginRuntime {
 
     pub(crate) fn manifest(self: &Arc<Self>) -> Result<PluginManifest, String> {
         let bytes = self
-            .call_with_timeout_internal("manifest", |runtime| {
-                runtime.call_buffer(|vtable| vtable.manifest)
+            .call_with_timeout_internal("manifest", |runtime, cancellation| {
+                runtime.call_buffer(cancellation, |vtable| vtable.manifest)
             })
             .map_err(|error| error.to_string())?;
         serde_json
@@ -1010,9 +1153,9 @@ impl PluginRuntime {
     }
 
     pub(crate) fn is_loaded(self: &Arc<Self>) -> Result<bool, String> {
-        self.call_with_timeout("is_loaded", |runtime| {
+        self.call_with_timeout("is_loaded", |runtime, cancellation| {
             runtime.with_instance(|context, vtable| {
-                let status = unsafe { (vtable.is_loaded)(context) };
+                let status = unsafe { (vtable.is_loaded)(context, cancellation) };
                 match status {
                     PLUGIN_STATUS_OK => Ok(true),
                     PLUGIN_STATUS_NOT_INITIALIZED => Ok(false),
@@ -1029,116 +1172,153 @@ impl PluginRuntime {
         PluginContracts::ApiContract::PluginEndpointResponse,
         PluginContracts::ApiContract::PluginEndpointError
     > {
-        self
-            .call_with_timeout("handle_endpoint", move |runtime| {
-                let request_bytes = serde_json
-                    ::to_vec(&request)
-                    .map_err(|error| format!("failed to encode plugin request: {error}"))?;
-                runtime.call_json_direct_from_bytes(&request_bytes, |vtable| vtable.handle_endpoint)
-            })
-            .map_err(|error| {
-                match error {
-                    PluginCallFailure::Timeout(timeout) =>
-                        PluginContracts::ApiContract::PluginEndpointError::new(
-                            504,
-                            "plugin_timeout",
-                            "The plugin did not respond within the configured timeout",
-                            Some(format!("plugin call timeout: {:?}", timeout))
-                        ),
-                    PluginCallFailure::Busy =>
-                        PluginContracts::ApiContract::PluginEndpointError::new(
-                            503,
-                            "plugin_overloaded",
-                            "The plugin is currently handling its maximum number of concurrent calls",
-                            None
-                        ),
-                    PluginCallFailure::Failed(message) =>
-                        PluginContracts::ApiContract::PluginEndpointError::internal(
-                            "plugin_abi_error",
-                            "The plugin ABI call failed",
-                            message
-                        ),
-                }
-            })?
+        self.handle_endpoint_with_parent(request, None)
     }
 
-    pub(crate) fn on_session_closed(
+    pub(crate) fn handle_endpoint_with_parent(
         self: &Arc<Self>,
-        context: &PluginContracts::ApiContract::PluginSessionContext
+        request: PluginContracts::ApiContract::PluginEndpointRequest,
+        parent_cancellation: Option<PluginCancellationV2>
+    ) -> Result<
+        PluginContracts::ApiContract::PluginEndpointResponse,
+        PluginContracts::ApiContract::PluginEndpointError
+    > {
+        let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
+            let request_bytes = serde_json
+                ::to_vec(&request)
+                .map_err(|error| format!("failed to encode plugin request: {error}"))?;
+            runtime.call_json_direct_from_bytes(
+                &request_bytes,
+                cancellation,
+                |vtable| vtable.handle_endpoint
+            )
+        };
+
+        let result = match parent_cancellation {
+            Some(parent) => self.call_with_timeout_parent("handle_endpoint", parent, call),
+            None => self.call_with_timeout("handle_endpoint", call),
+        };
+
+        result.map_err(|error| {
+            match error {
+                PluginCallFailure::Timeout(timeout) =>
+                    PluginContracts::ApiContract::PluginEndpointError::new(
+                        504,
+                        "plugin_timeout",
+                        "The plugin did not respond within the configured timeout",
+                        Some(format!("plugin call timeout: {:?}", timeout))
+                    ),
+                PluginCallFailure::Busy =>
+                    PluginContracts::ApiContract::PluginEndpointError::new(
+                        503,
+                        "plugin_overloaded",
+                        "The plugin is currently handling its maximum number of concurrent calls",
+                        None
+                    ),
+                PluginCallFailure::Failed(message) =>
+                    PluginContracts::ApiContract::PluginEndpointError::internal(
+                        "plugin_abi_error",
+                        "The plugin ABI call failed",
+                        message
+                    ),
+            }
+        })?
+    }
+
+    pub(crate) fn on_session_closed_with_parent(
+        self: &Arc<Self>,
+        context: &PluginContracts::ApiContract::PluginSessionContext,
+        parent_cancellation: Option<PluginCancellationV2>
     ) -> Result<(), PluginContracts::ApiContract::PluginLifecycleError> {
         let context = context.clone();
-        self
-            .call_with_timeout("on_session_closed", move |runtime| {
-                let request_bytes = serde_json
-                    ::to_vec(&context)
-                    .map_err(|error|
-                        format!("failed to encode session lifecycle request: {error}")
-                    )?;
-                runtime.call_json_direct_from_bytes(
-                    &request_bytes,
-                    |vtable| vtable.on_session_closed
-                )
-            })
-            .map_err(|error| {
-                match error {
-                    PluginCallFailure::Timeout(_) =>
-                        PluginContracts::ApiContract::PluginLifecycleError::new(
-                            "plugin_timeout",
-                            "Plugin session cleanup exceeded the configured timeout"
-                        ),
-                    PluginCallFailure::Busy =>
-                        PluginContracts::ApiContract::PluginLifecycleError::new(
-                            "plugin_overloaded",
-                            "Plugin session cleanup was rejected because the plugin is overloaded"
-                        ),
-                    PluginCallFailure::Failed(message) =>
-                        PluginContracts::ApiContract::PluginLifecycleError::new(
-                            "plugin_abi_error",
-                            message
-                        ),
-                }
-            })?
+        let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
+            let request_bytes = serde_json
+                ::to_vec(&context)
+                .map_err(|error| format!("failed to encode session lifecycle request: {error}"))?;
+            runtime.call_json_direct_from_bytes(
+                &request_bytes,
+                cancellation,
+                |vtable| vtable.on_session_closed
+            )
+        };
+
+        let result = match parent_cancellation {
+            Some(parent) => self.call_with_timeout_parent("on_session_closed", parent, call),
+            None => self.call_with_timeout("on_session_closed", call),
+        };
+
+        result.map_err(|error| {
+            match error {
+                PluginCallFailure::Timeout(_) =>
+                    PluginContracts::ApiContract::PluginLifecycleError::new(
+                        "plugin_timeout",
+                        "Plugin session cleanup exceeded the configured timeout"
+                    ),
+                PluginCallFailure::Busy =>
+                    PluginContracts::ApiContract::PluginLifecycleError::new(
+                        "plugin_overloaded",
+                        "Plugin session cleanup was rejected because the plugin is overloaded"
+                    ),
+                PluginCallFailure::Failed(message) =>
+                    PluginContracts::ApiContract::PluginLifecycleError::new(
+                        "plugin_abi_error",
+                        message
+                    ),
+            }
+        })?
     }
 
-    pub(crate) fn execute_database(
+    pub(crate) fn execute_database_with_parent(
         self: &Arc<Self>,
-        request: DatabaseContracts::DatabaseRequest
+        request: DatabaseContracts::DatabaseRequest,
+        parent_cancellation: Option<PluginCancellationV2>
     ) -> Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> {
-        self
-            .call_with_timeout("execute_database", move |runtime| {
-                let request_bytes = serde_json
-                    ::to_vec(&request)
-                    .map_err(|error| format!("failed to encode database request: {error}"))?;
+        let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
+            let request_bytes = serde_json
+                ::to_vec(&request)
+                .map_err(|error| format!("failed to encode database request: {error}"))?;
+            let response: Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> =
                 runtime.call_json_direct_from_bytes(
                     &request_bytes,
+                    cancellation,
                     |vtable| vtable.execute_database
-                )
-            })
-            .map_err(|error| {
-                match error {
-                    PluginCallFailure::Timeout(timeout) =>
-                        DatabaseContracts::DatabaseError::new(
-                            DatabaseContracts::DatabaseErrorKind::Query,
-                            format!("plugin database call timed out after {:?}", timeout)
-                        ),
-                    PluginCallFailure::Busy =>
-                        DatabaseContracts::DatabaseError::new(
-                            DatabaseContracts::DatabaseErrorKind::Query,
-                            "plugin database concurrency limit reached"
-                        ),
-                    PluginCallFailure::Failed(message) =>
-                        DatabaseContracts::DatabaseError::new(
-                            DatabaseContracts::DatabaseErrorKind::Decode,
-                            message
-                        ),
-                }
-            })?
+                )?;
+            response.map_err(|error| format!("plugin database operation failed: {error}"))
+        };
+
+        let result = match parent_cancellation {
+            Some(parent) => self.call_with_timeout_parent("execute_database", parent, call),
+            None => self.call_with_timeout("execute_database", call),
+        };
+
+        result.map_err(|error| {
+            match error {
+                PluginCallFailure::Timeout(timeout) =>
+                    DatabaseContracts::DatabaseError::new(
+                        DatabaseContracts::DatabaseErrorKind::Query,
+                        format!(
+                            "plugin database call timed out after {:?}; cooperative cancellation requested",
+                            timeout
+                        )
+                    ),
+                PluginCallFailure::Busy =>
+                    DatabaseContracts::DatabaseError::new(
+                        DatabaseContracts::DatabaseErrorKind::Query,
+                        "plugin database concurrency limit reached"
+                    ),
+                PluginCallFailure::Failed(message) =>
+                    DatabaseContracts::DatabaseError::new(
+                        DatabaseContracts::DatabaseErrorKind::Decode,
+                        message
+                    ),
+            }
+        })
     }
 
     fn start_lifecycle_operation(
         &self,
         operation: PluginLifecycleOperation,
-        callback: PluginLoadFnV1,
+        callback: PluginLoadFnV2,
         context: *mut std::ffi::c_void
     ) -> Result<(), String> {
         let mut pending = self.pending_lifecycle
@@ -1148,21 +1328,29 @@ impl PluginRuntime {
             return Err("a plugin lifecycle callback is already in progress".to_owned());
         }
 
+        let cancellation = Arc::new(PluginCancellationState {
+            local: AtomicBool::new(false),
+            parent: None,
+        });
+        let callback_cancellation = PluginCancellationV2 {
+            context: Arc::as_ptr(&cancellation).cast(),
+            is_cancelled: plugin_is_cancelled,
+        };
         let context = context as usize;
         let receiver = self.lifecycle_executor.submit(
             Box::new(move || {
                 let context = context as *mut std::ffi::c_void;
-                Ok(unsafe { callback(context) })
+                Ok(unsafe { callback(context, callback_cancellation) })
             })
         )?;
-        *pending = Some(PendingPluginLifecycle { operation, receiver });
+        *pending = Some(PendingPluginLifecycle { operation, receiver, cancellation });
         Ok(())
     }
 
     fn start_destroy_operation(
         &self,
-        callback: PluginDestroyFnV1,
-        instance: *mut PluginInstanceV1
+        callback: PluginDestroyFnV2,
+        instance: *mut PluginInstanceV2
     ) -> Result<(), String> {
         let mut pending = self.pending_lifecycle
             .lock()
@@ -1171,16 +1359,25 @@ impl PluginRuntime {
             return Err("a plugin lifecycle callback is already in progress".to_owned());
         }
 
+        let cancellation = Arc::new(PluginCancellationState {
+            local: AtomicBool::new(false),
+            parent: None,
+        });
+        let callback_cancellation = PluginCancellationV2 {
+            context: Arc::as_ptr(&cancellation).cast(),
+            is_cancelled: plugin_is_cancelled,
+        };
         let instance = instance as usize;
         let receiver = self.lifecycle_executor.submit(
             Box::new(move || {
-                let instance = instance as *mut PluginInstanceV1;
-                Ok(unsafe { callback(instance) })
+                let instance = instance as *mut PluginInstanceV2;
+                Ok(unsafe { callback(instance, callback_cancellation) })
             })
         )?;
         *pending = Some(PendingPluginLifecycle {
             operation: PluginLifecycleOperation::Destroy,
             receiver,
+            cancellation,
         });
         Ok(())
     }
@@ -1201,6 +1398,7 @@ impl PluginRuntime {
         match pending.receiver.recv_timeout(self.config.lifecycle_timeout) {
             Ok(result) => Ok(Some((pending.operation, result))),
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                pending.cancellation.local.store(true, Ordering::Release);
                 let mut slot = self.pending_lifecycle
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1220,7 +1418,7 @@ impl PluginRuntime {
 
     fn validate_lifecycle_instance(
         &self
-    ) -> Result<(*mut PluginInstanceV1, PluginLoadFnV1, PluginDestroyFnV1), String> {
+    ) -> Result<(*mut PluginInstanceV2, PluginLoadFnV2, PluginDestroyFnV2), String> {
         let state = self.read_state();
         let instance = state.instance.ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
         let instance_ref = unsafe { &*instance };
@@ -1326,6 +1524,7 @@ impl PluginRuntime {
         }
 
         self.set_health(PluginHealthState::Stopping);
+        self.gate.cancel_all();
 
         let deadline = Instant::now() + self.config.unload_timeout;
         if !self.gate.wait_until_idle(deadline) {
@@ -1490,6 +1689,15 @@ impl PluginRuntime {
 impl Drop for PluginRuntime {
     fn drop(&mut self) {
         self.unloading.store(true, Ordering::Release);
+        self.gate.cancel_all();
+        if
+            let Some(pending) = self.pending_lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+        {
+            pending.cancellation.local.store(true, Ordering::Release);
+        }
         self.worker_pool.shutdown();
         self.lifecycle_executor.shutdown();
         let mut state = self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1504,8 +1712,9 @@ impl Drop for PluginRuntime {
         let vtable = unsafe { &*instance_ref.vtable };
         let _ = std::panic::catch_unwind(
             std::panic::AssertUnwindSafe(|| unsafe {
-                let _ = (vtable.on_unload)(instance_ref.context);
-                let _ = (vtable.destroy)(instance);
+                let cancellation = never_cancelled_abi();
+                let _ = (vtable.on_unload)(instance_ref.context, cancellation);
+                let _ = (vtable.destroy)(instance, cancellation);
             })
         );
     }
@@ -1527,9 +1736,10 @@ impl PluginProxy {
 impl IPlugin for PluginProxy {
     fn execute_database(
         &self,
-        request: DatabaseContracts::DatabaseRequest
+        request: DatabaseContracts::DatabaseRequest,
+        cancellation: &PluginCancellation
     ) -> Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> {
-        self.runtime.execute_database(request)
+        self.runtime.execute_database_with_parent(request, Some(cancellation.as_abi()))
     }
 
     fn isLoaded(&self) -> bool {
@@ -1542,12 +1752,13 @@ impl IPlugin for PluginProxy {
 
     fn handle_endpoint(
         &self,
-        request: PluginContracts::ApiContract::PluginEndpointRequest
+        request: PluginContracts::ApiContract::PluginEndpointRequest,
+        cancellation: &PluginCancellation
     ) -> Result<
         PluginContracts::ApiContract::PluginEndpointResponse,
         PluginContracts::ApiContract::PluginEndpointError
     > {
-        self.runtime.handle_endpoint(request)
+        self.runtime.handle_endpoint_with_parent(request, Some(cancellation.as_abi()))
     }
 
     fn name(&self) -> String {
@@ -1569,15 +1780,16 @@ impl IPlugin for PluginProxy {
         self.isLoaded()
     }
 
-    fn on_unload(&mut self) -> bool {
+    fn on_unload(&mut self, _cancellation: &PluginCancellation) -> bool {
         self.runtime.unload()
     }
 
     fn on_session_closed(
         &self,
-        context: &PluginContracts::ApiContract::PluginSessionContext
+        context: &PluginContracts::ApiContract::PluginSessionContext,
+        cancellation: &PluginCancellation
     ) -> Result<(), PluginContracts::ApiContract::PluginLifecycleError> {
-        self.runtime.on_session_closed(context)
+        self.runtime.on_session_closed_with_parent(context, Some(cancellation.as_abi()))
     }
 }
 
@@ -1730,13 +1942,13 @@ impl PluginManager {
             }
         })?;
 
-        let constructor: Symbol<PluginCreateFnV1> = (
+        let constructor: Symbol<PluginCreateFnV2> = (
             unsafe {
-                library.get(PLUGIN_CONSTRUCTOR_SYMBOL_V1)
+                library.get(PLUGIN_CONSTRUCTOR_SYMBOL_V2)
             }
         ).map_err(|source| PluginManagerError::ConstructorLoad {
             path: path.to_path_buf(),
-            symbol: "InstantiateV1",
+            symbol: "InstantiateV2",
             source,
         })?;
 
@@ -1744,7 +1956,7 @@ impl PluginManager {
         let plugin_directory_bytes = plugin_directory.to_string_lossy().into_owned().into_bytes();
         let plugin_directory_slice = AbiSlice::from_bytes(&plugin_directory_bytes);
         let database = super::Factory::database_capability();
-        let host_services = PluginHostServicesV1::new(
+        let host_services = PluginHostServicesV2::new(
             host_log,
             database.map(|capability| capability.execute),
             database.map(|capability| capability.free),
@@ -1862,7 +2074,7 @@ mod tests {
 
     #[test]
     fn timed_out_call_lifecycle_is_closed_by_the_worker() {
-        let tracker = PluginCallTracker::new();
+        let tracker = PluginCallTracker::new(None);
         let mut timeout_bookkeeping = false;
 
         assert!(tracker.mark_timed_out(|| timeout_bookkeeping = true));
@@ -1872,9 +2084,22 @@ mod tests {
 
     #[test]
     fn completed_call_wins_the_timeout_race() {
-        let tracker = PluginCallTracker::new();
+        let tracker = PluginCallTracker::new(None);
 
         assert!(!tracker.complete());
         assert!(!tracker.mark_timed_out(|| panic!("completed call must not be timed out")));
+    }
+
+    #[test]
+    fn cancellation_token_reflects_local_and_parent_cancellation() {
+        let parent = PluginCallTracker::new(None);
+        let child = PluginCallTracker::new(Some(parent.abi_cancellation()));
+
+        assert!(!(unsafe { parent.abi_cancellation().is_cancelled() }));
+        assert!(!(unsafe { child.abi_cancellation().is_cancelled() }));
+
+        assert!(parent.mark_timed_out(|| {}));
+        assert!(unsafe { parent.abi_cancellation().is_cancelled() });
+        assert!(unsafe { child.abi_cancellation().is_cancelled() });
     }
 }

@@ -494,7 +494,12 @@ fn timed_plugin_calls_return_without_detaching_the_running_library() {
     assert_eq!(health.total_calls, 1);
     assert_eq!(health.active_calls, 1);
 
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        library.parent().unwrap().join("slow-cancelled.marker").is_file(),
+        "the timed-out call must observe the cooperative cancellation request"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(50));
     let recovered = Factory::plugin_health_by_name("PluginHostIntegration").expect(
         "timed-out plugin health must still be available after completion"
     );
@@ -521,9 +526,11 @@ fn unload_timeout_keeps_the_plugin_registered_until_quiescing_succeeds() {
         lifecycle_timeout: std::time::Duration::from_millis(25),
         max_concurrent_calls: 2,
     };
+    let previous = fixture_mode(Some("slow_ignore_cancel"));
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "fixture library must load with bounded unload timeout"
     );
+    restore_fixture_mode(previous);
 
     let request = PluginEndpointRequest {
         endpoint_id: "slow".to_owned(),
@@ -574,7 +581,7 @@ fn unload_timeout_keeps_the_plugin_registered_until_quiescing_succeeds() {
 }
 
 #[test]
-fn unload_waits_for_in_flight_plugin_calls_before_destroying_the_instance() {
+fn unload_requests_cooperative_cancellation_before_destroying_the_instance() {
     let _test_guard = lock_test();
     let library = build_fixture();
     let id = Factory::load_plugin_file(&library).expect("fixture library must load");
@@ -603,8 +610,8 @@ fn unload_waits_for_in_flight_plugin_calls_before_destroying_the_instance() {
     let _ = std::fs::remove_file(&marker);
 
     let worker = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", slow_request()).expect(
-            "in-flight endpoint call must succeed"
+        Factory::handle_endpoint("PluginHostIntegration", slow_request()).expect_err(
+            "the in-flight endpoint call must be cooperatively cancelled during unload"
         )
     });
 
@@ -618,13 +625,18 @@ fn unload_waits_for_in_flight_plugin_calls_before_destroying_the_instance() {
     Factory::unload_plugin(id).expect("unload must wait for the active call");
     let elapsed = started.elapsed();
 
-    let response = worker.join().expect("endpoint thread must finish");
-    assert_eq!(response.status, 200);
+    let error = worker.join().expect("endpoint thread must finish");
     assert!(
-        elapsed >= std::time::Duration::from_millis(150),
-        "unload returned before the in-flight call drained: {:?}",
+        elapsed < std::time::Duration::from_millis(150),
+        "unload did not observe cooperative cancellation promptly: {:?}",
         elapsed
     );
+    assert!(
+        library.parent().unwrap().join("slow-cancelled.marker").is_file(),
+        "the in-flight endpoint callback must observe unload cancellation"
+    );
+    assert_eq!(error.status, 499);
+    assert_eq!(error.code, "plugin_cancelled");
     assert_eq!(Factory::plugin_count(), 0);
 
     let _ = std::fs::remove_dir_all(library.parent().unwrap());
@@ -690,8 +702,8 @@ fn p1_readiness_state_matrix_covers_ready_stopping_failed_and_empty() {
         let mut request = ping_request();
         request.endpoint_id = "slow".to_owned();
         request.raw_path = "/pluginhost-integration/slow".to_owned();
-        Factory::handle_endpoint("PluginHostIntegration", request).expect(
-            "slow endpoint must remain valid while unload waits"
+        Factory::handle_endpoint("PluginHostIntegration", request).expect_err(
+            "slow endpoint must observe cooperative unload cancellation"
         )
     });
 
@@ -716,7 +728,8 @@ fn p1_readiness_state_matrix_covers_ready_stopping_failed_and_empty() {
     }
     assert!(observed_stopping, "readiness matrix must expose the transient stopping state");
 
-    worker.join().expect("slow endpoint worker must finish");
+    let cancellation_error = worker.join().expect("slow endpoint worker must finish");
+    assert_eq!(cancellation_error.code, "plugin_cancelled");
     unload_thread.join().expect("unload worker must finish").expect("unload must succeed");
     assert!(Factory::check_readiness().is_ok(), "empty plugin set is ready for the host gate");
 
@@ -819,7 +832,9 @@ fn p1_timeout_recovers_to_ready_without_detaching_the_plugin() {
     assert_eq!(degraded.active_calls, 1);
     assert!(Factory::check_readiness().is_err(), "degraded plugin must fail readiness");
 
-    std::thread::sleep(std::time::Duration::from_millis(350));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(library.parent().unwrap().join("slow-cancelled.marker").is_file());
+    std::thread::sleep(std::time::Duration::from_millis(50));
 
     let recovered = Factory::plugin_health_by_name("PluginHostIntegration").expect(
         "recovered plugin health must be available"
@@ -840,7 +855,7 @@ fn p1_timeout_recovers_to_ready_without_detaching_the_plugin() {
 }
 
 #[test]
-fn p1_lifetime_ordering_is_on_unload_before_destroy_and_after_quiescing() {
+fn p1_lifetime_ordering_is_on_unload_before_destroy_and_after_cooperative_cancellation() {
     let _test_guard = lock_test();
     let library = build_fixture();
     let id = Factory::load_plugin_file(&library).expect("fixture library must load");
@@ -854,8 +869,8 @@ fn p1_lifetime_ordering_is_on_unload_before_destroy_and_after_quiescing() {
     request.raw_path = "/pluginhost-integration/slow".to_owned();
 
     let worker = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", request).expect(
-            "in-flight request must finish before unload completes"
+        Factory::handle_endpoint("PluginHostIntegration", request).expect_err(
+            "in-flight request must observe cooperative cancellation during unload"
         )
     });
 
@@ -869,12 +884,21 @@ fn p1_lifetime_ordering_is_on_unload_before_destroy_and_after_quiescing() {
     Factory::unload_plugin(id).expect("plugin unload must succeed after quiescing");
     let elapsed = started.elapsed();
     assert!(
-        exited_marker.is_file(),
-        "unload must not return before the in-flight plugin callback exits"
+        library.parent().unwrap().join("slow-cancelled.marker").is_file(),
+        "the in-flight plugin callback must observe unload cancellation"
+    );
+    assert!(
+        !exited_marker.is_file(),
+        "a cooperatively cancelled callback must not run to normal completion"
     );
     let response = worker.join().expect("request worker must finish");
-    assert_eq!(response.status, 200);
-    assert!(elapsed >= std::time::Duration::from_millis(150));
+    assert_eq!(response.status, 499);
+    assert_eq!(response.code, "plugin_cancelled");
+    assert!(
+        elapsed < std::time::Duration::from_millis(150),
+        "unload should not wait for the full 200 ms fixture operation: {:?}",
+        elapsed
+    );
 
     let order_path = library.parent().unwrap().join("lifecycle.order");
     let order = fs::read_to_string(&order_path).expect("lifecycle order log must exist");
@@ -1047,7 +1071,8 @@ fn on_unload_timeout_keeps_the_plugin_registered_until_callback_finishes() {
     assert_eq!(health.state, PluginHealthState::Stopping);
     assert!(!library.parent().unwrap().join("destroy.marker").is_file());
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(library.parent().unwrap().join("unload-cancelled.marker").is_file());
 
     Factory::unload_plugin(id).expect(
         "retry must observe the finished on_unload and proceed to destroy"
@@ -1083,7 +1108,8 @@ fn destroy_timeout_keeps_the_plugin_registered_until_callback_finishes() {
     );
     assert_eq!(health.state, PluginHealthState::Stopping);
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(library.parent().unwrap().join("destroy-cancelled.marker").is_file());
 
     Factory::unload_plugin(id).expect(
         "retry must observe the finished destroy without invoking destroy twice"
@@ -1264,6 +1290,7 @@ static DATABASE_CAPABILITY_CALLS: std::sync::atomic::AtomicUsize = std::sync::at
 
 unsafe extern "C" fn test_database_execute(
     request: PluginContracts::PluginAbi::AbiSlice,
+    cancellation: PluginContracts::PluginAbi::PluginCancellationV2,
     response_out: *mut PluginContracts::PluginAbi::AbiBuffer
 ) -> i32 {
     if response_out.is_null() {
@@ -1273,11 +1300,34 @@ unsafe extern "C" fn test_database_execute(
     let request = (unsafe { request.to_vec() }).and_then(|bytes|
         serde_json::from_slice::<DatabaseContracts::DatabaseRequest>(&bytes).ok()
     );
-    if request.is_none() {
+    let Some(request) = request else {
         return PluginContracts::PluginAbi::PLUGIN_STATUS_INVALID_ARGUMENT;
-    }
+    };
 
     DATABASE_CAPABILITY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let is_cancellable_probe = match &request {
+        DatabaseContracts::DatabaseRequest::Execute(execute) => execute.statement == "CANCEL_ME",
+        DatabaseContracts::DatabaseRequest::Query(query) => query.statement == "CANCEL_ME",
+    };
+    if is_cancellable_probe {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let is_cancelled = unsafe {
+                let c = cancellation.is_cancelled();
+                c
+            };
+            match is_cancelled {
+                true => {
+                    return PluginContracts::PluginAbi::PLUGIN_STATUS_CANCELLED;
+                }
+                false => (),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        return PluginContracts::PluginAbi::PLUGIN_STATUS_OK;
+    }
+
     let result: Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> = Ok(
         DatabaseContracts::DatabaseResponse::Execute(DatabaseContracts::ExecutionResult {
             rows_affected: 42,
@@ -1288,6 +1338,17 @@ unsafe extern "C" fn test_database_execute(
         *response_out = PluginContracts::PluginAbi::AbiBuffer::from_vec(bytes);
     }
     PluginContracts::PluginAbi::PLUGIN_STATUS_OK
+}
+
+unsafe extern "C" fn test_is_cancelled(context: *const std::ffi::c_void) -> bool {
+    if context.is_null() {
+        return true;
+    }
+    unsafe {
+        (*(context as *const std::sync::atomic::AtomicBool)).load(
+            std::sync::atomic::Ordering::Acquire
+        )
+    }
 }
 
 unsafe extern "C" fn test_database_free(buffer: PluginContracts::PluginAbi::AbiBuffer) {
@@ -1314,7 +1375,12 @@ fn database_capability_crosses_the_real_plugin_abi_boundary() {
         statement: "UPDATE test_table SET value = 1".to_owned(),
         parameters: Vec::new(),
     });
-    let response = Factory::with_database_plugin(|plugin| plugin.execute_database(request.clone()))
+    let response = Factory::with_database_plugin(|plugin|
+        plugin.execute_database(
+            request.clone(),
+            &PluginContracts::ApiContract::PluginCancellation::uncancelled()
+        )
+    )
         .expect("exactly one database plugin must be selected")
         .expect("plugin database bridge must execute through host capability");
 
@@ -1325,6 +1391,50 @@ fn database_capability_crosses_the_real_plugin_abi_boundary() {
             rows_affected: 42,
         })
     );
+
+    cleanup_plugin(id);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn database_capability_propagates_cooperative_cancellation_across_the_plugin_boundary() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+
+    DATABASE_CAPABILITY_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let _ = Factory::register_database_executor(test_database_execute, test_database_free);
+
+    let previous = fixture_mode(Some("database"));
+    let id = Factory::load_plugin_file(&library).expect("database bridge fixture must load");
+    restore_fixture_mode(previous);
+
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let setter = std::sync::Arc::clone(&cancelled);
+    let setter_thread = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        setter.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    let cancellation = PluginContracts::ApiContract::PluginCancellation::from_abi(
+        PluginContracts::PluginAbi::PluginCancellationV2 {
+            context: std::sync::Arc::as_ptr(&cancelled).cast(),
+            is_cancelled: test_is_cancelled,
+        }
+    );
+    let request = DatabaseContracts::DatabaseRequest::Execute(DatabaseContracts::ExecuteRequest {
+        statement: "CANCEL_ME".to_owned(),
+        parameters: Vec::new(),
+    });
+
+    let error = Factory::with_database_plugin(|plugin|
+        plugin.execute_database(request, &cancellation)
+    )
+        .expect("exactly one database plugin must be selected")
+        .expect_err("cooperative cancellation must reach the host database capability");
+    setter_thread.join().expect("cancellation setter thread must finish");
+
+    assert!(error.to_string().contains("host database capability returned ABI status -6"));
+    assert_eq!(DATABASE_CAPABILITY_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     cleanup_plugin(id);
     let _ = fs::remove_dir_all(library.parent().unwrap());
@@ -1443,8 +1553,8 @@ fn concurrent_load_and_unload_for_the_same_library_are_serialized_and_reload_rem
         let mut request = ping_request();
         request.endpoint_id = "slow".to_owned();
         request.raw_path = "/pluginhost-integration/slow".to_owned();
-        Factory::handle_endpoint("PluginHostIntegration", request).expect(
-            "slow endpoint must remain valid during unload"
+        Factory::handle_endpoint("PluginHostIntegration", request).expect_err(
+            "slow endpoint must observe cooperative unload cancellation"
         )
     });
 
@@ -1487,7 +1597,8 @@ fn concurrent_load_and_unload_for_the_same_library_are_serialized_and_reload_rem
 
     let unload_result = unload_thread.join().expect("unload worker must finish");
     unload_result.expect("unload must succeed after the in-flight call drains");
-    worker.join().expect("in-flight endpoint worker must finish");
+    let cancellation_error = worker.join().expect("in-flight endpoint worker must finish");
+    assert_eq!(cancellation_error.code, "plugin_cancelled");
     assert_eq!(Factory::plugin_count(), 0);
 
     let reloaded_id = Factory::load_plugin_file_with_config(&library, config).expect(

@@ -51,14 +51,13 @@
 //! - Plugin call limits default to 30s call timeout, 10s unload timeout, and 64 concurrent calls.
 //!   They can be overridden with `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`,
 //!   and `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, or supplied explicitly to the `*_with_config` load APIs.
-//! - A call timeout is a caller-side deadline, not a forced cancellation. The underlying plugin
-//!   operation remains active until the worker returns; the runtime keeps that call counted as
-//!   active and unload waits for it to drain safely. Health telemetry distinguishes request
-//!   timeouts from actual plugin-operation failures and from completion after a timeout.
-//! - `on_unload` and `destroy` run on a dedicated persistent lifecycle worker after quiescing.
-//!   `EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS` bounds how long the unload caller waits for each callback;
-//!   a timed-out callback is never forcefully cancelled. The runtime remains registered and a
-//!   subsequent unload retry observes the callback's actual result before invoking the next stage.
+//! - ABI V2 uses cooperative cancellation for plugin calls. A caller-side timeout sets the
+//!   per-operation cancellation signal; plugin code must observe it at safe interruption points
+//!   and return. The host never terminates a plugin thread or invalidates plugin memory.
+//! - On unload, every admitted call receives the same cancellation request and the runtime waits
+//!   for those calls to drain before `on_unload` and `destroy` are started. Lifecycle callbacks
+//!   themselves also receive a cooperative cancellation token. A lifecycle timeout leaves the
+//!   runtime registered until the callback actually returns, so a retry can safely continue.
 //!
 //! # Return conventions
 //!
@@ -75,6 +74,7 @@ pub mod Factory {
     use PluginContracts::{
         IPlugin::IPlugin,
         ApiContract::{
+            PluginCancellation,
             PluginCatalog,
             PluginCatalogError,
             PluginDatabaseCapability,
@@ -1038,7 +1038,7 @@ pub mod Factory {
             let notification = catch_unwind(
                 AssertUnwindSafe(|| {
                     let proxy = PluginProxy::new(runtime.clone());
-                    proxy.on_session_closed(context)
+                    proxy.on_session_closed(context, &PluginCancellation::uncancelled())
                 })
             );
 

@@ -171,7 +171,7 @@ fn loads_executes_unloads_and_reloads_a_real_dynamic_library() {
     assert_eq!(initial_health.timed_out_calls, 0);
     assert_eq!(initial_health.timed_out_active_calls, 0);
 
-    let response = Factory::handle_endpoint("PluginHostIntegration", ping_request()).expect(
+    let response = Factory::handle_endpoint(ping_request()).expect(
         "dynamic endpoint call must cross the ABI boundary"
     );
     assert_eq!(response.status, 200);
@@ -198,9 +198,7 @@ fn loads_executes_unloads_and_reloads_a_real_dynamic_library() {
     );
     assert_eq!(Factory::plugin_count(), 1);
 
-    let reloaded_response = Factory::handle_endpoint(
-        "PluginHostIntegration",
-        ping_request()
+    let reloaded_response = Factory::handle_endpoint(ping_request()
     ).expect("reloaded dynamic endpoint call must cross the ABI boundary");
     assert_eq!(reloaded_response.status, 200);
     let reloaded_body: serde_json::Value = serde_json
@@ -337,9 +335,7 @@ fn plugin_calls_reuse_a_bounded_persistent_worker_pool() {
 
     let mut worker_threads = BTreeSet::new();
     for iteration in 0..100 {
-        let response = Factory::handle_endpoint(
-            "PluginHostIntegration",
-            ping_request()
+        let response = Factory::handle_endpoint(ping_request()
         ).unwrap_or_else(|error| panic!("iteration {iteration}: ping failed: {error}"));
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json
@@ -424,12 +420,12 @@ fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
     }
 
     let first = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", slow_request()).expect(
+        Factory::handle_endpoint(slow_request()).expect(
             "first concurrent endpoint call must succeed"
         )
     });
     let second = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", slow_request()).expect(
+        Factory::handle_endpoint(slow_request()).expect(
             "second concurrent endpoint call must succeed"
         )
     });
@@ -463,7 +459,7 @@ fn timed_plugin_calls_return_without_detaching_the_running_library() {
         "fixture library must load with custom runtime limits"
     );
 
-    let response = Factory::handle_endpoint("PluginHostIntegration", { PluginEndpointRequest {
+    let response = Factory::handle_endpoint({ PluginEndpointRequest {
             endpoint_id: "slow".to_owned(),
             method: PluginHttpMethod::Get,
             raw_path: "/pluginhost-integration/slow".to_owned(),
@@ -551,7 +547,7 @@ fn unload_timeout_keeps_the_plugin_registered_until_quiescing_succeeds() {
     };
 
     let worker = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", request).expect(
+        Factory::handle_endpoint(request).expect(
             "slow endpoint call must remain valid while unload is blocked"
         )
     });
@@ -610,7 +606,7 @@ fn unload_requests_cooperative_cancellation_before_destroying_the_instance() {
     let _ = std::fs::remove_file(&marker);
 
     let worker = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", slow_request()).expect_err(
+        Factory::handle_endpoint(slow_request()).expect_err(
             "the in-flight endpoint call must be cooperatively cancelled during unload"
         )
     });
@@ -702,7 +698,7 @@ fn p1_readiness_state_matrix_covers_ready_stopping_failed_and_empty() {
         let mut request = ping_request();
         request.endpoint_id = "slow".to_owned();
         request.raw_path = "/pluginhost-integration/slow".to_owned();
-        Factory::handle_endpoint("PluginHostIntegration", request).expect_err(
+        Factory::handle_endpoint(request).expect_err(
             "slow endpoint must observe cooperative unload cancellation"
         )
     });
@@ -815,7 +811,7 @@ fn p1_timeout_recovers_to_ready_without_detaching_the_plugin() {
     let mut slow = ping_request();
     slow.endpoint_id = "slow".to_owned();
     slow.raw_path = "/pluginhost-integration/slow".to_owned();
-    let error = Factory::handle_endpoint("PluginHostIntegration", slow).expect_err(
+    let error = Factory::handle_endpoint(slow).expect_err(
         "slow endpoint must exceed the configured timeout"
     );
     assert_eq!(error.status, 504);
@@ -869,7 +865,7 @@ fn p1_lifetime_ordering_is_on_unload_before_destroy_and_after_cooperative_cancel
     request.raw_path = "/pluginhost-integration/slow".to_owned();
 
     let worker = std::thread::spawn(move || {
-        Factory::handle_endpoint("PluginHostIntegration", request).expect_err(
+        Factory::handle_endpoint(request).expect_err(
             "in-flight request must observe cooperative cancellation during unload"
         )
     });
@@ -1017,7 +1013,7 @@ fn plugin_panic_is_isolated_and_the_runtime_can_continue_serving_requests() {
     request.endpoint_id = "panic".to_owned();
     request.raw_path = "/pluginhost-integration/panic".to_owned();
 
-    let error = Factory::handle_endpoint("PluginHostIntegration", request).expect_err(
+    let error = Factory::handle_endpoint(request).expect_err(
         "intentional plugin panic must cross the ABI as an error"
     );
     assert_eq!(error.status, 500);
@@ -1029,7 +1025,7 @@ fn plugin_panic_is_isolated_and_the_runtime_can_continue_serving_requests() {
     assert_eq!(health.state, PluginHealthState::Degraded);
     assert_eq!(health.failed_calls, 1);
 
-    let response = Factory::handle_endpoint("PluginHostIntegration", ping_request()).expect(
+    let response = Factory::handle_endpoint(ping_request()).expect(
         "a subsequent non-panicking call must still succeed"
     );
     assert_eq!(response.status, 200);
@@ -1463,7 +1459,7 @@ fn plugin_concurrency_limit_rejects_excess_calls_and_reports_overload() {
         let mut request = ping_request();
         request.endpoint_id = "slow".to_owned();
         request.raw_path = "/pluginhost-integration/slow".to_owned();
-        Factory::handle_endpoint("PluginHostIntegration", request).expect(
+        Factory::handle_endpoint(request).expect(
             "first slow call must succeed"
         )
     });
@@ -1477,7 +1473,7 @@ fn plugin_concurrency_limit_rejects_excess_calls_and_reports_overload() {
     let mut second_request = ping_request();
     second_request.endpoint_id = "slow".to_owned();
     second_request.raw_path = "/pluginhost-integration/slow".to_owned();
-    let error = Factory::handle_endpoint("PluginHostIntegration", second_request).expect_err(
+    let error = Factory::handle_endpoint(second_request).expect_err(
         "second call must be rejected while the concurrency limit is full"
     );
     assert_eq!(error.status, 503);
@@ -1512,9 +1508,7 @@ fn completed_plugin_call_releases_its_concurrency_slot_before_result_is_observed
     // Run a sustained sequence of short calls. The next call must never observe the previous
     // call as still occupying the single admission slot after its result was returned.
     for iteration in 0..1_000 {
-        let response = Factory::handle_endpoint(
-            "PluginHostIntegration",
-            ping_request()
+        let response = Factory::handle_endpoint(ping_request()
         ).unwrap_or_else(|error| {
             panic!(
                 "iteration {iteration}: completed call left the concurrency slot occupied: {error}"
@@ -1553,7 +1547,7 @@ fn concurrent_load_and_unload_for_the_same_library_are_serialized_and_reload_rem
         let mut request = ping_request();
         request.endpoint_id = "slow".to_owned();
         request.raw_path = "/pluginhost-integration/slow".to_owned();
-        Factory::handle_endpoint("PluginHostIntegration", request).expect_err(
+        Factory::handle_endpoint(request).expect_err(
             "slow endpoint must observe cooperative unload cancellation"
         )
     });

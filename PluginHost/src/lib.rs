@@ -45,7 +45,8 @@
 //! # Behavior notes
 //!
 //! - `load_plugin_if_missing` attempts lazy loading from the plugin root path.
-//! - Name-based lookup is the canonical way to select a plugin at runtime.
+//! - REST endpoint lookup is catalog-based: callers identify an endpoint by its HTTP contract,
+//!   not by a concrete plugin implementation name.
 //! - `with_plugin_by_name`, `with_all_plugins`, and `with_database_plugin` provide scoped shared
 //!   access to plugin instances via closures. Database execution is selected by manifest capability.
 //! - Plugin call limits default to 30s call timeout, 10s unload timeout, and 64 concurrent calls.
@@ -1095,27 +1096,21 @@ pub mod Factory {
         plugin_count() > 0
     }
 
+    /// Executes a plugin REST endpoint without requiring the caller to know the concrete plugin name.
+    ///
+    /// Endpoint ownership is resolved from the runtime catalog using the HTTP method and path.
+    /// This prevents application code from coupling itself to implementation-specific plugin
+    /// names such as `ProcessTracker` and also avoids fragile name-derivation heuristics from REST
+    /// function names.
     pub fn handle_endpoint(
-        plugin_name: &str,
         request: PluginEndpointRequest
     ) -> Result<PluginEndpointResponse, PluginEndpointError> {
-        if
-            !load_plugin_if_missing(plugin_name, &getPluginRootDir()).map_err(|error| {
-                PluginEndpointError::internal(
-                    "plugin_load_failed",
-                    "Failed to load the specified plugin",
-                    &format!("Failed to load plugin '{}': {}", plugin_name, error)
-                )
-            })?
-        {
-            return Err(
-                PluginEndpointError::not_found(
-                    "plugin_not_found",
-                    "The specified plugin could not be found",
-                    &format!("Plugin '{}' is not available in the system", plugin_name)
-                )
-            );
-        }
+        let endpoint_path = request_endpoint_path(&request.base_path, &request.raw_path);
+        let plugin_name = resolve_endpoint_plugin_name(
+            request.method,
+            &endpoint_path,
+            &request.endpoint_id
+        )?;
 
         let runtime = {
             let singleton = instance();
@@ -1126,27 +1121,99 @@ pub mod Factory {
                 .find(|id|
                     manager
                         .get_manifest(*id)
-                        .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(plugin_name))
+                        .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(&plugin_name))
                 )
                 .ok_or_else(||
                     PluginEndpointError::not_found(
                         "plugin_not_found",
-                        "The specified plugin could not be found",
-                        &format!("Plugin '{}' is not available in the system", plugin_name)
+                        "The plugin implementing this endpoint is not available",
+                        &format!("No loaded plugin implements {} {}", request.method, request.raw_path)
                     )
                 )?;
             manager
                 .get_runtime(id)
                 .ok_or_else(||
                     PluginEndpointError::not_found(
-                        "plugin_not_found",
-                        "The specified plugin could not be found",
-                        &format!("Plugin '{}' is not available in the system", plugin_name)
+                        "plugin_runtime_not_found",
+                        "The plugin runtime implementing this endpoint is not available",
+                        &format!("No runtime is registered for plugin '{}'", plugin_name)
                     )
                 )?
         };
 
         runtime.handle_endpoint(request)
+    }
+
+    fn request_endpoint_path(base_path: &str, raw_path: &str) -> String {
+        let base = base_path.trim();
+        let raw = if raw_path.trim().is_empty() { "/" } else { raw_path.trim() };
+
+        if base.is_empty() || base == "/" {
+            return raw.to_owned();
+        }
+
+        let base = format!("/{}", base.trim_matches('/'));
+        if raw == base {
+            return "/".to_owned();
+        }
+
+        raw.strip_prefix(&format!("{base}/"))
+            .map(|path| format!("/{path}"))
+            .unwrap_or_else(|| raw.to_owned())
+    }
+
+    fn resolve_endpoint_plugin_name(
+        method: PluginContracts::ApiContract::PluginHttpMethod,
+        path: &str,
+        endpoint_id: &str
+    ) -> Result<String, PluginEndpointError> {
+        let resolve_from_catalog = || {
+            let singleton = instance();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            manager.catalog().endpoint_binding(method, path).map(|binding| {
+                if !binding.endpoint.id.eq_ignore_ascii_case(endpoint_id) {
+                    return Err(PluginEndpointError::internal(
+                        "plugin_endpoint_contract_mismatch",
+                        "The requested endpoint contract does not match the registered REST endpoint",
+                        format!(
+                            "HTTP endpoint {} {} is registered as endpoint id '{}', not '{}'",
+                            method,
+                            path,
+                            binding.endpoint.id,
+                            endpoint_id
+                        )
+                    ));
+                }
+                Ok(binding.plugin_name.clone())
+            })
+        };
+
+        if let Some(result) = resolve_from_catalog() {
+            return result;
+        }
+
+        // Preserve the previous lazy-load behavior without reintroducing plugin-name coupling:
+        // discover all plugin libraries, then resolve the requested endpoint from the resulting
+        // catalog. Optional discovery failures do not prevent other plugins from loading.
+        load_plugins_with_policy(
+            &getPluginRootDir(),
+            PluginLoadPolicy::optional_all()
+        ).map_err(|error|
+            PluginEndpointError::internal(
+                "plugin_discovery_failed",
+                "Plugin discovery failed while resolving the endpoint",
+                error.to_string()
+            )
+        )?;
+
+        match resolve_from_catalog() {
+            Some(result) => result,
+            None => Err(PluginEndpointError::not_found(
+                "plugin_endpoint_not_found",
+                "No loaded plugin implements the requested endpoint",
+                &format!("No plugin implements {} {}", method, path)
+            )),
+        }
     }
 }
 

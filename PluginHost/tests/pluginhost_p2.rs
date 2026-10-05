@@ -227,7 +227,7 @@ fn p2_long_running_plugin_stress() {
             let failures = std::sync::Arc::clone(&total_failures);
             thread::spawn(move || {
                 while Instant::now() < deadline {
-                    match Factory::handle_endpoint("PluginHostIntegration", ping_request()) {
+                    match Factory::handle_endpoint(ping_request()) {
                         Ok(response) if response.status == 200 => {
                             successes.fetch_add(1, Ordering::Relaxed);
                         }
@@ -276,9 +276,7 @@ fn p2_repeated_load_unload_soak() {
         assert!(id > 0, "cycle {cycle}: plugin id must be valid");
         assert_eq!(Factory::plugin_count(), 1, "cycle {cycle}: exactly one plugin must be loaded");
 
-        let response = Factory::handle_endpoint(
-            "PluginHostIntegration",
-            ping_request()
+        let response = Factory::handle_endpoint(ping_request()
         ).unwrap_or_else(|error| panic!("cycle {cycle}: endpoint call failed: {error}"));
         assert_eq!(response.status, 200, "cycle {cycle}: endpoint must return HTTP 200");
 
@@ -299,7 +297,7 @@ fn p2_resource_handle_and_thread_leak_check() {
     let _test_guard = lock_test();
     let library = build_fixture();
     let warmup_id = Factory::load_plugin_file(&library).expect("leak-check warmup load must work");
-    Factory::handle_endpoint("PluginHostIntegration", ping_request()).expect(
+    Factory::handle_endpoint(ping_request()).expect(
         "leak-check warmup call must work"
     );
     Factory::unload_plugin(warmup_id).expect("leak-check warmup unload must work");
@@ -311,7 +309,7 @@ fn p2_resource_handle_and_thread_leak_check() {
         let id = Factory::load_plugin_file(&library).unwrap_or_else(|error|
             panic!("cycle {cycle}: plugin load failed: {error}")
         );
-        Factory::handle_endpoint("PluginHostIntegration", ping_request()).unwrap_or_else(|error|
+        Factory::handle_endpoint(ping_request()).unwrap_or_else(|error|
             panic!("cycle {cycle}: endpoint call failed: {error}")
         );
         Factory::unload_plugin(id).unwrap_or_else(|error|
@@ -405,9 +403,7 @@ fn p2_multi_plugin_load_and_call_stress() {
             thread::spawn(move || {
                 let mut successes = 0usize;
                 while start.elapsed() < duration {
-                    let response = Factory::handle_endpoint(
-                        "PluginHostIntegration",
-                        ping_request()
+                    let response = Factory::handle_endpoint(ping_request()
                     ).unwrap_or_else(|error|
                         panic!("endpoint call for PluginHostIntegration failed: {error}")
                     );

@@ -34,7 +34,7 @@ unsafe extern "C" fn plugin_name(_context: *mut c_void, _cancellation: PluginCan
 unsafe extern "C" fn plugin_manifest(_context: *mut c_void, _cancellation: PluginCancellationV2, response_out: *mut AbiBuffer) -> i32 {
     unsafe {
         json_string(
-            r#"{"contract_version":6,"name":"MalformedAbiFixture","version":"0.0.1","kind":"Domain","functions":[],"endpoints":[]}"#,
+            r#"{"contract_version":7,"name":"MalformedAbiFixture","version":"0.0.1","kind":"Domain","endpoints":[]}"#,
             response_out
         )
     }

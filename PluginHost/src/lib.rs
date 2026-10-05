@@ -44,11 +44,11 @@
 //!
 //! # Behavior notes
 //!
-//! - `load_plugin_if_missing` attempts lazy loading from the plugin root path.
+//! - `load_plugin_if_missing` is a deprecated compatibility API; prefer explicit catalog/health lookup.
 //! - REST endpoint lookup is catalog-based: callers identify an endpoint by its HTTP contract,
 //!   not by a concrete plugin implementation name.
-//! - `with_plugin_by_name`, `with_all_plugins`, and `with_database_plugin` provide scoped shared
-//!   access to plugin instances via closures. Database execution is selected by manifest capability.
+//! - `with_plugin_by_name` and `with_all_plugins` are deprecated compatibility APIs; prefer the
+//!   catalog/endpoint APIs. `with_database_plugin` remains the explicit capability boundary.
 //! - Plugin call limits default to 30s call timeout, 10s unload timeout, and 64 concurrent calls.
 //!   They can be overridden with `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`,
 //!   and `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, or supplied explicitly to the `*_with_config` load APIs.
@@ -62,11 +62,9 @@
 //!
 //! # Return conventions
 //!
-//! - `is_plugin_loaded` / `load_plugin_if_missing`: `Ok(true)` when plugin is
-//!   available after optional lazy loading.
+//! - `is_plugin_loaded`: `Ok(true)` when a plugin is available.
 //! - `with_*` helpers: `None` when no matching plugin (or no plugins) is present.
-//! - bulk loading returns a [`Factory::PluginLoadReport`] when policy-aware loading is used;
-//!   the compatibility [`Factory::load_plugins`] API continues to return a loaded count.
+//! - bulk loading returns a [`Factory::PluginLoadReport`] from the policy-aware API.
 #![allow(non_snake_case)]
 mod PluginManager;
 pub mod Factory {
@@ -557,6 +555,9 @@ pub mod Factory {
         result
     }
 
+    #[deprecated(
+        note = "use load_plugins_with_policy or load_plugins_with_policy_and_config; the legacy required-all policy is implicit and provides no load report"
+    )]
     pub fn load_plugins(plugin_path: &str) -> Result<usize, PluginManagerError> {
         let report = load_plugins_with_policy_and_config(
             plugin_path,
@@ -792,6 +793,9 @@ pub mod Factory {
         Ok(report)
     }
 
+    #[deprecated(
+        note = "use is_plugin_loaded for lookup; explicit loading should use load_plugin_file or load_plugins_with_policy"
+    )]
     pub fn load_plugin_if_missing(
         plugin_name: &str,
         plugin_path: &str
@@ -838,6 +842,38 @@ pub mod Factory {
             Ok(())
         } else {
             Err(format!("plugin readiness check failed: {}", degraded.join(", ")))
+        }
+    }
+
+    /// Executes the standard read-only database readiness probe against the active data-source plugin.
+    ///
+    /// The probe stays in the plugin host because database readiness is a runtime capability,
+    /// not an HTTP-layer concern. The API can therefore query readiness without depending on
+    /// the concrete `Infrastructure::Datasource::DatabaseExecutor` implementation.
+    pub fn check_database_readiness() -> Result<(), String> {
+        let request = DatabaseContracts::DatabaseRequest::Query(DatabaseContracts::QueryRequest {
+            statement: "SELECT 1".to_owned(),
+            parameters: Vec::new(),
+            columns: Vec::new(),
+        });
+
+        let result = with_database_plugin(|plugin| {
+            plugin.execute_database(request, &PluginCancellation::uncancelled())
+        })?;
+        let result = result.map_err(|error| error.to_string())?;
+
+        match result {
+            DatabaseContracts::DatabaseResponse::Query(result_set) if result_set.rows.len() == 1 =>
+                Ok(()),
+            DatabaseContracts::DatabaseResponse::Query(result_set) =>
+                Err(
+                    format!(
+                        "database connectivity query returned {} rows instead of 1",
+                        result_set.rows.len()
+                    )
+                ),
+            DatabaseContracts::DatabaseResponse::Execute(_) =>
+                Err("database connectivity probe returned an execution result".to_owned()),
         }
     }
 
@@ -944,14 +980,18 @@ pub mod Factory {
         let mut loaded_count = 0usize;
         for path in directories {
             let path = path.to_string_lossy().into_owned();
-            loaded_count += load_plugins(&path).map_err(|error|
-                format!("failed to load database plugins from '{}': {error}", path)
+            let report = load_plugins_with_policy(&path, PluginLoadPolicy::optional_all()).map_err(
+                |error| format!("failed to load database plugins from '{}': {error}", path)
             )?;
+            loaded_count += report.loaded_count();
         }
 
         Ok(loaded_count)
     }
 
+    #[deprecated(
+        note = "prefer catalog/endpoint dispatch; concrete plugin-name access is a compatibility API"
+    )]
     pub fn with_plugin_by_name<R, F>(plugin_name: &str, func: F) -> Option<R>
         where F: FnOnce(&dyn IPlugin) -> R
     {
@@ -987,6 +1027,9 @@ pub mod Factory {
         catalog
     }
 
+    #[deprecated(
+        note = "prefer catalog/health queries and explicit capability APIs; bulk raw plugin iteration is a compatibility API"
+    )]
     pub fn with_all_plugins<R, F>(func: F) -> Option<Vec<R>> where F: Fn(&dyn IPlugin) -> R {
         let runtimes = {
             let singleton = instance();
@@ -1127,7 +1170,11 @@ pub mod Factory {
                     PluginEndpointError::not_found(
                         "plugin_not_found",
                         "The plugin implementing this endpoint is not available",
-                        &format!("No loaded plugin implements {} {}", request.method, request.raw_path)
+                        &format!(
+                            "No loaded plugin implements {} {}",
+                            request.method,
+                            request.raw_path
+                        )
                     )
                 )?;
             manager
@@ -1170,22 +1217,27 @@ pub mod Factory {
         let resolve_from_catalog = || {
             let singleton = instance();
             let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            manager.catalog().endpoint_binding(method, path).map(|binding| {
-                if !binding.endpoint.id.eq_ignore_ascii_case(endpoint_id) {
-                    return Err(PluginEndpointError::internal(
-                        "plugin_endpoint_contract_mismatch",
-                        "The requested endpoint contract does not match the registered REST endpoint",
-                        format!(
-                            "HTTP endpoint {} {} is registered as endpoint id '{}', not '{}'",
-                            method,
-                            path,
-                            binding.endpoint.id,
-                            endpoint_id
-                        )
-                    ));
-                }
-                Ok(binding.plugin_name.clone())
-            })
+            manager
+                .catalog()
+                .endpoint_binding(method, path)
+                .map(|binding| {
+                    if !binding.endpoint.id.eq_ignore_ascii_case(endpoint_id) {
+                        return Err(
+                            PluginEndpointError::internal(
+                                "plugin_endpoint_contract_mismatch",
+                                "The requested endpoint contract does not match the registered REST endpoint",
+                                format!(
+                                    "HTTP endpoint {} {} is registered as endpoint id '{}', not '{}'",
+                                    method,
+                                    path,
+                                    binding.endpoint.id,
+                                    endpoint_id
+                                )
+                            )
+                        );
+                    }
+                    Ok(binding.plugin_name.clone())
+                })
         };
 
         if let Some(result) = resolve_from_catalog() {
@@ -1195,24 +1247,25 @@ pub mod Factory {
         // Preserve the previous lazy-load behavior without reintroducing plugin-name coupling:
         // discover all plugin libraries, then resolve the requested endpoint from the resulting
         // catalog. Optional discovery failures do not prevent other plugins from loading.
-        load_plugins_with_policy(
-            &getPluginRootDir(),
-            PluginLoadPolicy::optional_all()
-        ).map_err(|error|
-            PluginEndpointError::internal(
-                "plugin_discovery_failed",
-                "Plugin discovery failed while resolving the endpoint",
-                error.to_string()
-            )
+        load_plugins_with_policy(&getPluginRootDir(), PluginLoadPolicy::optional_all()).map_err(
+            |error|
+                PluginEndpointError::internal(
+                    "plugin_discovery_failed",
+                    "Plugin discovery failed while resolving the endpoint",
+                    error.to_string()
+                )
         )?;
 
         match resolve_from_catalog() {
             Some(result) => result,
-            None => Err(PluginEndpointError::not_found(
-                "plugin_endpoint_not_found",
-                "No loaded plugin implements the requested endpoint",
-                &format!("No plugin implements {} {}", method, path)
-            )),
+            None =>
+                Err(
+                    PluginEndpointError::not_found(
+                        "plugin_endpoint_not_found",
+                        "No loaded plugin implements the requested endpoint",
+                        &format!("No plugin implements {} {}", method, path)
+                    )
+                ),
         }
     }
 }

@@ -157,7 +157,11 @@ struct Context {
 static ACTIVE_SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PEAK_SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-unsafe extern "C" fn plugin_name(_context: *mut c_void, _cancellation: PluginCancellationV2, response_out: *mut AbiBuffer) -> i32 {
+unsafe extern "C" fn plugin_name(
+    _context: *mut c_void,
+    _cancellation: PluginCancellationV2,
+    response_out: *mut AbiBuffer
+) -> i32 {
     if response_out.is_null() {
         return -1;
     }
@@ -169,20 +173,27 @@ unsafe extern "C" fn plugin_name(_context: *mut c_void, _cancellation: PluginCan
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_manifest(_context: *mut c_void, _cancellation: PluginCancellationV2, response_out: *mut AbiBuffer) -> i32 {
+unsafe extern "C" fn plugin_manifest(
+    _context: *mut c_void,
+    _cancellation: PluginCancellationV2,
+    response_out: *mut AbiBuffer
+) -> i32 {
     if response_out.is_null() {
         return -1;
     }
     unsafe {
         let manifest =
-            format!(r#"{{"contract_version":6,"name":"{}","version":"0.0.1","kind":"Domain","functions":[],"endpoints":[{{"id":"ping","method":"Get","path":"/pluginhost-integration/ping","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}},{{"id":"slow","method":"Get","path":"/pluginhost-integration/slow","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}}]}}"#, PLUGIN_NAME);
+            format!(r#"{{"contract_version":7,"name":"{}","version":"0.0.1","kind":"Domain","endpoints":[{{"id":"ping","method":"Get","path":"/pluginhost-integration/ping","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}},{{"id":"slow","method":"Get","path":"/pluginhost-integration/slow","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}}]}}"#, PLUGIN_NAME);
         *response_out = AbiBuffer::json(&manifest);
     }
 
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_on_load(context: *mut c_void, _cancellation: PluginCancellationV2) -> i32 {
+unsafe extern "C" fn plugin_on_load(
+    context: *mut c_void,
+    _cancellation: PluginCancellationV2
+) -> i32 {
     if context.is_null() {
         return -1;
     }
@@ -194,7 +205,10 @@ unsafe extern "C" fn plugin_on_load(context: *mut c_void, _cancellation: PluginC
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_is_loaded(context: *mut c_void, _cancellation: PluginCancellationV2) -> i32 {
+unsafe extern "C" fn plugin_is_loaded(
+    context: *mut c_void,
+    _cancellation: PluginCancellationV2
+) -> i32 {
     if context.is_null() {
         return -1;
     }
@@ -234,7 +248,7 @@ unsafe extern "C" fn plugin_handle_endpoint(
         let _ = std::fs::write(marker, b"entered");
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_millis(200) {
-            if unsafe { (cancellation.is_cancelled)(cancellation.context) } {
+            if (unsafe { (cancellation.is_cancelled)(cancellation.context) }) {
                 ACTIVE_SLOW_CALLS.fetch_sub(1, Ordering::SeqCst);
                 return -6;
             }
@@ -301,7 +315,10 @@ unsafe extern "C" fn plugin_on_session_closed(
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_on_unload(context: *mut c_void, _cancellation: PluginCancellationV2) -> i32 {
+unsafe extern "C" fn plugin_on_unload(
+    context: *mut c_void,
+    _cancellation: PluginCancellationV2
+) -> i32 {
     if context.is_null() {
         return -1;
     }
@@ -317,7 +334,10 @@ unsafe extern "C" fn plugin_free_buffer(buffer: AbiBuffer) {
     buffer.free()
 }
 
-unsafe extern "C" fn plugin_destroy(instance: *mut PluginInstanceV2, _cancellation: PluginCancellationV2) -> i32 {
+unsafe extern "C" fn plugin_destroy(
+    instance: *mut PluginInstanceV2,
+    _cancellation: PluginCancellationV2
+) -> i32 {
     if instance.is_null() {
         return -1;
     }
@@ -394,7 +414,12 @@ unsafe extern "C" fn InstantiateV2(
         });
         let instance = Box::into_raw(instance);
 
-        if plugin_on_load(context, PluginCancellationV2 { context: std::ptr::null(), is_cancelled: never_cancelled }) != PLUGIN_STATUS_OK {
+        if
+            plugin_on_load(context, PluginCancellationV2 {
+                context: std::ptr::null(),
+                is_cancelled: never_cancelled,
+            }) != PLUGIN_STATUS_OK
+        {
             drop(Box::from_raw(context as *mut Context));
 
             drop(Box::from_raw(instance));

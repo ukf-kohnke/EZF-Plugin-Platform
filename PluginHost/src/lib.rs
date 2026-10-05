@@ -66,8 +66,28 @@
 //! - `with_*` helpers: `None` when no matching plugin (or no plugins) is present.
 //! - bulk loading returns a [`Factory::PluginLoadReport`] from the policy-aware API.
 #![allow(non_snake_case)]
+
+#[cfg(target_os = "linux")]
+const LOGGERDEF: &str = "unix";
+#[cfg(target_os = "macos")]
+const LOGGERDEF: &str = "macos";
+#[cfg(target_os = "windows")]
+const LOGGERDEF: &str = "windows";
+
+fn emit_log(level: log::LevelFilter, message: &str) {
+    match level {
+        log::LevelFilter::Error => log::error!(target: LOGGERDEF, "{}", message),
+        log::LevelFilter::Warn => log::warn!(target: LOGGERDEF, "{}", message),
+        log::LevelFilter::Info => log::info!(target: LOGGERDEF, "{}", message),
+        log::LevelFilter::Debug => log::debug!(target: LOGGERDEF, "{}", message),
+        log::LevelFilter::Trace => log::trace!(target: LOGGERDEF, "{}", message),
+        log::LevelFilter::Off => {}
+    }
+}
 mod PluginManager;
 pub mod Factory {
+    use crate::emit_log;
+
     use super::PluginManager::{ PluginManager, PluginProxy };
     pub use super::PluginManager::{ PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
     use PluginContracts::{
@@ -86,7 +106,7 @@ pub mod Factory {
             PluginSessionContext,
         },
     };
-    use Common::Helper::Functions::getPluginRootDir;
+    use ApplicationConfig::plugin_root_dir;
     use glob::PatternError;
     use std::{
         collections::{ BTreeMap, BTreeSet },
@@ -406,26 +426,22 @@ pub mod Factory {
                 manager.detach_plugin(id)?
             };
 
-            Common::Logging::Logger::Log::Dump(
-                "{}",
-                Common::Logging::LogConstants::LOGGERDEF,
+            emit_log(
                 log::LevelFilter::Info,
-                &[&format!("Plugin unloaded successfully: id={} after {:?}", id, elapsed)]
+                &format!("Plugin unloaded successfully: id={} after {:?}", id, elapsed)
             );
             drop(removed_item);
             Ok(())
         } else {
-            Common::Logging::Logger::Log::Dump(
-                "{}",
-                Common::Logging::LogConstants::LOGGERDEF,
+            emit_log(
                 log::LevelFilter::Error,
-                &[&format!("Plugin unload failed or timed out: id={}", id)]
+                &format!("Plugin unload failed or timed out: id={}", id)
             );
             Err(PluginManagerError::PluginUnloadFailed { id })
         }
     }
 
-    pub(crate) fn is_plugin_loaded(
+    pub fn is_plugin_loaded(
         plugin_name: &str,
         plugin_path: &str
     ) -> Result<bool, PluginManagerError> {
@@ -538,18 +554,14 @@ pub mod Factory {
         };
 
         if let Ok(id) = result.as_ref() {
-            Common::Logging::Logger::Log::Dump(
-                "{}",
-                Common::Logging::LogConstants::LOGGERDEF,
+            emit_log(
                 log::LevelFilter::Info,
-                &[
-                    &format!(
-                        "Plugin loaded successfully: '{}' (id={}) from '{}'",
-                        plugin_manifest.name,
-                        id,
-                        canonical_path.display()
-                    ),
-                ]
+                &format!(
+                    "Plugin loaded successfully: '{}' (id={}) from '{}'",
+                    plugin_manifest.name,
+                    id,
+                    canonical_path.display()
+                )
             );
         }
         result
@@ -741,13 +753,9 @@ pub mod Factory {
         // configured name; that would double-count one root cause and make the load report
         // misleading.
         if report.discovered.is_empty() && report.failures.is_empty() {
-            Common::Logging::Logger::Log::Dump(
-                "{}",
-                Common::Logging::LogConstants::LOGGERDEF,
+            emit_log(
                 log::LevelFilter::Warn,
-                &[
-                    &format!("No plugin libraries were found in the configured directory '{}'.", plugin_path),
-                ]
+                &format!("No plugin libraries were found in the configured directory '{}'.", plugin_path)
             );
         }
 
@@ -756,34 +764,28 @@ pub mod Factory {
                 PluginRequirement::Required => log::LevelFilter::Error,
                 PluginRequirement::Optional => log::LevelFilter::Warn,
             };
-            Common::Logging::Logger::Log::Dump(
-                "{}",
-                Common::Logging::LogConstants::LOGGERDEF,
+            emit_log(
                 level,
-                &[
-                    &format!(
-                        "{} plugin '{}' at '{}' could not be loaded: {}",
-                        match failure.requirement {
-                            PluginRequirement::Required => "Required",
-                            PluginRequirement::Optional => "Optional",
-                        },
-                        failure.plugin_name.as_deref().unwrap_or("unknown"),
-                        failure.path.display(),
-                        failure.error
-                    ),
-                ]
+                &format!(
+                    "{} plugin '{}' at '{}' could not be loaded: {}",
+                    match failure.requirement {
+                        PluginRequirement::Required => "Required",
+                        PluginRequirement::Optional => "Optional",
+                    },
+                    failure.plugin_name.as_deref().unwrap_or("unknown"),
+                    failure.path.display(),
+                    failure.error
+                )
             );
         }
 
-        Common::Logging::Logger::Log::Dump(
-            "{}",
-            Common::Logging::LogConstants::LOGGERDEF,
+        emit_log(
             if report.has_required_failures() {
                 log::LevelFilter::Error
             } else {
                 log::LevelFilter::Info
             },
-            &[&report.summary()]
+            &report.summary()
         );
 
         if report.has_required_failures() {
@@ -952,7 +954,7 @@ pub mod Factory {
     /// that their configuration can live alongside the shared library. The host
     /// deliberately discovers those directories instead of encoding a plugin name.
     pub fn load_database_plugins() -> Result<usize, String> {
-        let database_root = PathBuf::from(getPluginRootDir()).join("database");
+        let database_root = PathBuf::from(plugin_root_dir()).join("database");
         let entries = fs
             ::read_dir(&database_root)
             .map_err(|error|
@@ -1247,7 +1249,7 @@ pub mod Factory {
         // Preserve the previous lazy-load behavior without reintroducing plugin-name coupling:
         // discover all plugin libraries, then resolve the requested endpoint from the resulting
         // catalog. Optional discovery failures do not prevent other plugins from loading.
-        load_plugins_with_policy(&getPluginRootDir(), PluginLoadPolicy::optional_all()).map_err(
+        load_plugins_with_policy(&plugin_root_dir(), PluginLoadPolicy::optional_all()).map_err(
             |error|
                 PluginEndpointError::internal(
                     "plugin_discovery_failed",

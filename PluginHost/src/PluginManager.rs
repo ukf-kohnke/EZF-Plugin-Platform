@@ -964,17 +964,13 @@ impl PluginRuntime {
             Ok(permit) => permit,
             Err(_) => {
                 self.rejected_calls.fetch_add(1, Ordering::Relaxed);
-                Common::Logging::Logger::Log::Dump(
-                    "{}",
-                    Common::Logging::LogConstants::LOGGERDEF,
+                super::emit_log(
                     LevelFilter::Warn,
-                    &[
-                        &format!(
-                            "Plugin operation '{}' rejected: concurrency limit {} reached",
-                            operation,
-                            self.config.max_concurrent_calls
-                        ),
-                    ]
+                    &format!(
+                        "Plugin operation '{}' rejected: concurrency limit {} reached",
+                        operation,
+                        self.config.max_concurrent_calls
+                    )
                 );
                 return Err(PluginCallFailure::Busy);
             }
@@ -1012,13 +1008,9 @@ impl PluginRuntime {
 
             if was_timed_out {
                 let outcome = if result.is_ok() { "success" } else { "failure" };
-                Common::Logging::Logger::Log::Dump(
-                    "{}",
-                    Common::Logging::LogConstants::LOGGERDEF,
+                super::emit_log(
                     LevelFilter::Info,
-                    &[
-                        &format!("Plugin operation '{}' completed after the caller timed out ({outcome})", operation),
-                    ]
+                    &format!("Plugin operation '{}' completed after the caller timed out ({outcome})", operation)
                 );
             }
 
@@ -1058,12 +1050,7 @@ impl PluginRuntime {
                         "plugin operation '{operation}' timed out after {:?}; cooperative cancellation requested; operation remains active until it returns",
                         self.config.call_timeout
                     );
-                    Common::Logging::Logger::Log::Dump(
-                        "{}",
-                        Common::Logging::LogConstants::LOGGERDEF,
-                        LevelFilter::Warn,
-                        &[message.as_str()]
-                    );
+                    super::emit_log(LevelFilter::Warn, message.as_str());
                     Err(PluginCallFailure::Timeout(self.config.call_timeout))
                 } else {
                     // The worker won the timeout/completion race. The result is already on the
@@ -2042,12 +2029,7 @@ unsafe extern "C" fn host_log(level: u8, message: PluginAbi::AbiSlice) {
         _ => { LevelFilter::Error }
     };
 
-    Common::Logging::Logger::Log::Dump(
-        "{}",
-        Common::Logging::LogConstants::LOGGERDEF,
-        level_filter,
-        &[message.as_str()]
-    );
+    super::emit_log(level_filter, message.as_str());
 }
 
 pub(crate) struct LoadedPlugin {

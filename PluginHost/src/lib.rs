@@ -109,7 +109,7 @@ pub mod Factory {
     use ApplicationConfig::plugin_root_dir;
     use glob::PatternError;
     use std::{
-        collections::{ BTreeMap, BTreeSet },
+        collections::BTreeMap,
         fs,
         panic::{ AssertUnwindSafe, catch_unwind },
         path::{ Path, PathBuf },
@@ -403,7 +403,10 @@ pub mod Factory {
                 .map(|item| item.path.clone())
                 .ok_or(PluginManagerError::PluginNotFound { id })?
         };
-        let _operation_guard = begin_plugin_operation(&canonical_path)?;
+        let _operation_guard = begin_plugin_operation(
+            &canonical_path,
+            PluginOperationKind::Unloading
+        )?;
 
         // Re-check membership after acquiring the operation guard because another lifecycle
         // operation may have completed between the initial lookup and reservation. Only the
@@ -467,10 +470,18 @@ pub mod Factory {
             )
     }
 
-    static PLUGIN_OPERATIONS_IN_PROGRESS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PluginOperationKind {
+        Loading,
+        Unloading,
+    }
 
-    fn plugin_operations_in_progress() -> &'static Mutex<BTreeSet<PathBuf>> {
-        PLUGIN_OPERATIONS_IN_PROGRESS.get_or_init(|| Mutex::new(BTreeSet::new()))
+    static PLUGIN_OPERATIONS_IN_PROGRESS: OnceLock<
+        Mutex<BTreeMap<PathBuf, PluginOperationKind>>
+    > = OnceLock::new();
+
+    fn plugin_operations_in_progress() -> &'static Mutex<BTreeMap<PathBuf, PluginOperationKind>> {
+        PLUGIN_OPERATIONS_IN_PROGRESS.get_or_init(|| Mutex::new(BTreeMap::new()))
     }
 
     struct PluginOperationGuard {
@@ -486,15 +497,28 @@ pub mod Factory {
         }
     }
 
-    fn begin_plugin_operation(path: &Path) -> Result<PluginOperationGuard, PluginManagerError> {
+    fn begin_plugin_operation(
+        path: &Path,
+        kind: PluginOperationKind
+    ) -> Result<PluginOperationGuard, PluginManagerError> {
         let canonical_path = PluginManager::normalize_path(path);
         let mut paths = plugin_operations_in_progress()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !paths.insert(canonical_path.clone()) {
+        if paths.contains_key(&canonical_path) {
             return Err(PluginManagerError::PluginLoadInProgress { path: canonical_path });
         }
+        paths.insert(canonical_path.clone(), kind);
         Ok(PluginOperationGuard { path: canonical_path })
+    }
+
+    fn plugin_operation_kind(path: &Path) -> Option<PluginOperationKind> {
+        let canonical_path = PluginManager::normalize_path(path);
+        plugin_operations_in_progress()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&canonical_path)
+            .copied()
     }
 
     pub fn load_plugin_file(path: &Path) -> Result<i64, PluginManagerError> {
@@ -517,7 +541,10 @@ pub mod Factory {
         // Reserve the canonical library path before inspecting the registry. This closes the
         // unload/load race where an unload could remove the registry entry between the initial
         // duplicate check and acquisition of the lifecycle operation guard.
-        let _operation_guard = begin_plugin_operation(&canonical_path)?;
+        let _operation_guard = begin_plugin_operation(
+            &canonical_path,
+            PluginOperationKind::Loading
+        )?;
 
         {
             let singleton = instance();
@@ -619,7 +646,9 @@ pub mod Factory {
             let path_requirement = policy.requirement_for_path(&canonical_path);
             // Reserve the path before checking the registry for the same reason as the direct
             // file-load path: a concurrent unload must not be able to create a reload window.
-            let _operation_guard = match begin_plugin_operation(&canonical_path) {
+            let _operation_guard = match
+                begin_plugin_operation(&canonical_path, PluginOperationKind::Loading)
+            {
                 Ok(guard) => guard,
                 Err(error) => {
                     report.failures.push(PluginLoadFailure {
@@ -812,7 +841,14 @@ pub mod Factory {
         manager
             .plugin_ids()
             .into_iter()
-            .filter_map(|id| manager.plugins.get(&id).map(|item| item.health()))
+            .filter_map(|id| {
+                let item = manager.plugins.get(&id)?;
+                let mut health = item.health();
+                if plugin_operation_kind(&item.path) == Some(PluginOperationKind::Unloading) {
+                    health.state = PluginHealthState::Stopping;
+                }
+                Some(health)
+            })
             .collect()
     }
 
@@ -825,9 +861,15 @@ pub mod Factory {
             .into_iter()
             .find_map(|id| {
                 let item = manager.plugins.get(&id)?;
-                item.manifest()
-                    .name.eq_ignore_ascii_case(plugin_name)
-                    .then(|| item.health())
+                if !item.manifest().name.eq_ignore_ascii_case(plugin_name) {
+                    return None;
+                }
+
+                let mut health = item.health();
+                if plugin_operation_kind(&item.path) == Some(PluginOperationKind::Unloading) {
+                    health.state = PluginHealthState::Stopping;
+                }
+                Some(health)
             })
     }
 

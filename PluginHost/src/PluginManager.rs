@@ -45,7 +45,7 @@ const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
 const DEFAULT_PLUGIN_CALL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_PLUGIN_UNLOAD_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_PLUGIN_LIFECYCLE_TIMEOUT_MS: u64 = 10_000;
-const DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS: usize = 64;
+const DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS: usize = 256;
 const MIN_PLUGIN_TIMEOUT_MS: u64 = 1;
 const MAX_PLUGIN_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 const MAX_PLUGIN_CONCURRENT_CALLS: usize = 1_024;
@@ -1264,12 +1264,14 @@ impl PluginRuntime {
             let request_bytes = serde_json
                 ::to_vec(&request)
                 .map_err(|error| format!("failed to encode database request: {error}"))?;
-            let response: Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> =
-                runtime.call_json_direct_from_bytes(
-                    &request_bytes,
-                    cancellation,
-                    |vtable| vtable.execute_database
-                )?;
+            let response: Result<
+                DatabaseContracts::DatabaseResponse,
+                DatabaseContracts::DatabaseError
+            > = runtime.call_json_direct_from_bytes(
+                &request_bytes,
+                cancellation,
+                |vtable| vtable.execute_database
+            )?;
             response.map_err(|error| format!("plugin database operation failed: {error}"))
         };
 

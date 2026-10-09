@@ -1,5 +1,11 @@
 use PluginContracts::{
-    ApiContract::{ PluginCancellation, PluginCatalog, PluginManifest },
+    ApiContract::{
+        PluginCancellation,
+        PluginCatalog,
+        PluginEndpointError,
+        PluginEndpointResponse,
+        PluginManifest,
+    },
     IPlugin::IPlugin,
 };
 use super::Factory::PluginManagerError;
@@ -14,10 +20,12 @@ use PluginAbi::{
     PluginCreateFnV2,
     PluginDestroyFnV2,
     PluginEndpointFnV2,
+    PluginEndpointRawFnV2,
     PluginLoadFnV2,
     PluginHostServicesV2,
     PluginInstanceV2,
     PluginVTableV2,
+    PluginVTableV2Ext,
     MAX_ABI_BUFFER_BYTES,
     PLUGIN_ABI_VERSION_V2,
     PLUGIN_CONSTRUCTOR_SYMBOL_V2,
@@ -1171,6 +1179,129 @@ impl PluginRuntime {
         })?
     }
 
+    /// Calls a plugin endpoint using the optional split-metadata/body ABI fast path.
+    ///
+    /// New plugins return small JSON metadata plus an opaque body buffer. Older ABI V2 plugins
+    /// continue to use the original single JSON envelope. In either case the host owns a copy of
+    /// the response bytes before invoking the plugin's allocator-specific free callback.
+    fn call_endpoint_direct_from_bytes(
+        &self,
+        request_bytes: &[u8],
+        cancellation: PluginCancellationV2
+    ) -> Result<Result<PluginEndpointResponse, PluginEndpointError>, String> {
+        self.with_instance(|context, vtable| {
+            if let Some(raw_endpoint) = Self::raw_endpoint_callback(vtable) {
+                let mut metadata = AbiBuffer::EMPTY;
+                let mut body = AbiBuffer::EMPTY;
+                let status = unsafe {
+                    raw_endpoint(
+                        context,
+                        AbiSlice::from_bytes(request_bytes),
+                        cancellation,
+                        &mut metadata,
+                        &mut body
+                    )
+                };
+
+                if status != PLUGIN_STATUS_OK {
+                    Self::free_if_valid(vtable, metadata);
+                    Self::free_if_valid(vtable, body);
+                    return Err(
+                        format!("plugin ABI endpoint fast path failed with status {status}")
+                    );
+                }
+
+                // Read both buffers before propagating either error so a valid companion buffer
+                // is not leaked if the other output is malformed.
+                let metadata_bytes = Self::copy_and_free_buffer(vtable, metadata);
+                let body_bytes = Self::copy_and_free_buffer(vtable, body);
+                let metadata_bytes = metadata_bytes?;
+                let body_bytes = body_bytes?;
+
+                let mut response: Result<PluginEndpointResponse, PluginEndpointError> = serde_json
+                    ::from_slice(&metadata_bytes)
+                    .map_err(|error|
+                        format!("failed to decode plugin endpoint metadata: {error}")
+                    )?;
+
+                match &mut response {
+                    Ok(success) => {
+                        if !success.body.is_empty() {
+                            return Err(
+                                "plugin endpoint fast path returned a body in metadata and body buffers".to_owned()
+                            );
+                        }
+                        success.body = body_bytes;
+                    }
+                    Err(_) => {
+                        if !body_bytes.is_empty() {
+                            return Err(
+                                "plugin endpoint fast path returned a body alongside an error".to_owned()
+                            );
+                        }
+                    }
+                }
+
+                Ok(response)
+            } else {
+                // Compatibility path for existing plugins compiled before the optional endpoint
+                // callback was added to the append-only vtable extension.
+                let mut response = AbiBuffer::EMPTY;
+                let status = unsafe {
+                    (vtable.handle_endpoint)(
+                        context,
+                        AbiSlice::from_bytes(request_bytes),
+                        cancellation,
+                        &mut response
+                    )
+                };
+
+                if status != PLUGIN_STATUS_OK {
+                    Self::free_if_valid(vtable, response);
+                    return Err(format!("plugin ABI call failed with status {status}"));
+                }
+
+                let bytes = Self::copy_and_free_buffer(vtable, response)?;
+                serde_json
+                    ::from_slice(&bytes)
+                    .map_err(|error| format!("failed to decode plugin response: {error}"))
+            }
+        })?
+    }
+
+    fn raw_endpoint_callback(vtable: &PluginVTableV2) -> Option<PluginEndpointRawFnV2> {
+        if (vtable.struct_size as usize) < std::mem::size_of::<PluginVTableV2Ext>() {
+            return None;
+        }
+
+        // SAFETY: The advertised table size was checked above. `PluginVTableV2Ext` begins with
+        // the unchanged `PluginVTableV2` prefix, so the extension field is readable when present.
+        let extended = unsafe { &*(vtable as *const PluginVTableV2 as *const PluginVTableV2Ext) };
+        extended.handle_endpoint_raw
+    }
+
+    fn free_if_valid(vtable: &PluginVTableV2, buffer: AbiBuffer) {
+        if Self::is_valid_buffer(buffer) && !buffer.ptr.is_null() {
+            unsafe {
+                (vtable.free_buffer)(buffer);
+            }
+        }
+    }
+
+    fn copy_and_free_buffer(vtable: &PluginVTableV2, buffer: AbiBuffer) -> Result<Vec<u8>, String> {
+        if !Self::is_valid_buffer(buffer) {
+            return Err("plugin returned an invalid response buffer".to_owned());
+        }
+
+        let bytes = unsafe { buffer.to_vec() };
+        // SAFETY: `is_valid_buffer` verified the producer buffer metadata. Always reclaim valid
+        // buffers with the allocator callback supplied by the producing plugin.
+        unsafe {
+            (vtable.free_buffer)(buffer);
+        }
+        bytes.ok_or_else(|| "plugin returned an invalid response buffer".to_owned())
+    }
+
     pub(crate) fn name(self: &Arc<Self>) -> Result<String, String> {
         let bytes = self
             .call_with_timeout_internal("name", |runtime, cancellation| {
@@ -1230,11 +1361,7 @@ impl PluginRuntime {
             let request_bytes = serde_json
                 ::to_vec(&request)
                 .map_err(|error| format!("failed to encode plugin request: {error}"))?;
-            runtime.call_json_direct_from_bytes(
-                &request_bytes,
-                cancellation,
-                |vtable| vtable.handle_endpoint
-            )
+            runtime.call_endpoint_direct_from_bytes(&request_bytes, cancellation)
         };
 
         let result = match parent_cancellation {

@@ -243,6 +243,29 @@ impl IPlugin for PluginHostIntegration {
                 if let Some(directory) = &self.plugin_directory {
                     let _ = std::fs::write(directory.join("slow-entered.marker"), b"entered");
                 }
+                // The lifecycle race test asks this endpoint to stay in flight after unload has
+                // requested cooperative cancellation.  The marker handshake makes the stopping
+                // state observable deterministically instead of relying on a short timing window.
+                let hold_until_released = request
+                    .raw_query
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split('&')
+                    .any(|parameter| parameter == "hold=true");
+                if hold_until_released {
+                    if let Some(directory) = &self.plugin_directory {
+                        let release_marker = directory.join("slow-release.marker");
+                        // Keep the fixture bounded even if a test aborts before releasing it.
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while !release_marker.is_file() && std::time::Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+
+                // This mode is useful for timeout tests that need a callback to outlive caller-side
+                // cancellation. The query-string hold above delays observing cancellation only
+                // until the test releases the marker; after release cancellation is still honored.
                 let ignore_cancellation = self.mode == "slow_ignore_cancel";
                 let iterations = if self.mode == "slow_long" { 500 } else { 60 };
                 for _ in 0..iterations {

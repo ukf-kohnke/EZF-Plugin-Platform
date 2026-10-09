@@ -63,8 +63,10 @@ impl IPlugin for PluginHostIntegration {
     fn name(&self) -> String {
         if self.mode == "slow_name" {
             for _ in 0..30 {
-                if PluginContracts::ApiContract::current_plugin_cancellation()
-                    .is_some_and(|cancellation| cancellation.is_cancelled())
+                if
+                    PluginContracts::ApiContract::current_plugin_cancellation().is_some_and(
+                        |cancellation| cancellation.is_cancelled()
+                    )
                 {
                     return "PluginHostIntegration".to_owned();
                 }
@@ -169,8 +171,10 @@ impl IPlugin for PluginHostIntegration {
     fn manifest(&self) -> PluginManifest {
         if self.mode == "slow_manifest" {
             for _ in 0..30 {
-                if PluginContracts::ApiContract::current_plugin_cancellation()
-                    .is_some_and(|cancellation| cancellation.is_cancelled())
+                if
+                    PluginContracts::ApiContract::current_plugin_cancellation().is_some_and(
+                        |cancellation| cancellation.is_cancelled()
+                    )
                 {
                     return PluginManifest::without_api("PluginHostIntegration");
                 }
@@ -240,13 +244,24 @@ impl IPlugin for PluginHostIntegration {
                     let _ = std::fs::write(directory.join("slow-entered.marker"), b"entered");
                 }
                 let ignore_cancellation = self.mode == "slow_ignore_cancel";
-                for _ in 0..60 {
+                let iterations = if self.mode == "slow_long" { 500 } else { 60 };
+                for _ in 0..iterations {
                     if !ignore_cancellation && cancellation.is_cancelled() {
                         if let Some(directory) = &self.plugin_directory {
-                            let _ = std::fs::write(directory.join("slow-cancelled.marker"), b"cancelled");
+                            let _ = std::fs::write(
+                                directory.join("slow-cancelled.marker"),
+                                b"cancelled"
+                            );
                         }
                         ACTIVE_CALLS.fetch_sub(1, Ordering::AcqRel);
-                        return Err(PluginEndpointError::new(499, "plugin_cancelled", "plugin call cancelled", None));
+                        return Err(
+                            PluginEndpointError::new(
+                                499,
+                                "plugin_cancelled",
+                                "plugin call cancelled",
+                                None
+                            )
+                        );
                     }
                     thread::sleep(Duration::from_millis(5));
                 }

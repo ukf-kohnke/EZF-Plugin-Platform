@@ -45,18 +45,24 @@ const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
 const DEFAULT_PLUGIN_CALL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_PLUGIN_UNLOAD_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_PLUGIN_LIFECYCLE_TIMEOUT_MS: u64 = 10_000;
-const DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS: usize = 256;
+// Plugins may perform blocking database work. Keep their persistent OS-thread footprint small
+// and provide independent, bounded admission and queue limits for short traffic bursts.
+const DEFAULT_PLUGIN_WORKER_THREADS: usize = 8;
+const DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS: usize = 32;
+const DEFAULT_PLUGIN_QUEUE_CAPACITY: usize = 24;
 const MIN_PLUGIN_TIMEOUT_MS: u64 = 1;
 const MAX_PLUGIN_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
-const MAX_PLUGIN_CONCURRENT_CALLS: usize = 1_024;
+const MAX_PLUGIN_WORKER_THREADS: usize = 128;
+const MAX_PLUGIN_CONCURRENT_CALLS: usize = 4_096;
+const MAX_PLUGIN_QUEUE_CAPACITY: usize = 4_096;
 
 /// Runtime behavior limits for one plugin.
 ///
 /// The defaults are intentionally conservative enough for normal API/database work while still
 /// bounding the amount of work a misbehaving plugin can consume. Production deployments may
 /// override them globally through environment variables:
-/// `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`, `EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS`, and
-/// `EZF_PLUGIN_MAX_CONCURRENT_CALLS`.
+/// `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`, `EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS`,
+/// `EZF_PLUGIN_WORKER_THREADS`, `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, and `EZF_PLUGIN_QUEUE_CAPACITY`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginRuntimeConfig {
     pub call_timeout: Duration,
@@ -66,7 +72,12 @@ pub struct PluginRuntimeConfig {
     /// cooperative cancellation; the callback remains active on the lifecycle worker until it
     /// returns and the runtime stays registered until that result is observed.
     pub lifecycle_timeout: Duration,
+    /// Number of persistent OS threads that can execute this plugin concurrently.
+    pub worker_threads: usize,
+    /// Maximum admitted calls across execution and queueing (not the number of worker threads).
     pub max_concurrent_calls: usize,
+    /// Maximum number of jobs waiting for a worker. A full queue rejects new work with overload.
+    pub queue_capacity: usize,
 }
 
 impl Default for PluginRuntimeConfig {
@@ -75,7 +86,9 @@ impl Default for PluginRuntimeConfig {
             call_timeout: Duration::from_millis(DEFAULT_PLUGIN_CALL_TIMEOUT_MS),
             unload_timeout: Duration::from_millis(DEFAULT_PLUGIN_UNLOAD_TIMEOUT_MS),
             lifecycle_timeout: Duration::from_millis(DEFAULT_PLUGIN_LIFECYCLE_TIMEOUT_MS),
+            worker_threads: DEFAULT_PLUGIN_WORKER_THREADS,
             max_concurrent_calls: DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS,
+            queue_capacity: DEFAULT_PLUGIN_QUEUE_CAPACITY,
         }
     }
 }
@@ -90,9 +103,20 @@ impl PluginRuntimeConfig {
                 "EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS",
                 defaults.lifecycle_timeout
             ),
+            worker_threads: env_usize(
+                "EZF_PLUGIN_WORKER_THREADS",
+                defaults.worker_threads,
+                MAX_PLUGIN_WORKER_THREADS
+            ),
             max_concurrent_calls: env_usize(
                 "EZF_PLUGIN_MAX_CONCURRENT_CALLS",
-                defaults.max_concurrent_calls
+                defaults.max_concurrent_calls,
+                MAX_PLUGIN_CONCURRENT_CALLS
+            ),
+            queue_capacity: env_usize(
+                "EZF_PLUGIN_QUEUE_CAPACITY",
+                defaults.queue_capacity,
+                MAX_PLUGIN_QUEUE_CAPACITY
             ),
         }
     }
@@ -135,14 +159,14 @@ unsafe extern "C" fn never_cancelled(_context: *const std::ffi::c_void) -> bool 
     false
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
+fn env_usize(name: &str, default: usize, maximum: usize) -> usize {
     let Ok(raw) = std::env::var(name) else {
         return default;
     };
     let Ok(value) = raw.trim().parse::<usize>() else {
         return default;
     };
-    value.clamp(1, MAX_PLUGIN_CONCURRENT_CALLS)
+    value.clamp(1, maximum)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,7 +404,7 @@ enum PluginCallFailure {
 impl std::fmt::Display for PluginCallFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy => write!(f, "plugin call concurrency limit reached"),
+            Self::Busy => write!(f, "plugin call admission or worker queue capacity reached"),
             Self::Timeout(timeout) => write!(f, "plugin call timed out after {:?}", timeout),
             Self::Failed(message) => write!(f, "{message}"),
         }
@@ -422,15 +446,21 @@ struct PluginRuntimeState {
 
 type PluginJob = Box<dyn FnOnce() + Send + 'static>;
 
+enum PluginWorkerSubmitError {
+    QueueFull(PluginJob),
+    Closed(PluginJob),
+}
+
 struct PluginWorkerPool {
     sender: Mutex<Option<mpsc::SyncSender<PluginJob>>>,
     workers: Mutex<Option<Vec<thread::JoinHandle<()>>>>,
 }
 
 impl PluginWorkerPool {
-    fn new(worker_count: usize) -> Result<Self, String> {
+    fn new(worker_count: usize, queue_capacity: usize) -> Result<Self, String> {
         let worker_count = worker_count.max(1);
-        let (sender, receiver) = mpsc::sync_channel::<PluginJob>(worker_count);
+        let queue_capacity = queue_capacity.max(1);
+        let (sender, receiver) = mpsc::sync_channel::<PluginJob>(queue_capacity);
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(worker_count);
 
@@ -476,16 +506,16 @@ impl PluginWorkerPool {
         })
     }
 
-    fn submit(&self, job: PluginJob) -> Result<(), PluginJob> {
+    fn submit(&self, job: PluginJob) -> Result<(), PluginWorkerSubmitError> {
         let sender = self.sender.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(sender) = sender.as_ref() else {
-            return Err(job);
+            return Err(PluginWorkerSubmitError::Closed(job));
         };
 
         match sender.try_send(job) {
             Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(job)) | Err(mpsc::TrySendError::Disconnected(job)) =>
-                Err(job),
+            Err(mpsc::TrySendError::Full(job)) => Err(PluginWorkerSubmitError::QueueFull(job)),
+            Err(mpsc::TrySendError::Disconnected(job)) => Err(PluginWorkerSubmitError::Closed(job)),
         }
     }
 
@@ -679,7 +709,10 @@ impl PluginRuntime {
             return Err("plugin vtable contains a null function pointer".to_owned());
         }
 
-        let worker_pool = PluginWorkerPool::new(config.max_concurrent_calls).map_err(|error| {
+        let worker_pool = PluginWorkerPool::new(
+            config.worker_threads,
+            config.queue_capacity
+        ).map_err(|error| {
             let _ = unsafe { (vtable.destroy)(instance, never_cancelled_abi()) };
             error
         })?;
@@ -967,9 +1000,11 @@ impl PluginRuntime {
                 super::emit_log(
                     LevelFilter::Warn,
                     &format!(
-                        "Plugin operation '{}' rejected: concurrency limit {} reached",
+                        "Plugin operation '{}' rejected: admitted-call limit {} reached (workers={}, queue_capacity={})",
                         operation,
-                        self.config.max_concurrent_calls
+                        self.config.max_concurrent_calls,
+                        self.config.worker_threads,
+                        self.config.queue_capacity
                     )
                 );
                 return Err(PluginCallFailure::Busy);
@@ -1021,12 +1056,33 @@ impl PluginRuntime {
             let _ = sender.send(result);
         });
 
-        if self.worker_pool.submit(job).is_err() {
-            let message = "plugin worker pool rejected an admitted call".to_owned();
-            if accounting == PluginCallAccounting::Observed {
-                self.record_submission_failure(message.clone());
+        match self.worker_pool.submit(job) {
+            Ok(()) => {}
+            Err(PluginWorkerSubmitError::QueueFull(job)) => {
+                // Dropping the rejected closure releases its admission permit and any captured
+                // request state. Queue saturation is overload, not an internal plugin failure.
+                drop(job);
+                self.rejected_calls.fetch_add(1, Ordering::Relaxed);
+                super::emit_log(
+                    LevelFilter::Warn,
+                    &format!(
+                        "Plugin operation '{}' rejected: worker queue is full (workers={}, queue_capacity={}, max_admitted_calls={})",
+                        operation,
+                        self.config.worker_threads,
+                        self.config.queue_capacity,
+                        self.config.max_concurrent_calls
+                    )
+                );
+                return Err(PluginCallFailure::Busy);
             }
-            return Err(PluginCallFailure::Failed(message));
+            Err(PluginWorkerSubmitError::Closed(job)) => {
+                drop(job);
+                let message = "plugin worker pool is closed".to_owned();
+                if accounting == PluginCallAccounting::Observed {
+                    self.record_submission_failure(message.clone());
+                }
+                return Err(PluginCallFailure::Failed(message));
+            }
         }
 
         match receiver.recv_timeout(self.config.call_timeout) {
@@ -1199,7 +1255,7 @@ impl PluginRuntime {
                     PluginContracts::ApiContract::PluginEndpointError::new(
                         503,
                         "plugin_overloaded",
-                        "The plugin is currently handling its maximum number of concurrent calls",
+                        "The plugin has reached its admitted-call or worker-queue capacity",
                         None
                     ),
                 PluginCallFailure::Failed(message) =>
@@ -1293,7 +1349,7 @@ impl PluginRuntime {
                 PluginCallFailure::Busy =>
                     DatabaseContracts::DatabaseError::new(
                         DatabaseContracts::DatabaseErrorKind::Query,
-                        "plugin database concurrency limit reached"
+                        "plugin database worker or queue capacity reached"
                     ),
                 PluginCallFailure::Failed(message) =>
                     DatabaseContracts::DatabaseError::new(
@@ -2054,7 +2110,20 @@ fn format_glob_error(error: &GlobError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::PluginCallTracker;
+    use crate::PluginManager::{
+        DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS,
+        DEFAULT_PLUGIN_QUEUE_CAPACITY,
+        DEFAULT_PLUGIN_WORKER_THREADS,
+    };
+
+    use super::{
+        PluginCallTracker,
+        PluginRuntimeConfig,
+        PluginWorkerPool,
+        PluginWorkerSubmitError,
+    };
+    use std::sync::{ Arc, Condvar, Mutex, mpsc };
+    use std::time::Duration;
 
     #[test]
     fn timed_out_call_lifecycle_is_closed_by_the_worker() {
@@ -2085,5 +2154,70 @@ mod tests {
         assert!(parent.mark_timed_out(|| {}));
         assert!(unsafe { parent.abi_cancellation().is_cancelled() });
         assert!(unsafe { child.abi_cancellation().is_cancelled() });
+    }
+
+    #[test]
+    fn runtime_defaults_separate_workers_admission_and_queue_capacity() {
+        let config = PluginRuntimeConfig::default();
+        assert_eq!(config.worker_threads, DEFAULT_PLUGIN_WORKER_THREADS);
+        assert_eq!(config.max_concurrent_calls, DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS);
+        assert_eq!(config.queue_capacity, DEFAULT_PLUGIN_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn worker_count_and_queue_capacity_are_independent_and_queue_is_bounded() {
+        let pool = PluginWorkerPool::new(2, 3).expect("two worker threads must start");
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let blocking_job = |
+            started_tx: mpsc::Sender<()>,
+            release: Arc<(Mutex<bool>, Condvar)>
+        | -> super::PluginJob {
+            Box::new(move || {
+                started_tx.send(()).expect("test receiver remains connected");
+                let (lock, ready) = &*release;
+                let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*released {
+                    released = ready
+                        .wait(released)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            })
+        };
+
+        // Both worker threads enter a blocking job and remain occupied while the test fills the
+        // queue. Receiving two starts proves worker_count=2 independently of queue_capacity=3.
+        for _ in 0..2 {
+            pool.submit(blocking_job(started_tx.clone(), Arc::clone(&release))).unwrap_or_else(|_|
+                panic!("running jobs must be accepted")
+            );
+        }
+        started_rx.recv_timeout(Duration::from_secs(2)).expect("first worker must start");
+        started_rx.recv_timeout(Duration::from_secs(2)).expect("second worker must start");
+
+        // While both workers are occupied, exactly three additional jobs can wait in the queue.
+        for _ in 0..3 {
+            pool.submit(blocking_job(started_tx.clone(), Arc::clone(&release))).unwrap_or_else(|_|
+                panic!("queue must accept jobs up to its independent capacity")
+            );
+        }
+        match pool.submit(blocking_job(started_tx.clone(), Arc::clone(&release))) {
+            Err(PluginWorkerSubmitError::QueueFull(job)) => drop(job),
+            Err(PluginWorkerSubmitError::Closed(_)) => panic!("worker pool must still be open"),
+            Ok(()) =>
+                panic!("a sixth job must be rejected with two workers and queue capacity three"),
+        }
+
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        ready.notify_all();
+
+        for _ in 0..3 {
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("queued jobs must drain after release");
+        }
+        drop(pool); // joins both persistent workers after their bounded queue drains.
     }
 }

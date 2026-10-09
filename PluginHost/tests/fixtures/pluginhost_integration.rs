@@ -183,7 +183,7 @@ unsafe extern "C" fn plugin_manifest(
     }
     unsafe {
         let manifest =
-            format!(r#"{{"contract_version":7,"name":"{}","version":"0.0.1","kind":"Domain","endpoints":[{{"id":"ping","method":"Get","path":"/pluginhost-integration/ping","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}},{{"id":"slow","method":"Get","path":"/pluginhost-integration/slow","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}}]}}"#, PLUGIN_NAME);
+            format!(r#"{{"contract_version":8,"name":"{}","version":"0.0.1","kind":"Domain","endpoints":[{{"id":"ping","method":"Get","path":"/pluginhost-integration/ping","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}},{{"id":"slow","method":"Get","path":"/pluginhost-integration/slow","consumes":null,"produces":"application/json","max_body_bytes":null,"request_body":null,"query_parameters":[],"tag":null,"summary":null,"description":null}}]}}"#, PLUGIN_NAME);
         *response_out = AbiBuffer::json(&manifest);
     }
 
@@ -246,6 +246,38 @@ unsafe extern "C" fn plugin_handle_endpoint(
         PEAK_SLOW_CALLS.fetch_max(active, Ordering::SeqCst);
         let marker = context.plugin_directory.join("slow-entered.marker");
         let _ = std::fs::write(marker, b"entered");
+
+        // Hold mode is selected via raw_query on this already-registered route. This makes the
+        // lifecycle test deterministic without relying on a second endpoint binding in the
+        // manifest/catalog. Cancellation is deliberately observed only after the test releases
+        // the call, so the test can inspect Stopping while the call is still in flight.
+        let raw_query = request
+            .as_ref()
+            .and_then(|value| value.get("raw_query"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if raw_query.split('&').any(|part| part == "hold=true") {
+            let release_marker = context.plugin_directory.join("slow-release.marker");
+            let start = std::time::Instant::now();
+            while !release_marker.is_file() && start.elapsed() < Duration::from_secs(10) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            ACTIVE_SLOW_CALLS.fetch_sub(1, Ordering::SeqCst);
+            if (unsafe { (cancellation.is_cancelled)(cancellation.context) }) {
+                return -6;
+            }
+            let response = format!(
+                r#"{{"plugin":"{}","loaded":{},"endpoint":"slow","peak_active":{}}}"#,
+                PLUGIN_NAME,
+                context.loaded,
+                PEAK_SLOW_CALLS.load(Ordering::SeqCst)
+            );
+            unsafe {
+                *response_out = AbiBuffer::json(&response);
+            }
+            return PLUGIN_STATUS_OK;
+        }
+
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_millis(200) {
             if (unsafe { (cancellation.is_cancelled)(cancellation.context) }) {

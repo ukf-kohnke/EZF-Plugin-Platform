@@ -26,15 +26,23 @@ unsafe fn json_string(value: &str, response_out: *mut AbiBuffer) -> i32 {
     PLUGIN_STATUS_OK
 }
 
-unsafe extern "C" fn plugin_name(_context: *mut c_void, _cancellation: PluginCancellationV2, response_out: *mut AbiBuffer) -> i32 {
+unsafe extern "C" fn plugin_name(
+    _context: *mut c_void,
+    _cancellation: PluginCancellationV2,
+    response_out: *mut AbiBuffer
+) -> i32 {
     let json = serde_json::to_string("MalformedAbiFixture").expect("literal serializes");
     unsafe { json_string(&json, response_out) }
 }
 
-unsafe extern "C" fn plugin_manifest(_context: *mut c_void, _cancellation: PluginCancellationV2, response_out: *mut AbiBuffer) -> i32 {
+unsafe extern "C" fn plugin_manifest(
+    _context: *mut c_void,
+    _cancellation: PluginCancellationV2,
+    response_out: *mut AbiBuffer
+) -> i32 {
     unsafe {
         json_string(
-            r#"{"contract_version":7,"name":"MalformedAbiFixture","version":"0.0.1","kind":"Domain","endpoints":[]}"#,
+            r#"{"contract_version":8,"name":"MalformedAbiFixture","version":"0.0.1","kind":"Domain","endpoints":[]}"#,
             response_out
         )
     }
@@ -78,7 +86,10 @@ unsafe extern "C" fn free_buffer(buffer: AbiBuffer) {
         buffer.free();
     }
 }
-unsafe extern "C" fn destroy(instance: *mut PluginInstanceV2, _cancellation: PluginCancellationV2) -> i32 {
+unsafe extern "C" fn destroy(
+    instance: *mut PluginInstanceV2,
+    _cancellation: PluginCancellationV2
+) -> i32 {
     if instance.is_null() {
         return -1;
     }

@@ -49,9 +49,10 @@
 //!   not by a concrete plugin implementation name.
 //! - `with_plugin_by_name` and `with_all_plugins` are deprecated compatibility APIs; prefer the
 //!   catalog/endpoint APIs. `with_database_plugin` remains the explicit capability boundary.
-//! - Plugin call limits default to 30s call timeout, 10s unload timeout, and 64 concurrent calls.
-//!   They can be overridden with `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`,
-//!   and `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, or supplied explicitly to the `*_with_config` load APIs.
+//! - Plugin call limits default to 30s call timeout, 10s unload timeout, 8 worker threads,
+//!   32 admitted calls, and 24 queued jobs. The three capacity limits can be overridden with
+//!   `EZF_PLUGIN_WORKER_THREADS`, `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, and
+//!   `EZF_PLUGIN_QUEUE_CAPACITY`, or supplied explicitly to the `*_with_config` load APIs.
 //! - ABI V2 uses cooperative cancellation for plugin calls. A caller-side timeout sets the
 //!   per-operation cancellation signal; plugin code must observe it at safe interruption points
 //!   and return. The host never terminates a plugin thread or invalidates plugin memory.

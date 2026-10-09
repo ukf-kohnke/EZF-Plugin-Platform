@@ -198,8 +198,9 @@ fn loads_executes_unloads_and_reloads_a_real_dynamic_library() {
     );
     assert_eq!(Factory::plugin_count(), 1);
 
-    let reloaded_response = Factory::handle_endpoint(ping_request()
-    ).expect("reloaded dynamic endpoint call must cross the ABI boundary");
+    let reloaded_response = Factory::handle_endpoint(ping_request()).expect(
+        "reloaded dynamic endpoint call must cross the ABI boundary"
+    );
     assert_eq!(reloaded_response.status, 200);
     let reloaded_body: serde_json::Value = serde_json
         ::from_slice(&reloaded_response.body)
@@ -327,7 +328,9 @@ fn plugin_calls_reuse_a_bounded_persistent_worker_pool() {
         call_timeout: std::time::Duration::from_secs(1),
         unload_timeout: std::time::Duration::from_secs(2),
         lifecycle_timeout: std::time::Duration::from_secs(2),
+        worker_threads: 2,
         max_concurrent_calls: 2,
+        queue_capacity: 2,
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "fixture library must load with a bounded worker pool"
@@ -335,8 +338,9 @@ fn plugin_calls_reuse_a_bounded_persistent_worker_pool() {
 
     let mut worker_threads = BTreeSet::new();
     for iteration in 0..100 {
-        let response = Factory::handle_endpoint(ping_request()
-        ).unwrap_or_else(|error| panic!("iteration {iteration}: ping failed: {error}"));
+        let response = Factory::handle_endpoint(ping_request()).unwrap_or_else(|error|
+            panic!("iteration {iteration}: ping failed: {error}")
+        );
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json
             ::from_slice(&response.body)
@@ -368,7 +372,9 @@ fn plugin_name_and_manifest_use_the_bounded_timeout_execution_path() {
             call_timeout: std::time::Duration::from_millis(25),
             unload_timeout: std::time::Duration::from_secs(1),
             lifecycle_timeout: std::time::Duration::from_secs(1),
+            worker_threads: 1,
             max_concurrent_calls: 1,
+            queue_capacity: 1,
         };
 
         let result = Factory::load_plugin_file_with_config(&library, config);
@@ -453,7 +459,9 @@ fn timed_plugin_calls_return_without_detaching_the_running_library() {
         call_timeout: std::time::Duration::from_millis(50),
         unload_timeout: std::time::Duration::from_secs(2),
         lifecycle_timeout: std::time::Duration::from_secs(2),
+        worker_threads: 2,
         max_concurrent_calls: 2,
+        queue_capacity: 2,
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "fixture library must load with custom runtime limits"
@@ -520,7 +528,9 @@ fn unload_timeout_keeps_the_plugin_registered_until_quiescing_succeeds() {
         call_timeout: std::time::Duration::from_secs(2),
         unload_timeout: std::time::Duration::from_millis(25),
         lifecycle_timeout: std::time::Duration::from_millis(25),
+        worker_threads: 2,
         max_concurrent_calls: 2,
+        queue_capacity: 2,
     };
     let previous = fixture_mode(Some("slow_ignore_cancel"));
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
@@ -681,7 +691,9 @@ fn p1_readiness_state_matrix_covers_ready_stopping_failed_and_empty() {
         call_timeout: std::time::Duration::from_secs(2),
         unload_timeout: std::time::Duration::from_secs(2),
         lifecycle_timeout: std::time::Duration::from_secs(2),
+        worker_threads: 2,
         max_concurrent_calls: 2,
+        queue_capacity: 2,
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "fixture library must load"
@@ -802,7 +814,9 @@ fn p1_timeout_recovers_to_ready_without_detaching_the_plugin() {
         call_timeout: std::time::Duration::from_millis(50),
         unload_timeout: std::time::Duration::from_secs(2),
         lifecycle_timeout: std::time::Duration::from_secs(2),
+        worker_threads: 2,
         max_concurrent_calls: 2,
+        queue_capacity: 2,
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "fixture library must load with a short call timeout"
@@ -1048,7 +1062,9 @@ fn on_unload_timeout_keeps_the_plugin_registered_until_callback_finishes() {
         call_timeout: std::time::Duration::from_secs(2),
         unload_timeout: std::time::Duration::from_secs(2),
         lifecycle_timeout: std::time::Duration::from_millis(25),
+        worker_threads: 2,
         max_concurrent_calls: 2,
+        queue_capacity: 2,
     };
     let previous = fixture_mode(Some("slow_on_unload"));
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
@@ -1086,7 +1102,9 @@ fn destroy_timeout_keeps_the_plugin_registered_until_callback_finishes() {
         call_timeout: std::time::Duration::from_secs(2),
         unload_timeout: std::time::Duration::from_secs(2),
         lifecycle_timeout: std::time::Duration::from_millis(25),
+        worker_threads: 2,
         max_concurrent_calls: 2,
+        queue_capacity: 2,
     };
     let previous = fixture_mode(Some("slow_destroy"));
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
@@ -1447,7 +1465,9 @@ fn plugin_concurrency_limit_rejects_excess_calls_and_reports_overload() {
         call_timeout: std::time::Duration::from_secs(1),
         unload_timeout: std::time::Duration::from_secs(2),
         lifecycle_timeout: std::time::Duration::from_secs(2),
+        worker_threads: 1,
         max_concurrent_calls: 1,
+        queue_capacity: 1,
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "fixture library must load with a single-call concurrency limit"
@@ -1459,9 +1479,7 @@ fn plugin_concurrency_limit_rejects_excess_calls_and_reports_overload() {
         let mut request = ping_request();
         request.endpoint_id = "slow".to_owned();
         request.raw_path = "/pluginhost-integration/slow".to_owned();
-        Factory::handle_endpoint(request).expect(
-            "first slow call must succeed"
-        )
+        Factory::handle_endpoint(request).expect("first slow call must succeed")
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1492,6 +1510,78 @@ fn plugin_concurrency_limit_rejects_excess_calls_and_reports_overload() {
 }
 
 #[test]
+fn full_worker_queue_rejects_excess_calls_as_overload() {
+    let _test_guard = lock_test();
+    let _environment = EnvironmentVariableGuard::set("EZF_PLUGIN_FIXTURE_MODE", "slow_long");
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_secs(8),
+        unload_timeout: std::time::Duration::from_secs(3),
+        lifecycle_timeout: std::time::Duration::from_secs(3),
+        worker_threads: 1,
+        max_concurrent_calls: 3,
+        queue_capacity: 1,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config).expect(
+        "fixture library must load with independent worker, admission, and queue limits"
+    );
+
+    let marker = library.parent().unwrap().join("slow-entered.marker");
+    let _ = fs::remove_file(&marker);
+    let slow_call = || {
+        let mut request = ping_request();
+        request.endpoint_id = "slow".to_owned();
+        request.raw_path = "/pluginhost-integration/slow".to_owned();
+        Factory::handle_endpoint(request)
+    };
+
+    let first = std::thread::spawn(slow_call);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker.is_file() {
+        assert!(std::time::Instant::now() < deadline, "first slow call did not signal entry");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // One worker is busy. Admit one queued request, leaving capacity in the admission gate so
+    // the third request specifically exercises the bounded queue's overload behavior.
+    let second = std::thread::spawn(slow_call);
+    let admission_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+            "plugin health must remain available while queueing"
+        );
+        if health.active_calls >= 2 {
+            break;
+        }
+        assert!(std::time::Instant::now() < admission_deadline, "second call was not admitted");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // The fixture holds the worker for 2.5s, so the admitted second call can settle into the
+    // one-slot queue before the next request is attempted, even under a loaded test runner.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let error = slow_call().expect_err("a full queue must reject the third call");
+    assert_eq!(error.status, 503);
+    assert_eq!(error.code, "plugin_overloaded");
+
+    assert_eq!(first.join().expect("first request thread must finish").unwrap().status, 200);
+    assert_eq!(second.join().expect("second request thread must finish").unwrap().status, 200);
+    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "plugin health must be available after queue drain"
+    );
+    assert_eq!(health.rejected_calls, 1, "queue overflow must be counted as a rejection");
+    assert_eq!(
+        health.failed_calls,
+        0,
+        "queue overflow must not count as an internal plugin failure"
+    );
+    assert_eq!(health.active_calls, 0);
+
+    cleanup_plugin(id);
+    let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
 fn completed_plugin_call_releases_its_concurrency_slot_before_result_is_observed() {
     let _test_guard = lock_test();
     let library = build_fixture();
@@ -1499,7 +1589,9 @@ fn completed_plugin_call_releases_its_concurrency_slot_before_result_is_observed
         call_timeout: std::time::Duration::from_secs(1),
         unload_timeout: std::time::Duration::from_secs(2),
         lifecycle_timeout: std::time::Duration::from_secs(2),
+        worker_threads: 1,
         max_concurrent_calls: 1,
+        queue_capacity: 1,
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "fixture library must load with a single-call concurrency limit"
@@ -1508,8 +1600,7 @@ fn completed_plugin_call_releases_its_concurrency_slot_before_result_is_observed
     // Run a sustained sequence of short calls. The next call must never observe the previous
     // call as still occupying the single admission slot after its result was returned.
     for iteration in 0..1_000 {
-        let response = Factory::handle_endpoint(ping_request()
-        ).unwrap_or_else(|error| {
+        let response = Factory::handle_endpoint(ping_request()).unwrap_or_else(|error| {
             panic!(
                 "iteration {iteration}: completed call left the concurrency slot occupied: {error}"
             )
@@ -1532,39 +1623,64 @@ fn concurrent_load_and_unload_for_the_same_library_are_serialized_and_reload_rem
     let _test_guard = lock_test();
     let library = build_fixture();
     let config = PluginRuntimeConfig {
-        call_timeout: std::time::Duration::from_secs(2),
-        unload_timeout: std::time::Duration::from_secs(2),
+        call_timeout: std::time::Duration::from_secs(5),
+        unload_timeout: std::time::Duration::from_secs(5),
         lifecycle_timeout: std::time::Duration::from_secs(2),
+        worker_threads: 2,
         max_concurrent_calls: 2,
+        queue_capacity: 2,
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "fixture library must load before concurrent lifecycle test"
     );
 
-    let marker = library.parent().unwrap().join("slow-entered.marker");
-    let _ = fs::remove_file(&marker);
+    let plugin_dir = library.parent().unwrap();
+    // Reuse the established `slow` route. The hold mode is selected through the query string so
+    // this lifecycle test does not depend on registering a separate fixture endpoint in the
+    // runtime catalog.
+    let entered_marker = plugin_dir.join("slow-entered.marker");
+    let release_marker = plugin_dir.join("slow-release.marker");
+    let _ = fs::remove_file(&entered_marker);
+    let _ = fs::remove_file(&release_marker);
     let worker = std::thread::spawn(|| {
         let mut request = ping_request();
         request.endpoint_id = "slow".to_owned();
         request.raw_path = "/pluginhost-integration/slow".to_owned();
+        request.raw_query = Some("hold=true".to_owned());
         Factory::handle_endpoint(request).expect_err(
-            "slow endpoint must observe cooperative unload cancellation"
+            "held endpoint must observe cooperative unload cancellation after release"
         )
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !marker.is_file() {
-        assert!(std::time::Instant::now() < deadline, "slow endpoint did not signal entry");
+    while !entered_marker.is_file() {
+        if worker.is_finished() {
+            match worker.join() {
+                Ok(endpoint_error) =>
+                    panic!("held endpoint returned before signaling entry: {:?}", endpoint_error),
+                Err(_) => panic!("held endpoint worker panicked before signaling entry"),
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // Do not leave a fixture callback blocked if its entry marker was not observed.
+            let _ = fs::write(&release_marker, b"release");
+            match worker.join() {
+                Ok(endpoint_error) =>
+                    panic!(
+                        "held endpoint did not signal entry before the deadline; worker returned: {:?}",
+                        endpoint_error
+                    ),
+                Err(_) => panic!("held endpoint did not signal entry and worker panicked"),
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
     let unload_id = id;
     let unload_thread = std::thread::spawn(move || Factory::unload_plugin(unload_id));
 
-    // Synchronize with the actual unload transition before attempting the concurrent load.
-    // Without this handshake the unload worker may already have completed its short fixture call
-    // and detached the plugin before the load attempt runs, which would make the test itself race
-    // rather than test serialization.
+    // The fixture deliberately keeps the in-flight call alive after cancellation. This gives the
+    // test a deterministic synchronization point: unload cannot finish until release_marker exists.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut observed_stopping = false;
     while std::time::Instant::now() < deadline {
@@ -1576,22 +1692,29 @@ fn concurrent_load_and_unload_for_the_same_library_are_serialized_and_reload_rem
         }
         std::thread::yield_now();
     }
+
+    // Try the concurrent load while the fixture is guaranteed to remain inside the unload path.
+    let concurrent_load = if observed_stopping {
+        Some(Factory::load_plugin_file_with_config(&library, config))
+    } else {
+        None
+    };
+    // Always release the fixture before assertions or joins, including the failure path, so a
+    // failed assertion cannot strand a plugin worker or make the test process hang.
+    fs::write(&release_marker, b"release").expect("held endpoint must be released");
+
+    let unload_result = unload_thread.join().expect("unload worker must finish");
+    let cancellation_error = worker.join().expect("in-flight endpoint worker must finish");
+
     assert!(
         observed_stopping,
         "unload must expose the transient stopping state before the concurrent load attempt"
     );
-
     assert!(
-        matches!(
-            Factory::load_plugin_file_with_config(&library, config),
-            Err(PluginManagerError::PluginLoadInProgress { .. })
-        ),
+        matches!(concurrent_load, Some(Err(PluginManagerError::PluginLoadInProgress { .. }))),
         "concurrent load must be rejected by the per-library lifecycle guard while unload is stopping"
     );
-
-    let unload_result = unload_thread.join().expect("unload worker must finish");
     unload_result.expect("unload must succeed after the in-flight call drains");
-    let cancellation_error = worker.join().expect("in-flight endpoint worker must finish");
     assert_eq!(cancellation_error.code, "plugin_cancelled");
     assert_eq!(Factory::plugin_count(), 0);
 
@@ -1599,5 +1722,5 @@ fn concurrent_load_and_unload_for_the_same_library_are_serialized_and_reload_rem
         "library must be reloadable after serialized unload"
     );
     cleanup_plugin(reloaded_id);
-    let _ = fs::remove_dir_all(library.parent().unwrap());
+    let _ = fs::remove_dir_all(plugin_dir);
 }

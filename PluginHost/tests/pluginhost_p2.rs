@@ -211,7 +211,9 @@ fn p2_long_running_plugin_stress() {
         call_timeout: Duration::from_secs(5),
         unload_timeout: Duration::from_secs(5),
         lifecycle_timeout: Duration::from_secs(5),
+        worker_threads: workers.min(8).max(1),
         max_concurrent_calls: workers.max(1),
+        queue_capacity: workers.max(1),
     };
     let id = Factory::load_plugin_file_with_config(&library, config).expect(
         "P2 stress fixture must load"
@@ -368,7 +370,9 @@ fn p2_multi_plugin_load_and_call_stress() {
         call_timeout: Duration::from_secs(5),
         unload_timeout: Duration::from_secs(5),
         lifecycle_timeout: Duration::from_secs(5),
+        worker_threads: workers_per_plugin.min(8).max(1),
         max_concurrent_calls: workers_per_plugin.max(1),
+        queue_capacity: workers_per_plugin.max(1),
     };
     let load_handles = libraries
         .iter()

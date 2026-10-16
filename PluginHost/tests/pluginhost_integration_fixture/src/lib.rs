@@ -241,13 +241,18 @@ impl IPlugin for PluginHostIntegration {
                 let active = ACTIVE_CALLS.fetch_add(1, Ordering::AcqRel) + 1;
                 record_peak_active(active);
                 if let Some(directory) = &self.plugin_directory {
+                    // Per-active-count markers let the host's ABI/lifecycle tests wait until
+                    // multiple callbacks are simultaneously inside this same plugin context.
+                    let _ = std::fs::write(
+                        directory.join(format!("slow-active-{active}.marker")),
+                        b"active"
+                    );
                     let _ = std::fs::write(directory.join("slow-entered.marker"), b"entered");
                 }
                 // The lifecycle race test asks this endpoint to stay in flight after unload has
                 // requested cooperative cancellation.  The marker handshake makes the stopping
                 // state observable deterministically instead of relying on a short timing window.
-                let hold_until_released = request
-                    .raw_query
+                let hold_until_released = request.raw_query
                     .as_deref()
                     .unwrap_or_default()
                     .split('&')

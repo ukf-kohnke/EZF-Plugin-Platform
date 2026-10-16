@@ -1,9 +1,11 @@
 use PluginContracts::{
     ApiContract::{
+        normalize_plugin_path,
         PluginCancellation,
         PluginCatalog,
         PluginEndpointError,
         PluginEndpointResponse,
+        PluginHttpMethod,
         PluginManifest,
     },
     IPlugin::IPlugin,
@@ -1971,6 +1973,17 @@ pub(crate) struct PluginItem {
     runtime: Arc<PluginRuntime>,
 }
 
+/// Immutable, pre-resolved route target used by the hot request-dispatch path.
+/// Keeping an `Arc` here means a request can leave the manager lock with its runtime
+/// reference already resolved; unload removes the route index only after a successful
+/// runtime shutdown, while requests already holding an `Arc` retain the runtime lifetime.
+#[derive(Clone)]
+pub(crate) struct PluginEndpointRoute {
+    pub(crate) plugin_name: Arc<str>,
+    pub(crate) endpoint_id: Arc<str>,
+    pub(crate) runtime: Arc<PluginRuntime>,
+}
+
 impl PluginItem {
     pub(crate) fn manifest(&self) -> &PluginManifest {
         &self.manifest
@@ -1990,6 +2003,9 @@ pub(crate) struct PluginManager {
     pub(crate) paths: HashMap<PathBuf, i64>,
     pub(crate) plugins: HashMap<i64, PluginItem>,
     catalog: PluginCatalog,
+    /// `(method, normalized path) -> plugin runtime + endpoint id`.
+    /// Rebuilt only when the catalog changes, never as part of an HTTP request.
+    endpoint_routes: HashMap<(PluginHttpMethod, String), PluginEndpointRoute>,
 }
 
 impl PluginManager {
@@ -2011,6 +2027,22 @@ impl PluginManager {
 
     pub(crate) fn catalog(&self) -> PluginCatalog {
         self.catalog.clone()
+    }
+
+    /// Returns only plugin manifests, avoiding the duplicate endpoint-binding list in the
+    /// full catalog for API responses that need manifest data only.
+    pub(crate) fn plugin_manifests(&self) -> Vec<PluginManifest> {
+        self.catalog.plugins.values().cloned().collect()
+    }
+
+    /// Performs one hash lookup for an already-normalized path and returns an owned route target.
+    /// Path validation/normalization is done before the manager mutex is acquired.
+    pub(crate) fn endpoint_route_normalized(
+        &self,
+        method: PluginHttpMethod,
+        normalized_path: String
+    ) -> Option<PluginEndpointRoute> {
+        self.endpoint_routes.get(&(method, normalized_path)).cloned()
     }
 
     pub(crate) fn plugin_ids(&self) -> Vec<i64> {
@@ -2082,6 +2114,7 @@ impl PluginManager {
         self.plugins.insert(id, item);
         self.paths.insert(canonical_path.to_path_buf(), id);
         self.catalog = catalog;
+        self.rebuild_endpoint_routes();
         id
     }
 
@@ -2100,7 +2133,48 @@ impl PluginManager {
         let item = self.plugins.remove(&id).ok_or(PluginManagerError::PluginNotFound { id })?;
         self.paths.remove(&item.path);
         self.catalog = new_catalog;
+        self.rebuild_endpoint_routes();
         Ok(item)
+    }
+
+    /// Rebuild the hot-path route index after a validated catalog mutation. This is deliberately
+    /// O(number of registered endpoints) on load/unload, which are rare operations, instead of
+    /// cloning the full catalog and linearly normalizing every endpoint on every request.
+    fn rebuild_endpoint_routes(&mut self) {
+        let runtimes_by_name = self.plugins
+            .values()
+            .map(|item| { (item.manifest.name.to_ascii_lowercase(), item.runtime()) })
+            .collect::<HashMap<_, _>>();
+
+        let mut routes = HashMap::with_capacity(self.catalog.endpoints.len());
+        for binding in &self.catalog.endpoints {
+            let Some(runtime) = runtimes_by_name.get(
+                &binding.plugin_name.to_ascii_lowercase()
+            ) else {
+                // Catalog and registered plugins are updated under the same manager lock. A
+                // missing runtime would indicate an internal invariant violation, not a request
+                // condition; skip the route rather than panic during plugin lifecycle changes.
+                continue;
+            };
+            let Ok(normalized_path) = normalize_plugin_path(&binding.endpoint.path) else {
+                // Catalog construction validates paths before a mutation is committed.
+                continue;
+            };
+
+            routes.insert((binding.endpoint.method, normalized_path), PluginEndpointRoute {
+                // Route hits clone only Arcs; no String allocation is required per request.
+                plugin_name: Arc::<str>::from(binding.plugin_name.as_str()),
+                endpoint_id: Arc::<str>::from(binding.endpoint.id.as_str()),
+                runtime: Arc::clone(runtime),
+            });
+        }
+
+        debug_assert_eq!(
+            routes.len(),
+            self.catalog.endpoints.len(),
+            "a validated catalog must have a runtime route for every endpoint"
+        );
+        self.endpoint_routes = routes;
     }
 
     pub(crate) fn load_plugin(

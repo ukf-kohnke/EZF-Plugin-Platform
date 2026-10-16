@@ -89,17 +89,19 @@ mod PluginManager;
 pub mod Factory {
     use crate::emit_log;
 
-    use super::PluginManager::{ PluginManager, PluginProxy };
+    use super::PluginManager::{ PluginEndpointRoute, PluginManager, PluginProxy };
     pub use super::PluginManager::{ PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
     use PluginContracts::{
         IPlugin::IPlugin,
         ApiContract::{
+            normalize_plugin_path,
             PluginCancellation,
             PluginCatalog,
             PluginCatalogError,
             PluginDatabaseCapability,
             PluginEndpointError,
             PluginEndpointRequest,
+            PluginManifest,
             PluginEndpointResponse,
             PluginFreeBufferFn,
             PluginKind,
@@ -997,6 +999,12 @@ pub mod Factory {
     /// that their configuration can live alongside the shared library. The host
     /// deliberately discovers those directories instead of encoding a plugin name.
     pub fn load_database_plugins() -> Result<usize, String> {
+        load_database_plugins_with_config(PluginRuntimeConfig::from_environment())
+    }
+
+    /// Loads database plugins with the same runtime limits used for the rest of the API plugins.
+    /// Startup uses this form so every plugin in one backend instance has a consistent runtime policy.
+    pub fn load_database_plugins_with_config(config: PluginRuntimeConfig) -> Result<usize, String> {
         let database_root = PathBuf::from(plugin_root_dir()).join("database");
         let entries = fs
             ::read_dir(&database_root)
@@ -1025,9 +1033,13 @@ pub mod Factory {
         let mut loaded_count = 0usize;
         for path in directories {
             let path = path.to_string_lossy().into_owned();
-            let report = load_plugins_with_policy(&path, PluginLoadPolicy::optional_all()).map_err(
-                |error| format!("failed to load database plugins from '{}': {error}", path)
-            )?;
+            let report = load_plugins_with_policy_and_config(
+                &path,
+                PluginLoadPolicy::optional_all(),
+                config
+            ).map_err(|error| {
+                format!("failed to load database plugins from '{}': {error}", path)
+            })?;
             loaded_count += report.loaded_count();
         }
 
@@ -1067,9 +1079,39 @@ pub mod Factory {
     pub fn plugin_catalog() -> PluginCatalog {
         let singleton = instance();
         let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        manager.catalog()
+    }
 
-        let catalog = manager.catalog();
-        catalog
+    /// Returns plugin manifests without cloning the catalog's separate endpoint-binding list.
+    /// Use this for API responses that expose manifests but do not need dispatch metadata.
+    pub fn plugin_manifests() -> Vec<PluginManifest> {
+        let singleton = instance();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        manager.plugin_manifests()
+    }
+
+    /// Resolves multiple endpoint owners under one manager lock. Intended for aggregate health
+    /// checks such as readiness, where resolving the required route set one-by-one would add
+    /// lock traffic and cloning the complete catalog would copy unrelated endpoint metadata.
+    pub fn plugin_names_for_endpoints(
+        endpoints: &[(PluginContracts::ApiContract::PluginHttpMethod, &str)]
+    ) -> Vec<Option<String>> {
+        let normalized_endpoints = endpoints
+            .iter()
+            .map(|(method, path)| { (*method, normalize_plugin_path(path).ok()) })
+            .collect::<Vec<_>>();
+        let singleton = instance();
+        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        normalized_endpoints
+            .into_iter()
+            .map(|(method, path)| {
+                path.and_then(|normalized_path|
+                    manager
+                        .endpoint_route_normalized(method, normalized_path)
+                        .map(|route| route.plugin_name.as_ref().to_owned())
+                )
+            })
+            .collect()
     }
 
     #[deprecated(
@@ -1186,54 +1228,49 @@ pub mod Factory {
 
     /// Executes a plugin REST endpoint without requiring the caller to know the concrete plugin name.
     ///
-    /// Endpoint ownership is resolved from the runtime catalog using the HTTP method and path.
-    /// This prevents application code from coupling itself to implementation-specific plugin
+    /// Endpoint ownership is resolved from a precomputed runtime index keyed by HTTP method and
+    /// normalized path. This prevents application code from coupling itself to implementation-specific plugin
     /// names such as `ProcessTracker` and also avoids fragile name-derivation heuristics from REST
     /// function names.
     pub fn handle_endpoint(
         request: PluginEndpointRequest
     ) -> Result<PluginEndpointResponse, PluginEndpointError> {
         let endpoint_path = request_endpoint_path(&request.base_path, &request.raw_path);
-        let plugin_name = resolve_endpoint_plugin_name(
-            request.method,
-            &endpoint_path,
-            &request.endpoint_id
-        )?;
-
-        let runtime = {
-            let singleton = instance();
-            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let id = manager
-                .plugin_ids()
-                .into_iter()
-                .find(|id|
-                    manager
-                        .get_manifest(*id)
-                        .is_some_and(|manifest| manifest.name.eq_ignore_ascii_case(&plugin_name))
-                )
-                .ok_or_else(||
-                    PluginEndpointError::not_found(
-                        "plugin_not_found",
-                        "The plugin implementing this endpoint is not available",
-                        &format!(
-                            "No loaded plugin implements {} {}",
-                            request.method,
-                            request.raw_path
-                        )
+        let route = match
+            resolve_endpoint_route(request.method, &endpoint_path, &request.endpoint_id)?
+        {
+            Some(route) => route,
+            None => {
+                // Preserve lazy discovery for callers that reach the dispatcher before plugins
+                // have been explicitly loaded. The second lookup uses the same prebuilt index.
+                load_plugins_with_policy(
+                    &plugin_root_dir(),
+                    PluginLoadPolicy::optional_all()
+                ).map_err(|error|
+                    PluginEndpointError::internal(
+                        "plugin_discovery_failed",
+                        "Plugin discovery failed while resolving the endpoint",
+                        error.to_string()
                     )
                 )?;
-            manager
-                .get_runtime(id)
-                .ok_or_else(||
+
+                resolve_endpoint_route(
+                    request.method,
+                    &endpoint_path,
+                    &request.endpoint_id
+                )?.ok_or_else(||
                     PluginEndpointError::not_found(
-                        "plugin_runtime_not_found",
-                        "The plugin runtime implementing this endpoint is not available",
-                        &format!("No runtime is registered for plugin '{}'", plugin_name)
+                        "plugin_endpoint_not_found",
+                        "No loaded plugin implements the requested endpoint",
+                        &format!("No plugin implements {} {}", request.method, endpoint_path)
                     )
                 )?
+            }
         };
 
-        runtime.handle_endpoint(request)
+        // The route lookup clones the runtime Arc while holding the manager mutex. Actual plugin
+        // code always runs after that mutex has been released.
+        route.runtime.handle_endpoint(request)
     }
 
     fn request_endpoint_path(base_path: &str, raw_path: &str) -> String {
@@ -1254,64 +1291,41 @@ pub mod Factory {
             .unwrap_or_else(|| raw.to_owned())
     }
 
-    fn resolve_endpoint_plugin_name(
+    fn resolve_endpoint_route(
         method: PluginContracts::ApiContract::PluginHttpMethod,
         path: &str,
         endpoint_id: &str
-    ) -> Result<String, PluginEndpointError> {
-        let resolve_from_catalog = || {
+    ) -> Result<Option<PluginEndpointRoute>, PluginEndpointError> {
+        // Normalize outside the manager lock so even the remaining per-request string work does
+        // not lengthen the critical section shared by concurrent dispatches and lifecycle changes.
+        let normalized_path = normalize_plugin_path(path).ok();
+        let route = normalized_path.and_then(|normalized_path| {
             let singleton = instance();
             let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            manager
-                .catalog()
-                .endpoint_binding(method, path)
-                .map(|binding| {
-                    if !binding.endpoint.id.eq_ignore_ascii_case(endpoint_id) {
-                        return Err(
-                            PluginEndpointError::internal(
-                                "plugin_endpoint_contract_mismatch",
-                                "The requested endpoint contract does not match the registered REST endpoint",
-                                format!(
-                                    "HTTP endpoint {} {} is registered as endpoint id '{}', not '{}'",
-                                    method,
-                                    path,
-                                    binding.endpoint.id,
-                                    endpoint_id
-                                )
-                            )
-                        );
-                    }
-                    Ok(binding.plugin_name.clone())
-                })
+            manager.endpoint_route_normalized(method, normalized_path)
+        });
+
+        let Some(route) = route else {
+            return Ok(None);
         };
 
-        if let Some(result) = resolve_from_catalog() {
-            return result;
-        }
-
-        // Preserve the previous lazy-load behavior without reintroducing plugin-name coupling:
-        // discover all plugin libraries, then resolve the requested endpoint from the resulting
-        // catalog. Optional discovery failures do not prevent other plugins from loading.
-        load_plugins_with_policy(&plugin_root_dir(), PluginLoadPolicy::optional_all()).map_err(
-            |error|
+        if !route.endpoint_id.as_ref().eq_ignore_ascii_case(endpoint_id) {
+            return Err(
                 PluginEndpointError::internal(
-                    "plugin_discovery_failed",
-                    "Plugin discovery failed while resolving the endpoint",
-                    error.to_string()
-                )
-        )?;
-
-        match resolve_from_catalog() {
-            Some(result) => result,
-            None =>
-                Err(
-                    PluginEndpointError::not_found(
-                        "plugin_endpoint_not_found",
-                        "No loaded plugin implements the requested endpoint",
-                        &format!("No plugin implements {} {}", method, path)
+                    "plugin_endpoint_contract_mismatch",
+                    "The requested endpoint contract does not match the registered REST endpoint",
+                    format!(
+                        "HTTP endpoint {} {} is registered as endpoint id '{}', not '{}'",
+                        method,
+                        path,
+                        route.endpoint_id.as_ref(),
+                        endpoint_id
                     )
-                ),
+                )
+            );
         }
+
+        Ok(Some(route))
     }
 }
 

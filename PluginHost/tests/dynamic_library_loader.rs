@@ -89,6 +89,14 @@ fn ping_request() -> PluginEndpointRequest {
     }
 }
 
+fn held_slow_request() -> PluginEndpointRequest {
+    let mut request = ping_request();
+    request.endpoint_id = "slow".to_owned();
+    request.raw_path = "/pluginhost-integration/slow".to_owned();
+    request.raw_query = Some("hold=true".to_owned());
+    request
+}
+
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct TestGuard {
@@ -151,6 +159,23 @@ impl Drop for EnvironmentVariableGuard {
             }
         }
     }
+}
+
+#[test]
+fn indexed_dispatch_rejects_an_endpoint_id_mismatch() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let id = Factory::load_plugin_file(&library).expect("fixture library must load");
+
+    let mut request = ping_request();
+    request.endpoint_id = "not-ping".to_owned();
+    let error = Factory::handle_endpoint(request).expect_err(
+        "a known method/path must not dispatch under a different endpoint contract id"
+    );
+
+    assert_eq!(error.code, "plugin_endpoint_contract_mismatch");
+    cleanup_plugin(id);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
 }
 
 #[test]
@@ -449,6 +474,83 @@ fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
 
     cleanup_plugin(id);
     let _ = std::fs::remove_dir_all(library.parent().unwrap());
+}
+
+#[test]
+fn concurrent_abi_calls_keep_context_alive_until_unload_drains_every_call() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let config = PluginRuntimeConfig {
+        call_timeout: std::time::Duration::from_secs(5),
+        unload_timeout: std::time::Duration::from_secs(3),
+        lifecycle_timeout: std::time::Duration::from_secs(2),
+        worker_threads: 2,
+        max_concurrent_calls: 2,
+        queue_capacity: 2,
+    };
+    let id = Factory::load_plugin_file_with_config(&library, config).expect(
+        "Rust ABI fixture must load with concurrent execution enabled"
+    );
+    let plugin_dir = library.parent().unwrap();
+    let release_marker = plugin_dir.join("slow-release.marker");
+    let second_active_marker = plugin_dir.join("slow-active-2.marker");
+    let destroy_marker = plugin_dir.join("destroy.marker");
+    for marker in [&release_marker, &second_active_marker, &destroy_marker] {
+        let _ = fs::remove_file(marker);
+    }
+
+    let first = std::thread::spawn(|| Factory::handle_endpoint(held_slow_request()));
+    let second = std::thread::spawn(|| Factory::handle_endpoint(held_slow_request()));
+
+    let active_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !second_active_marker.is_file() {
+        if first.is_finished() || second.is_finished() {
+            let _ = fs::write(&release_marker, b"release");
+            let _ = first.join();
+            let _ = second.join();
+            panic!("both ABI callbacks must be active before unload begins");
+        }
+        if std::time::Instant::now() >= active_deadline {
+            let _ = fs::write(&release_marker, b"release");
+            let _ = first.join();
+            let _ = second.join();
+            panic!("second concurrent callback did not enter the shared plugin context");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let unload_thread = std::thread::spawn(move || Factory::unload_plugin(id));
+    let stopping_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut observed_stopping = false;
+    while std::time::Instant::now() < stopping_deadline {
+        if
+            Factory::plugin_health_by_name("PluginHostIntegration").is_some_and(
+                |snapshot| snapshot.state == PluginHealthState::Stopping
+            )
+        {
+            observed_stopping = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    // If destroy were invoked before both callbacks return, this marker would appear while the
+    // context is still in use. Always release callbacks before assertions to avoid stranded workers.
+    let destroyed_while_active = destroy_marker.is_file();
+    fs::write(&release_marker, b"release").expect("held ABI callbacks must be released");
+
+    let unload_result = unload_thread.join().expect("unload worker must finish");
+    let first_result = first.join().expect("first ABI callback must finish");
+    let second_result = second.join().expect("second ABI callback must finish");
+
+    assert!(observed_stopping, "unload must expose stopping while calls are active");
+    assert!(!destroyed_while_active, "destroy must not run while an ABI callback is active");
+    assert!(first_result.is_err(), "first callback should observe unload cancellation");
+    assert!(second_result.is_err(), "second callback should observe unload cancellation");
+    unload_result.expect("unload must finish after all concurrent ABI callbacks drain");
+    assert_eq!(Factory::plugin_count(), 0);
+    assert!(destroy_marker.is_file(), "destroy must run after the calls have drained");
+    let _ = fs::remove_dir_all(plugin_dir);
 }
 
 #[test]

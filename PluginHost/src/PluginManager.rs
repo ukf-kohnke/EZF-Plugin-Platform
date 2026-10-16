@@ -4,6 +4,8 @@ use PluginContracts::{
         PluginCancellation,
         PluginCatalog,
         PluginEndpointError,
+        PLUGIN_OVERLOADED_CODE,
+        PLUGIN_OVERLOADED_USER_MESSAGE,
         PluginEndpointResponse,
         PluginHttpMethod,
         PluginManifest,
@@ -1400,8 +1402,8 @@ impl PluginRuntime {
                 PluginCallFailure::Busy =>
                     PluginContracts::ApiContract::PluginEndpointError::new(
                         503,
-                        "plugin_overloaded",
-                        "The plugin has reached its admitted-call or worker-queue capacity",
+                        PLUGIN_OVERLOADED_CODE,
+                        PLUGIN_OVERLOADED_USER_MESSAGE,
                         None
                     ),
                 PluginCallFailure::Failed(message) =>

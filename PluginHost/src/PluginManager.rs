@@ -830,13 +830,12 @@ impl PluginRuntime {
                 return Err("plugin returned an invalid response buffer".to_owned());
             }
 
-            let bytes = (unsafe { response.to_vec() }).ok_or_else(||
-                "plugin returned an invalid response buffer".to_owned()
-            )?;
+            let bytes = unsafe { response.to_vec() };
+            // Release through the plugin's allocator regardless of whether conversion succeeded.
             unsafe {
                 (vtable.free_buffer)(response);
             }
-            Ok(bytes)
+            bytes.ok_or_else(|| "plugin returned an invalid response buffer".to_owned())
         })?
     }
 
@@ -1140,12 +1139,15 @@ impl PluginRuntime {
         }
     }
 
-    fn call_json_direct_from_bytes<R: DeserializeOwned, F>(
+    /// Calls an ABI function and copies its response bytes into host-owned memory without
+    /// decoding the JSON payload. The plugin allocator is always used to release the ABI buffer.
+    /// This is used by the database capability to forward successful response envelopes unchanged.
+    fn call_abi_bytes_direct_from_bytes<F>(
         &self,
         request_bytes: &[u8],
         cancellation: PluginCancellationV2,
         select_call: F
-    ) -> Result<R, String>
+    ) -> Result<Vec<u8>, String>
         where F: FnOnce(&PluginVTableV2) -> PluginEndpointFnV2
     {
         self.with_instance(|context, vtable| {
@@ -1169,16 +1171,31 @@ impl PluginRuntime {
             if !Self::is_valid_buffer(response) {
                 return Err("plugin returned an invalid response buffer".to_owned());
             }
-            let bytes = (unsafe { response.to_vec() }).ok_or_else(||
-                "plugin returned an invalid response buffer".to_owned()
-            )?;
+            let bytes = unsafe { response.to_vec() };
+            // Release through the plugin's allocator regardless of whether conversion succeeded.
             unsafe {
                 (vtable.free_buffer)(response);
             }
-            serde_json
-                ::from_slice(&bytes)
-                .map_err(|error| format!("failed to decode plugin response: {error}"))
+            bytes.ok_or_else(|| "plugin returned an invalid response buffer".to_owned())
         })?
+    }
+
+    fn call_json_direct_from_bytes<R: DeserializeOwned, F>(
+        &self,
+        request_bytes: &[u8],
+        cancellation: PluginCancellationV2,
+        select_call: F
+    ) -> Result<R, String>
+        where F: FnOnce(&PluginVTableV2) -> PluginEndpointFnV2
+    {
+        let bytes = self.call_abi_bytes_direct_from_bytes(
+            request_bytes,
+            cancellation,
+            select_call
+        )?;
+        serde_json
+            ::from_slice(&bytes)
+            .map_err(|error| format!("failed to decode plugin response: {error}"))
     }
 
     /// Calls a plugin endpoint using the optional split-metadata/body ABI fast path.
@@ -1438,6 +1455,48 @@ impl PluginRuntime {
                     ),
             }
         })?
+    }
+
+    /// Executes a database ABI call while preserving the datasource's serialized response.
+    /// Request ownership and the response ABI buffer are handled entirely inside the host; no
+    /// Rust `DatabaseResponse` graph is constructed for successful large query results.
+    pub(crate) fn execute_database_bytes_with_parent(
+        self: &Arc<Self>,
+        request_bytes: Vec<u8>,
+        parent_cancellation: PluginCancellationV2
+    ) -> Result<Vec<u8>, DatabaseContracts::DatabaseError> {
+        let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
+            runtime.call_abi_bytes_direct_from_bytes(
+                &request_bytes,
+                cancellation,
+                |vtable| vtable.execute_database
+            )
+        };
+
+        self.call_with_timeout_parent("execute_database", parent_cancellation, call).map_err(
+            |error| {
+                match error {
+                    PluginCallFailure::Timeout(timeout) =>
+                        DatabaseContracts::DatabaseError::new(
+                            DatabaseContracts::DatabaseErrorKind::Query,
+                            format!(
+                                "plugin database call timed out after {:?}; cooperative cancellation requested",
+                                timeout
+                            )
+                        ),
+                    PluginCallFailure::Busy =>
+                        DatabaseContracts::DatabaseError::new(
+                            DatabaseContracts::DatabaseErrorKind::Query,
+                            "plugin database worker or queue capacity reached"
+                        ),
+                    PluginCallFailure::Failed(message) =>
+                        DatabaseContracts::DatabaseError::new(
+                            DatabaseContracts::DatabaseErrorKind::Decode,
+                            message
+                        ),
+                }
+            }
+        )
     }
 
     pub(crate) fn execute_database_with_parent(
@@ -1998,6 +2057,23 @@ impl PluginItem {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum DatabasePluginSelection {
+    None,
+    Unique {
+        runtime: Arc<PluginRuntime>,
+    },
+    Multiple {
+        names: Arc<[String]>,
+    },
+}
+
+impl Default for DatabasePluginSelection {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PluginManager {
     pub(crate) paths: HashMap<PathBuf, i64>,
@@ -2006,6 +2082,9 @@ pub(crate) struct PluginManager {
     /// `(method, normalized path) -> plugin runtime + endpoint id`.
     /// Rebuilt only when the catalog changes, never as part of an HTTP request.
     endpoint_routes: HashMap<(PluginHttpMethod, String), PluginEndpointRoute>,
+    /// Cached DataSource cardinality and unique runtime. Updated atomically with registry changes.
+    /// Database requests therefore avoid scanning every loaded plugin under the manager mutex.
+    database_plugin: DatabasePluginSelection,
 }
 
 impl PluginManager {
@@ -2043,6 +2122,10 @@ impl PluginManager {
         normalized_path: String
     ) -> Option<PluginEndpointRoute> {
         self.endpoint_routes.get(&(method, normalized_path)).cloned()
+    }
+
+    pub(crate) fn database_plugin_selection(&self) -> DatabasePluginSelection {
+        self.database_plugin.clone()
     }
 
     pub(crate) fn plugin_ids(&self) -> Vec<i64> {
@@ -2175,6 +2258,36 @@ impl PluginManager {
             "a validated catalog must have a runtime route for every endpoint"
         );
         self.endpoint_routes = routes;
+
+        // This selection is rebuilt under the same manager lock as the plugin registry and
+        // endpoint index, so a request sees one consistent registry generation.
+        let data_sources = self
+            .plugin_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let manifest = self.get_manifest(id)?;
+                if manifest.kind != PluginContracts::ApiContract::PluginKind::DataSource {
+                    return None;
+                }
+                self.get_runtime(id).map(|runtime| (manifest.name.clone(), runtime))
+            })
+            .collect::<Vec<_>>();
+        self.database_plugin = match data_sources.len() {
+            0 => DatabasePluginSelection::None,
+            1 =>
+                DatabasePluginSelection::Unique {
+                    runtime: Arc::clone(&data_sources[0].1),
+                },
+            _ =>
+                DatabasePluginSelection::Multiple {
+                    names: Arc::<[String]>::from(
+                        data_sources
+                            .into_iter()
+                            .map(|(name, _)| name)
+                            .collect::<Vec<_>>()
+                    ),
+                },
+        };
     }
 
     pub(crate) fn load_plugin(

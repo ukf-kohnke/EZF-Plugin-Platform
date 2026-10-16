@@ -89,7 +89,12 @@ mod PluginManager;
 pub mod Factory {
     use crate::emit_log;
 
-    use super::PluginManager::{ PluginEndpointRoute, PluginManager, PluginProxy };
+    use super::PluginManager::{
+        DatabasePluginSelection,
+        PluginEndpointRoute,
+        PluginManager,
+        PluginProxy,
+    };
     pub use super::PluginManager::{ PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
     use PluginContracts::{
         IPlugin::IPlugin,
@@ -104,7 +109,6 @@ pub mod Factory {
             PluginManifest,
             PluginEndpointResponse,
             PluginFreeBufferFn,
-            PluginKind,
             PluginLifecycleError,
             PluginSessionContext,
         },
@@ -932,15 +936,7 @@ pub mod Factory {
     pub fn has_database_plugin() -> bool {
         let singleton = instance();
         let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        manager
-            .plugin_ids()
-            .into_iter()
-            .any(|id| {
-                manager
-                    .get_manifest(id)
-                    .is_some_and(|manifest| manifest.kind == PluginKind::DataSource)
-            })
+        !matches!(manager.database_plugin_selection(), DatabasePluginSelection::None)
     }
 
     /// Executes a callback against the unique loaded data-source plugin.
@@ -951,43 +947,61 @@ pub mod Factory {
     pub fn with_database_plugin<R, F>(func: F) -> Result<R, String>
         where F: FnOnce(&dyn IPlugin) -> R
     {
-        let (runtimes, names) = {
+        let selection = {
             let singleton = instance();
             let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-            let mut runtimes = Vec::new();
-            let mut names = Vec::new();
-
-            for id in manager.plugin_ids() {
-                let Some(manifest) = manager.get_manifest(id) else {
-                    continue;
-                };
-                if manifest.kind != PluginKind::DataSource {
-                    continue;
-                }
-
-                let Some(runtime) = manager.get_runtime(id) else {
-                    continue;
-                };
-
-                names.push(manifest.name.clone());
-                runtimes.push(runtime);
-            }
-
-            (runtimes, names)
+            manager.database_plugin_selection()
         };
 
-        match runtimes.len() {
-            0 => Err("no database data-source plugin is loaded".to_owned()),
-            1 => {
-                let proxy = PluginProxy::new(runtimes[0].clone());
+        match selection {
+            DatabasePluginSelection::None =>
+                Err("no database data-source plugin is loaded".to_owned()),
+            DatabasePluginSelection::Unique { runtime } => {
+                let proxy = PluginProxy::new(runtime);
                 Ok(func(&proxy))
             }
-            _ =>
+            DatabasePluginSelection::Multiple { names } =>
                 Err(
                     format!(
                         "multiple database data-source plugins are loaded: {}",
                         names.join(", ")
+                    )
+                ),
+        }
+    }
+
+    /// Executes a DataSource ABI operation with raw JSON request bytes and returns the exact
+    /// host-owned response bytes. Successful response envelopes are not deserialized and encoded
+    /// again on the host. Call-level failures remain typed so the Infrastructure capability can
+    /// preserve its established error mapping.
+    pub fn execute_database_raw(
+        request_bytes: Vec<u8>,
+        cancellation: PluginAbi::PluginCancellationV2
+    ) -> Result<Vec<u8>, DatabaseContracts::DatabaseError> {
+        let selection = {
+            let singleton = instance();
+            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            manager.database_plugin_selection()
+        };
+
+        match selection {
+            DatabasePluginSelection::None =>
+                Err(
+                    DatabaseContracts::DatabaseError::new(
+                        DatabaseContracts::DatabaseErrorKind::Query,
+                        "no database data-source plugin is loaded"
+                    )
+                ),
+            DatabasePluginSelection::Unique { runtime } =>
+                runtime.execute_database_bytes_with_parent(request_bytes, cancellation),
+            DatabasePluginSelection::Multiple { names } =>
+                Err(
+                    DatabaseContracts::DatabaseError::new(
+                        DatabaseContracts::DatabaseErrorKind::Query,
+                        format!(
+                            "multiple database data-source plugins are loaded: {}",
+                            names.join(", ")
+                        )
                     )
                 ),
         }

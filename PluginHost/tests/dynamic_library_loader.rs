@@ -1508,6 +1508,20 @@ fn database_capability_crosses_the_real_plugin_abi_boundary() {
         })
     );
 
+    // The raw DataSource dispatch path must preserve the serialized Result envelope while still
+    // using the cached unique-DataSource selection and the normal ABI/cancellation boundary.
+    let request_bytes = serde_json::to_vec(&request).expect("database request must serialize");
+    let raw_response = Factory::execute_database_raw(
+        request_bytes,
+        PluginContracts::ApiContract::PluginCancellation::uncancelled().as_abi()
+    ).expect("raw DataSource dispatch must return its ABI payload");
+    let decoded: Result<
+        DatabaseContracts::DatabaseResponse,
+        DatabaseContracts::DatabaseError
+    > = serde_json::from_slice(&raw_response).expect("raw DataSource response must remain JSON");
+    assert_eq!(decoded.expect("raw DataSource result must be successful"), response);
+    assert_eq!(DATABASE_CAPABILITY_CALLS.load(std::sync::atomic::Ordering::SeqCst), 2);
+
     cleanup_plugin(id);
     let _ = fs::remove_dir_all(library.parent().unwrap());
 }

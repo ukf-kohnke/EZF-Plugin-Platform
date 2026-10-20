@@ -57,9 +57,9 @@ const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
 const DEFAULT_PLUGIN_CALL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_PLUGIN_UNLOAD_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_PLUGIN_LIFECYCLE_TIMEOUT_MS: u64 = 10_000;
-// Plugins may perform blocking database work. Keep their persistent OS-thread footprint small
-// and provide independent, bounded admission and queue limits for short traffic bursts.
-const DEFAULT_PLUGIN_WORKER_THREADS: usize = 8;
+// Patient-list load testing showed higher successful throughput at 16 workers. Keep admission
+// and queue limits independent and bounded; validate this default against the target SQL Server.
+const DEFAULT_PLUGIN_WORKER_THREADS: usize = 16;
 const DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS: usize = 32;
 const DEFAULT_PLUGIN_QUEUE_CAPACITY: usize = 24;
 const MIN_PLUGIN_TIMEOUT_MS: u64 = 1;
@@ -70,8 +70,9 @@ const MAX_PLUGIN_QUEUE_CAPACITY: usize = 4_096;
 
 /// Runtime behavior limits for one plugin.
 ///
-/// The defaults are intentionally conservative enough for normal API/database work while still
-/// bounding the amount of work a misbehaving plugin can consume. Production deployments may
+/// The current 16-worker default reflects the measured patient-list load profile; it is not a
+/// universal optimum and should be validated against the target database. Admission and queue
+/// limits remain bounded. Production deployments may
 /// override them globally through environment variables:
 /// `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`, `EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS`,
 /// `EZF_PLUGIN_WORKER_THREADS`, `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, and `EZF_PLUGIN_QUEUE_CAPACITY`.

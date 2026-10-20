@@ -46,7 +46,7 @@ use std::{
         RwLock,
         RwLockReadGuard,
         Weak,
-        atomic::{ AtomicBool, AtomicU64, Ordering },
+        atomic::{ AtomicBool, AtomicU64, AtomicUsize, Ordering },
         mpsc,
     },
     thread,
@@ -196,6 +196,16 @@ pub enum PluginHealthState {
 pub struct PluginHealthSnapshot {
     pub name: String,
     pub state: PluginHealthState,
+    /// Configured number of persistent workers for this plugin.
+    pub worker_threads: usize,
+    /// Maximum number of admitted calls, including calls waiting for a worker.
+    pub max_concurrent_calls: usize,
+    /// Configured capacity of the worker queue.
+    pub queue_capacity: usize,
+    /// Jobs currently waiting in the bounded worker queue.
+    pub queued_jobs: usize,
+    /// Jobs currently executing on plugin worker threads.
+    pub running_workers: usize,
     /// Calls admitted by the runtime that have not yet completed inside the plugin.
     pub active_calls: usize,
     /// Admitted calls for which the caller already received a timeout, while the plugin operation
@@ -466,6 +476,24 @@ enum PluginWorkerSubmitError {
 struct PluginWorkerPool {
     sender: Mutex<Option<mpsc::SyncSender<PluginJob>>>,
     workers: Mutex<Option<Vec<thread::JoinHandle<()>>>>,
+    queue_capacity: usize,
+    queued_jobs: Arc<AtomicUsize>,
+    running_workers: Arc<AtomicUsize>,
+}
+
+struct WorkerActivityGuard(Arc<AtomicUsize>);
+
+impl WorkerActivityGuard {
+    fn enter(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for WorkerActivityGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl PluginWorkerPool {
@@ -474,10 +502,14 @@ impl PluginWorkerPool {
         let queue_capacity = queue_capacity.max(1);
         let (sender, receiver) = mpsc::sync_channel::<PluginJob>(queue_capacity);
         let receiver = Arc::new(Mutex::new(receiver));
+        let queued_jobs = Arc::new(AtomicUsize::new(0));
+        let running_workers = Arc::new(AtomicUsize::new(0));
         let mut workers = Vec::with_capacity(worker_count);
 
         for index in 0..worker_count {
             let receiver = Arc::clone(&receiver);
+            let worker_queue_depth = Arc::clone(&queued_jobs);
+            let worker_running_count = Arc::clone(&running_workers);
             let thread_name = format!("ezf-plugin-worker-{index}");
             match
                 thread::Builder
@@ -493,7 +525,13 @@ impl PluginWorkerPool {
                             };
 
                             match job {
-                                Ok(job) => job(),
+                                Ok(job) => {
+                                    worker_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                                    let _activity = WorkerActivityGuard::enter(
+                                        Arc::clone(&worker_running_count)
+                                    );
+                                    job();
+                                }
                                 Err(_) => {
                                     break;
                                 }
@@ -515,6 +553,9 @@ impl PluginWorkerPool {
         Ok(Self {
             sender: Mutex::new(Some(sender)),
             workers: Mutex::new(Some(workers)),
+            queue_capacity,
+            queued_jobs,
+            running_workers,
         })
     }
 
@@ -524,10 +565,18 @@ impl PluginWorkerPool {
             return Err(PluginWorkerSubmitError::Closed(job));
         };
 
+        // Increment before publishing the job so a worker cannot dequeue it before it is counted.
+        self.queued_jobs.fetch_add(1, Ordering::Relaxed);
         match sender.try_send(job) {
             Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(job)) => Err(PluginWorkerSubmitError::QueueFull(job)),
-            Err(mpsc::TrySendError::Disconnected(job)) => Err(PluginWorkerSubmitError::Closed(job)),
+            Err(mpsc::TrySendError::Full(job)) => {
+                self.queued_jobs.fetch_sub(1, Ordering::Relaxed);
+                Err(PluginWorkerSubmitError::QueueFull(job))
+            }
+            Err(mpsc::TrySendError::Disconnected(job)) => {
+                self.queued_jobs.fetch_sub(1, Ordering::Relaxed);
+                Err(PluginWorkerSubmitError::Closed(job))
+            }
         }
     }
 
@@ -920,6 +969,11 @@ impl PluginRuntime {
         PluginHealthSnapshot {
             name,
             state: health.state,
+            worker_threads: self.config.worker_threads,
+            max_concurrent_calls: self.config.max_concurrent_calls,
+            queue_capacity: self.worker_pool.queue_capacity,
+            queued_jobs: self.worker_pool.queued_jobs.load(Ordering::Relaxed),
+            running_workers: self.worker_pool.running_workers.load(Ordering::Relaxed),
             active_calls: self.gate.active_calls(),
             timed_out_active_calls: health.timed_out_active_calls,
             completed_calls: self.completed_calls.load(Ordering::Relaxed),

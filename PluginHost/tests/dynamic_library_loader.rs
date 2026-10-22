@@ -1193,6 +1193,17 @@ fn on_unload_timeout_keeps_the_plugin_registered_until_callback_finishes() {
     );
     assert_eq!(Factory::plugin_count(), 0);
     assert!(library.parent().unwrap().join("destroy.marker").is_file());
+
+    let lifecycle = std::fs::read_to_string(library.parent().unwrap().join("lifecycle.order"))
+        .expect("fixture must record lifecycle events");
+    let on_unload_count = lifecycle.lines().filter(|line| *line == "on_unload").count();
+    let on_destroy_count = lifecycle.lines().filter(|line| *line == "on_destroy").count();
+    assert_eq!(
+        on_unload_count,
+        1,
+        "successful timed-out on_unload must not be invoked twice: {lifecycle}"
+    );
+    assert_eq!(on_destroy_count, 1, "destroy must run exactly once: {lifecycle}");
     let _ = std::fs::remove_dir_all(library.parent().unwrap());
 }
 
@@ -1282,6 +1293,21 @@ fn destroy_failure_keeps_the_instance_and_library_loaded_until_retry_succeeds() 
 
     Factory::unload_plugin(id).expect("second destroy must succeed after the one-shot failure");
     assert_eq!(Factory::plugin_count(), 0);
+
+    let lifecycle = fs::read_to_string(library.parent().unwrap().join("lifecycle.order"))
+        .expect("fixture must record lifecycle events");
+    let on_unload_count = lifecycle.lines().filter(|line| *line == "on_unload").count();
+    let on_destroy_count = lifecycle.lines().filter(|line| *line == "on_destroy").count();
+    assert_eq!(
+        on_unload_count,
+        1,
+        "successful on_unload must not be repeated when destroy is retried: {lifecycle}"
+    );
+    assert_eq!(
+        on_destroy_count,
+        2,
+        "one failed destroy plus one retry are expected: {lifecycle}"
+    );
     let _ = fs::remove_dir_all(library.parent().unwrap());
 }
 

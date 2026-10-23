@@ -9,9 +9,9 @@ repository = "https://github.com/hoppmann/EZF-Backend.git"
 
 [dependencies]
 ApplicationConfig = { path = "../ApplicationConfig" }
-DatabaseContracts = { path = "../DatabaseContracts" }
-PluginAbi = { path = "../PluginAbi" }
-PluginContracts = { path = "../PluginContracts" }
+DatabaseContracts = { path = "../Contracts/DatabaseContracts" }
+PluginAbi = { path = "../Contracts/PluginAbi" }
+PluginContracts = { path = "../Contracts/PluginContracts" }
 glob = "0.3.1"
 libloading = "0.8.3"
 log = "0.4.20"

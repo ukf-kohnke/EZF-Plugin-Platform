@@ -10,5 +10,5 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-PluginAbi = { path = "../../../PluginAbi" }
+PluginAbi = { path = "../../../Contracts/PluginAbi" }
 serde_json = "1.0"

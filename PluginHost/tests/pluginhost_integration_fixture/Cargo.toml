@@ -12,7 +12,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-PluginContracts = { path = "../../../Contracts/PluginContracts" }
-DatabaseContracts = { path = "../../../Contracts/DatabaseContracts" }
+PluginContracts = { path = "../../../Plugin-SDK/PluginContracts" }
+DatabaseContracts = { path = "../../../Plugin-SDK/DatabaseContracts" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

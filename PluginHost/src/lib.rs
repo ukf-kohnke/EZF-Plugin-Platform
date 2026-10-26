@@ -67,6 +67,7 @@
 //! - `with_*` helpers: `None` when no matching plugin (or no plugins) is present.
 //! - bulk loading returns a [`Factory::PluginLoadReport`] from the policy-aware API.
 #![allow(non_snake_case)]
+mod PluginManager;
 
 #[cfg(target_os = "linux")]
 const LOGGERDEF: &str = "unix";
@@ -85,10 +86,9 @@ fn emit_log(level: log::LevelFilter, message: &str) {
         log::LevelFilter::Off => {}
     }
 }
-mod PluginManager;
+
 pub mod Factory {
     use crate::emit_log;
-
     use super::PluginManager::{
         DatabasePluginSelection,
         PluginEndpointRoute,

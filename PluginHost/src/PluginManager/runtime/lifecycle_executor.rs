@@ -1,6 +1,7 @@
 //! Serialized lifecycle callback executor with timeout-safe retry semantics.
-use super::{ PluginCancellationState, PluginLifecycleStatus };
-use std::sync::{ Arc, Mutex, mpsc };
+use super::PluginLifecycleStatus;
+use super::super::executor::PluginCancellationSource;
+use std::sync::{ Mutex, mpsc };
 use std::thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,7 +13,7 @@ pub(super) enum PluginLifecycleOperation {
 pub(super) struct PendingPluginLifecycle {
     pub(super) operation: PluginLifecycleOperation,
     pub(super) receiver: mpsc::Receiver<Result<PluginLifecycleStatus, String>>,
-    pub(super) cancellation: Arc<PluginCancellationState>,
+    pub(super) cancellation: PluginCancellationSource,
 }
 
 pub(super) type PluginLifecycleJob = Box<

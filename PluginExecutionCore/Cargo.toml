@@ -1,0 +1,10 @@
+[package]
+name = "PluginExecutionCore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared ABI V2 dynamic-library and buffer execution core for EZF plugins"
+
+[dependencies]
+PluginAbi = { path = "../Plugin-SDK/PluginAbi" }
+libloading = "0.8.3"

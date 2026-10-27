@@ -3,17 +3,6 @@
 use super::*;
 use std::{ sync::mpsc, time::Instant };
 
-unsafe extern "C" fn plugin_is_cancelled(context: *const std::ffi::c_void) -> bool {
-    if context.is_null() {
-        return true;
-    }
-    let state = unsafe { &*(context as *const PluginCancellationState) };
-    if state.local.load(Ordering::Acquire) {
-        return true;
-    }
-    state.parent.is_some_and(|parent| unsafe { parent.is_cancelled() })
-}
-
 impl PluginRuntime {
     fn start_lifecycle_operation(
         &self,
@@ -27,22 +16,17 @@ impl PluginRuntime {
             return Err("a plugin lifecycle callback is already in progress".to_owned());
         }
 
-        let cancellation = Arc::new(PluginCancellationState {
-            local: AtomicBool::new(false),
-            parent: None,
-        });
-        let callback_cancellation = PluginCancellationV2 {
-            context: Arc::as_ptr(&cancellation).cast(),
-            is_cancelled: plugin_is_cancelled,
-        };
-        // Keep the cancellation state alive for the full callback even if the caller times out.
-        let cancellation_guard = Arc::clone(&cancellation);
+        let cancellation = PluginCancellationSource::new(None);
+        let operation_id = self.next_call_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let deadline = Instant::now() + self.config.lifecycle_timeout;
+        let call_context = PluginCallContext::new(operation_id, deadline, cancellation.token());
+        // The call context and pending lifecycle state share the cancellation source, so a timeout
+        // remains observable until the native callback actually returns.
         let receiver = self.lifecycle_executor.submit(
             Box::new(move || {
-                let _cancellation_guard = cancellation_guard;
                 match operation {
-                    PluginLifecycleOperation::OnUnload => executor.on_unload(callback_cancellation),
-                    PluginLifecycleOperation::Destroy => executor.destroy(callback_cancellation),
+                    PluginLifecycleOperation::OnUnload => executor.on_unload(&call_context),
+                    PluginLifecycleOperation::Destroy => executor.destroy(&call_context),
                 }
             })
         )?;
@@ -70,7 +54,7 @@ impl PluginRuntime {
         match pending.receiver.recv_timeout(self.config.lifecycle_timeout) {
             Ok(result) => Ok(Some((pending.operation, result))),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                pending.cancellation.local.store(true, Ordering::Release);
+                pending.cancellation.cancel();
                 let mut slot = self.pending_lifecycle
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());

@@ -1,8 +1,13 @@
 //! Per-plugin runtime state and shared invariants.
 //! Calls, plugin operations, lifecycle transitions, scheduling, configuration, and health are split into child modules.
-use super::executor::{ PluginExecutor, PluginLifecycleStatus };
-use PluginAbi::PluginCancellationV2;
+use super::executor::{
+    PluginCallContext,
+    PluginCancellationSource,
+    PluginExecutor,
+    PluginLifecycleStatus,
+};
 use std::sync::{ Arc, Mutex, RwLock, atomic::{ AtomicBool, AtomicU64, Ordering } };
+use std::time::Instant;
 
 mod worker_pool;
 mod lifecycle_executor;
@@ -22,23 +27,14 @@ use self::worker_pool::{ PluginJob, PluginWorkerPool, PluginWorkerSubmitError };
 pub use self::config::PluginRuntimeConfig;
 pub use self::health::{ PluginHealthSnapshot, PluginHealthState };
 use self::health::PluginHealthRuntimeState;
-use self::calls::{
-    PluginCallAccounting,
-    PluginCallFailure,
-    PluginCallGate,
-    PluginCallTracker,
-    PluginCancellationState,
-};
+use self::calls::{ PluginCallAccounting, PluginCallFailure, PluginCallGate, PluginCallTracker };
 
-fn never_cancelled_abi() -> PluginCancellationV2 {
-    PluginCancellationV2 {
-        context: std::ptr::null(),
-        is_cancelled: never_cancelled,
-    }
-}
-
-unsafe extern "C" fn never_cancelled(_context: *const std::ffi::c_void) -> bool {
-    false
+fn cleanup_call_context(operation_id: u64, timeout: std::time::Duration) -> PluginCallContext {
+    PluginCallContext::new(
+        operation_id,
+        Instant::now() + timeout,
+        PluginCancellationSource::new(None).token()
+    )
 }
 
 /// Runtime state of one loaded plugin.
@@ -85,11 +81,13 @@ impl PluginRuntime {
             config.worker_threads,
             config.queue_capacity
         ).map_err(|error| {
-            let _ = executor.destroy(never_cancelled_abi());
+            let context = cleanup_call_context(0, config.lifecycle_timeout);
+            let _ = executor.destroy(&context);
             error
         })?;
         let lifecycle_executor = PluginLifecycleExecutor::new().map_err(|error| {
-            let _ = executor.destroy(never_cancelled_abi());
+            let context = cleanup_call_context(0, config.lifecycle_timeout);
+            let _ = executor.destroy(&context);
             error
         })?;
 
@@ -192,14 +190,32 @@ impl PluginRuntime {
     /// may still finish successfully afterwards.
     fn record_failure(&self, call_id: u64, message: impl Into<String>, timed_out: bool) {
         let message = message.into();
+        // A process-backed executor can fail because the worker died, not merely because the
+        // plugin returned a domain error. Revalidate before taking the health lock so a dead worker
+        // transitions the runtime to Failed instead of remaining Degraded indefinitely.
+        let executor_error = {
+            let state = self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.destroyed {
+                None
+            } else {
+                state.executor.as_deref().and_then(|executor| executor.validate().err())
+            }
+        };
         let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if timed_out {
             health.timed_out_active_calls = health.timed_out_active_calls.saturating_sub(1);
         }
         health.last_failure_call_id = health.last_failure_call_id.max(call_id);
         if matches!(health.state, PluginHealthState::Ready | PluginHealthState::Degraded) {
-            health.state = PluginHealthState::Degraded;
-            health.last_error = Some(message);
+            if let Some(executor_error) = executor_error {
+                health.state = PluginHealthState::Failed;
+                health.last_error = Some(
+                    format!("{message}; executor unavailable: {executor_error}")
+                );
+            } else {
+                health.state = PluginHealthState::Degraded;
+                health.last_error = Some(message);
+            }
         }
         drop(health);
         self.completed_calls.fetch_add(1, Ordering::Relaxed);
@@ -233,7 +249,25 @@ impl PluginRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .unwrap_or_else(|| "<initializing>".to_owned());
-        let health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Readiness/health probes must also notice a worker that exited while idle, before a new
+        // endpoint happens to exercise the executor. `validate()` is non-blocking for both
+        // implementations (the process executor uses Child::try_wait).
+        let executor_error = {
+            let state = self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.destroyed {
+                None
+            } else {
+                state.executor.as_deref().and_then(|executor| executor.validate().err())
+            }
+        };
+        let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(error) = executor_error {
+            if matches!(health.state, PluginHealthState::Ready | PluginHealthState::Degraded) {
+                health.state = PluginHealthState::Failed;
+                health.last_error = Some(format!("executor unavailable: {error}"));
+            }
+        }
         PluginHealthSnapshot {
             name,
             state: health.state,
@@ -269,7 +303,7 @@ impl Drop for PluginRuntime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_ref()
         {
-            pending.cancellation.local.store(true, Ordering::Release);
+            pending.cancellation.cancel();
         }
         self.worker_pool.shutdown();
         self.lifecycle_executor.shutdown();
@@ -301,6 +335,8 @@ mod tests {
         PluginWorkerPool,
         PluginWorkerSubmitError,
     };
+    use PluginAbi::PluginCancellationV2;
+    use super::super::executor::PluginCancellationToken;
     use std::sync::{ Arc, Condvar, Mutex, mpsc };
     use std::time::Duration;
 
@@ -324,15 +360,29 @@ mod tests {
 
     #[test]
     fn cancellation_token_reflects_local_and_parent_cancellation() {
-        let parent = PluginCallTracker::new(None);
-        let child = PluginCallTracker::new(Some(parent.abi_cancellation()));
+        unsafe extern "C" fn is_cancelled(context: *const std::ffi::c_void) -> bool {
+            if context.is_null() {
+                return true;
+            }
+            let token = unsafe { &*(context as *const PluginCancellationToken) };
+            token.is_cancelled()
+        }
 
-        assert!(!(unsafe { parent.abi_cancellation().is_cancelled() }));
-        assert!(!(unsafe { child.abi_cancellation().is_cancelled() }));
+        let parent = PluginCallTracker::new(None);
+        let parent_token = parent.cancellation_token();
+        let parent_abi = PluginCancellationV2 {
+            context: (&parent_token as *const PluginCancellationToken).cast(),
+            is_cancelled,
+        };
+        let child = PluginCallTracker::new(Some(parent_abi));
+        let child_token = child.cancellation_token();
+
+        assert!(!parent_token.is_cancelled());
+        assert!(!child_token.is_cancelled());
 
         assert!(parent.mark_timed_out(|| {}));
-        assert!(unsafe { parent.abi_cancellation().is_cancelled() });
-        assert!(unsafe { child.abi_cancellation().is_cancelled() });
+        assert!(parent_token.is_cancelled());
+        assert!(child_token.is_cancelled());
     }
 
     #[test]

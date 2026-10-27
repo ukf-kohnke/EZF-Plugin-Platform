@@ -1,8 +1,10 @@
 //! Bounded plugin-call execution, timeout accounting, and completion tracking.
 
 use super::*;
+use PluginAbi::PluginCancellationV2;
 use log::LevelFilter;
 use std::sync::mpsc;
+use std::time::Instant;
 
 impl PluginRuntime {
     pub(super) fn call_with_timeout<R, F>(
@@ -13,7 +15,7 @@ impl PluginRuntime {
         -> Result<R, PluginCallFailure>
         where
             R: Send + 'static,
-            F: FnOnce(&PluginRuntime, PluginCancellationV2) -> Result<R, String> + Send + 'static
+            F: FnOnce(&PluginRuntime, PluginCallContext) -> Result<R, String> + Send + 'static
     {
         self.call_with_timeout_accounted_parent(
             operation,
@@ -32,7 +34,7 @@ impl PluginRuntime {
         -> Result<R, PluginCallFailure>
         where
             R: Send + 'static,
-            F: FnOnce(&PluginRuntime, PluginCancellationV2) -> Result<R, String> + Send + 'static
+            F: FnOnce(&PluginRuntime, PluginCallContext) -> Result<R, String> + Send + 'static
     {
         self.call_with_timeout_accounted_parent(
             operation,
@@ -50,7 +52,7 @@ impl PluginRuntime {
         -> Result<R, PluginCallFailure>
         where
             R: Send + 'static,
-            F: FnOnce(&PluginRuntime, PluginCancellationV2) -> Result<R, String> + Send + 'static
+            F: FnOnce(&PluginRuntime, PluginCallContext) -> Result<R, String> + Send + 'static
     {
         self.call_with_timeout_accounted_parent(
             operation,
@@ -70,10 +72,10 @@ impl PluginRuntime {
         -> Result<R, PluginCallFailure>
         where
             R: Send + 'static,
-            F: FnOnce(&PluginRuntime, PluginCancellationV2) -> Result<R, String> + Send + 'static
+            F: FnOnce(&PluginRuntime, PluginCallContext) -> Result<R, String> + Send + 'static
     {
         let tracker = Arc::new(PluginCallTracker::new(parent_cancellation));
-        let permit = match self.gate.try_acquire(tracker.cancellation()) {
+        let permit = match self.gate.try_acquire(tracker.cancellation_source()) {
             Ok(permit) => permit,
             Err(_) => {
                 self.rejected_calls.fetch_add(1, Ordering::Relaxed);
@@ -97,16 +99,18 @@ impl PluginRuntime {
         }
 
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let deadline = Instant::now() + self.config.call_timeout;
+        let call_context = PluginCallContext::new(call_id, deadline, tracker.cancellation_token());
         if accounting == PluginCallAccounting::Observed {
             self.total_calls.fetch_add(1, Ordering::Relaxed);
         }
         let runtime = Arc::clone(self);
         let worker_tracker = Arc::clone(&tracker);
+        let worker_context = call_context;
         let (sender, receiver) = mpsc::sync_channel(1);
         let job: PluginJob = Box::new(move || {
-            let cancellation = worker_tracker.abi_cancellation();
             let result = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| call(&runtime, cancellation))
+                std::panic::AssertUnwindSafe(|| call(&runtime, worker_context))
             );
             let result = match result {
                 Ok(result) => result,

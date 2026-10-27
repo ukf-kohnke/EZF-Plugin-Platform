@@ -1,6 +1,7 @@
 //! Public plugin operations executed through the bounded runtime call path.
 
 use super::*;
+use PluginAbi::PluginCancellationV2;
 use PluginContracts::ApiContract::{
     PLUGIN_OVERLOADED_CODE,
     PLUGIN_OVERLOADED_USER_MESSAGE,
@@ -10,8 +11,8 @@ use PluginContracts::ApiContract::{
 impl PluginRuntime {
     pub(crate) fn name(self: &Arc<Self>) -> Result<String, String> {
         let bytes = self
-            .call_with_timeout_internal("name", |runtime, cancellation| {
-                runtime.with_executor(|executor| executor.name_bytes(cancellation))
+            .call_with_timeout_internal("name", |runtime, context| {
+                runtime.with_executor(|executor| executor.name_bytes(&context))
             })
             .map_err(|error| error.to_string())?;
         let name = serde_json
@@ -23,8 +24,8 @@ impl PluginRuntime {
 
     pub(crate) fn manifest(self: &Arc<Self>) -> Result<PluginManifest, String> {
         let bytes = self
-            .call_with_timeout_internal("manifest", |runtime, cancellation| {
-                runtime.with_executor(|executor| executor.manifest_bytes(cancellation))
+            .call_with_timeout_internal("manifest", |runtime, context| {
+                runtime.with_executor(|executor| executor.manifest_bytes(&context))
             })
             .map_err(|error| error.to_string())?;
         serde_json
@@ -33,8 +34,8 @@ impl PluginRuntime {
     }
 
     pub(crate) fn is_loaded(self: &Arc<Self>) -> Result<bool, String> {
-        self.call_with_timeout("is_loaded", |runtime, cancellation| {
-            runtime.with_executor(|executor| executor.is_loaded(cancellation))
+        self.call_with_timeout("is_loaded", |runtime, context| {
+            runtime.with_executor(|executor| executor.is_loaded(&context))
         }).map_err(|error| error.to_string())
     }
 
@@ -56,11 +57,11 @@ impl PluginRuntime {
         PluginContracts::ApiContract::PluginEndpointResponse,
         PluginContracts::ApiContract::PluginEndpointError
     > {
-        let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
+        let call = move |runtime: &PluginRuntime, context: PluginCallContext| {
             let request_bytes = serde_json
                 ::to_vec(&request)
                 .map_err(|error| format!("failed to encode plugin request: {error}"))?;
-            runtime.with_executor(|executor| executor.handle_endpoint(&request_bytes, cancellation))
+            runtime.with_executor(|executor| executor.handle_endpoint(&request_bytes, &context))
         };
 
         let result = match parent_cancellation {
@@ -99,13 +100,13 @@ impl PluginRuntime {
         context: &PluginContracts::ApiContract::PluginSessionContext,
         parent_cancellation: Option<PluginCancellationV2>
     ) -> Result<(), PluginContracts::ApiContract::PluginLifecycleError> {
-        let context = context.clone();
-        let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
+        let session_context = context.clone();
+        let call = move |runtime: &PluginRuntime, call_context: PluginCallContext| {
             let request_bytes = serde_json
-                ::to_vec(&context)
+                ::to_vec(&session_context)
                 .map_err(|error| format!("failed to encode session lifecycle request: {error}"))?;
             runtime.with_executor(|executor|
-                executor.on_session_closed(&request_bytes, cancellation)
+                executor.on_session_closed(&request_bytes, &call_context)
             )
         };
 
@@ -143,9 +144,9 @@ impl PluginRuntime {
         request_bytes: Vec<u8>,
         parent_cancellation: PluginCancellationV2
     ) -> Result<Vec<u8>, DatabaseContracts::DatabaseError> {
-        let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
+        let call = move |runtime: &PluginRuntime, context: PluginCallContext| {
             runtime.with_executor(|executor|
-                executor.execute_database_bytes(&request_bytes, cancellation)
+                executor.execute_database_bytes(&request_bytes, &context)
             )
         };
 
@@ -180,7 +181,7 @@ impl PluginRuntime {
         request: DatabaseContracts::DatabaseRequest,
         parent_cancellation: Option<PluginCancellationV2>
     ) -> Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> {
-        let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
+        let call = move |runtime: &PluginRuntime, context: PluginCallContext| {
             let request_bytes = serde_json
                 ::to_vec(&request)
                 .map_err(|error| format!("failed to encode database request: {error}"))?;
@@ -188,7 +189,7 @@ impl PluginRuntime {
                 DatabaseContracts::DatabaseResponse,
                 DatabaseContracts::DatabaseError
             > = runtime.with_executor(|executor|
-                executor.execute_database(&request_bytes, cancellation)
+                executor.execute_database(&request_bytes, &context)
             )?;
             response.map_err(|error| format!("plugin database operation failed: {error}"))
         };

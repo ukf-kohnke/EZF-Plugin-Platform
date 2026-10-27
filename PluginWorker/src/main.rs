@@ -1,0 +1,755 @@
+//! First process-backed worker implementation for integration testing.
+//!
+//! This binary intentionally supports only the explicit DevelopmentUnconfined profile. It is
+//! not a production sandbox and must not be treated as one. The initial worker is single-flight:
+//! it executes one plugin callback at a time while Phase 4 proves the real process/ABI/IPC path.
+
+#[cfg(unix)]
+mod unix_worker {
+    use PluginAbi::{
+        AbiSlice,
+        PluginCancellationV2,
+        PluginHostServicesV2,
+        PLUGIN_ABI_VERSION_V2,
+        PLUGIN_STATUS_OK,
+    };
+    use PluginExecutionCore::{ EndpointCallOutput, PluginLoadError };
+    use PluginIpc::{
+        FrameLimits,
+        HelloControl,
+        InitializeControl,
+        InitializedControl,
+        InvokeControl,
+        InvokeOperation,
+        IpcErrorCode,
+        IpcFrame,
+        LoadPluginControl,
+        MessageType,
+        PongControl,
+        ProtocolErrorControl,
+        ResultControl,
+        SandboxReadyControl,
+        ShutdownCompleteControl,
+        DEFAULT_MAX_CONTROL_BYTES,
+        DEFAULT_MAX_PAYLOAD_BYTES,
+        IPC_HEADER_LEN,
+        IPC_MAJOR_VERSION,
+        IPC_MINOR_VERSION,
+    };
+    use std::ffi::c_void;
+    use std::os::unix::net::UnixStream;
+    use std::path::{ Path, PathBuf };
+    use std::sync::atomic::{ AtomicBool, Ordering };
+    use std::time::Instant;
+
+    const WORKER_BUILD: &str = env!("CARGO_PKG_VERSION");
+
+    pub fn main_entry() -> Result<(), String> {
+        let (socket_path, allow_unconfined) = parse_args()?;
+        if !allow_unconfined {
+            return Err(
+                "this integration worker only runs when --allow-unconfined is explicit; no OS sandbox is implemented".into()
+            );
+        }
+        let mut stream = UnixStream::connect(&socket_path).map_err(|error|
+            format!("could not connect to private IPC socket {}: {error}", socket_path.display())
+        )?;
+        stream.set_read_timeout(None).map_err(|e| format!("could not configure IPC socket: {e}"))?;
+        stream.set_write_timeout(None).map_err(|e| format!("could not configure IPC socket: {e}"))?;
+        serve(&mut stream, allow_unconfined)
+    }
+
+    fn parse_args() -> Result<(PathBuf, bool), String> {
+        let mut args = std::env::args_os().skip(1);
+        let mut socket = None;
+        let mut allow_unconfined = false;
+        while let Some(arg) = args.next() {
+            if arg == "--ipc-socket" {
+                let value = args.next().ok_or("--ipc-socket requires a path")?;
+                socket = Some(PathBuf::from(value));
+            } else if arg == "--allow-unconfined" {
+                allow_unconfined = true;
+            } else if arg == "--help" || arg == "-h" {
+                println!("ezf-plugin-worker --ipc-socket <absolute-path> --allow-unconfined");
+                std::process::exit(0);
+            } else {
+                return Err(format!("unknown argument: {}", arg.to_string_lossy()));
+            }
+        }
+        let socket = socket.ok_or("missing required --ipc-socket <path>")?;
+        if !socket.is_absolute() {
+            return Err("IPC socket path must be absolute".into());
+        }
+        Ok((socket, allow_unconfined))
+    }
+
+    fn serve(stream: &mut UnixStream, allow_unconfined: bool) -> Result<(), String> {
+        let mut limits = FrameLimits::default();
+        let mut core: Option<PluginExecutionCore::PluginExecutionCore> = None;
+        let mut initialized: Option<InitializeControl> = None;
+        let mut on_unload_completed = false;
+        let mut destroyed = false;
+        let started_at = Instant::now();
+
+        let result = (|| {
+            // Phase 4 handshake. No library is loaded until the host explicitly selects the
+            // development-only unconfined profile and sends LoadPlugin.
+            let hello = read_frame(stream, limits)?;
+            if hello.message_type != MessageType::Hello {
+                send_protocol_error(
+                    stream,
+                    hello.request_id,
+                    IpcErrorCode::UnsupportedProtocol,
+                    "expected Hello as the first supervisor message",
+                    limits
+                )?;
+                return Err("expected Hello as the first supervisor message".into());
+            }
+            let hello_control: HelloControl = decode_control(&hello)?;
+            if
+                hello_control.protocol_major != IPC_MAJOR_VERSION ||
+                hello_control.protocol_minor != IPC_MINOR_VERSION
+            {
+                send_protocol_error(
+                    stream,
+                    hello.request_id,
+                    IpcErrorCode::UnsupportedProtocol,
+                    "host and worker IPC versions do not match",
+                    limits
+                )?;
+                return Err("host and worker IPC versions do not match".into());
+            }
+            let response = HelloControl {
+                protocol_major: IPC_MAJOR_VERSION,
+                protocol_minor: IPC_MINOR_VERSION,
+                worker_build: format!("ezf-plugin-worker/{WORKER_BUILD}"),
+            };
+            send_control(
+                stream,
+                MessageType::Hello,
+                hello.request_id,
+                &response,
+                Vec::new(),
+                limits
+            )?;
+
+            let init_frame = read_frame(stream, limits)?;
+            if init_frame.message_type != MessageType::Initialize {
+                send_protocol_error(
+                    stream,
+                    init_frame.request_id,
+                    IpcErrorCode::ProtocolViolation,
+                    "expected Initialize after Hello",
+                    limits
+                )?;
+                return Err("expected Initialize after Hello".into());
+            }
+            let init: InitializeControl = decode_control(&init_frame)?;
+            if init.protocol_major != IPC_MAJOR_VERSION || init.protocol_minor != IPC_MINOR_VERSION {
+                send_protocol_error(
+                    stream,
+                    init_frame.request_id,
+                    IpcErrorCode::UnsupportedProtocol,
+                    "unsupported IPC version in Initialize",
+                    limits
+                )?;
+                return Err("unsupported IPC version in Initialize".into());
+            }
+            if
+                !allow_unconfined ||
+                init.sandbox_profile != PluginIpc::SandboxProfile::DevelopmentUnconfined
+            {
+                send_protocol_error(
+                    stream,
+                    init_frame.request_id,
+                    IpcErrorCode::SandboxSetupFailed,
+                    "this worker build only supports explicit DevelopmentUnconfined integration mode",
+                    limits
+                )?;
+                return Err("this worker build only supports DevelopmentUnconfined".into());
+            }
+            if init.runtime_limits.max_concurrent_calls == 0 {
+                send_protocol_error(
+                    stream,
+                    init_frame.request_id,
+                    IpcErrorCode::ResourceLimitExceeded,
+                    "max_concurrent_calls must be at least one",
+                    limits
+                )?;
+                return Err("max_concurrent_calls must be at least one".into());
+            }
+            // The host may tighten the default protocol limit, but cannot increase it through
+            // configuration. Subsequent frames are checked against this negotiated maximum.
+            limits.max_payload_bytes = (init.runtime_limits.max_payload_bytes as usize).min(
+                DEFAULT_MAX_PAYLOAD_BYTES
+            );
+            limits.max_frame_bytes = IPC_HEADER_LEN.saturating_add(
+                DEFAULT_MAX_CONTROL_BYTES
+            ).saturating_add(limits.max_payload_bytes);
+            let sandbox = SandboxReadyControl {
+                profile: PluginIpc::SandboxProfile::DevelopmentUnconfined,
+                sandbox_enforced: false,
+                active_features: Vec::new(),
+                missing_features: vec!["os_sandbox_not_implemented_in_phase_4".to_owned()],
+            };
+            send_control(
+                stream,
+                MessageType::SandboxReady,
+                init_frame.request_id,
+                &sandbox,
+                Vec::new(),
+                limits
+            )?;
+            initialized = Some(init);
+
+            let load_frame = read_frame(stream, limits)?;
+            if load_frame.message_type != MessageType::LoadPlugin {
+                send_protocol_error(
+                    stream,
+                    load_frame.request_id,
+                    IpcErrorCode::ProtocolViolation,
+                    "expected LoadPlugin after SandboxReady",
+                    limits
+                )?;
+                return Err("expected LoadPlugin after SandboxReady".into());
+            }
+            let load: LoadPluginControl = decode_control(&load_frame)?;
+            if load.expected_abi_version != PLUGIN_ABI_VERSION_V2 {
+                send_protocol_error(
+                    stream,
+                    load_frame.request_id,
+                    IpcErrorCode::UnsupportedProtocol,
+                    "requested plugin ABI version is not supported",
+                    limits
+                )?;
+                return Err("requested plugin ABI version is not supported".into());
+            }
+            let init = initialized.as_ref().ok_or("worker initialization state is missing")?;
+            if init.allowed_capabilities.contains(&PluginIpc::CapabilityKind::DatabaseExecute) {
+                send_protocol_error(
+                    stream,
+                    load_frame.request_id,
+                    IpcErrorCode::CapabilityDenied,
+                    "database capability broker is not implemented in phase 4",
+                    limits
+                )?;
+                return Err(
+                    "DatabaseExecute requested before the capability broker is implemented".into()
+                );
+            }
+            let plugin_path = PathBuf::from(&init.plugin_path);
+            if !plugin_path.is_absolute() || !plugin_path.is_file() {
+                send_protocol_error(
+                    stream,
+                    load_frame.request_id,
+                    IpcErrorCode::PluginError,
+                    "plugin_path must be an absolute path to an existing library",
+                    limits
+                )?;
+                return Err("plugin_path must be an absolute path to an existing library".into());
+            }
+            let plugin_directory = if init.plugin_directory.is_empty() {
+                plugin_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            } else {
+                PathBuf::from(&init.plugin_directory)
+            };
+            if !plugin_directory.is_absolute() {
+                return Err("plugin_directory must be an absolute path".into());
+            }
+            let directory_bytes = plugin_directory.to_string_lossy().into_owned().into_bytes();
+            let directory_slice = AbiSlice::from_bytes(&directory_bytes);
+            // Log is local to the worker for this phase; database execution remains unavailable.
+            let host_services = PluginHostServicesV2::new(worker_log, None, None, directory_slice);
+            let loaded = PluginExecutionCore::PluginExecutionCore::load(
+                &plugin_path,
+                &host_services
+            ).map_err(|error| {
+                match error {
+                    PluginLoadError::Library(error) =>
+                        format!("failed to load plugin library: {error}"),
+                    PluginLoadError::Constructor(error) =>
+                        format!("failed to load InstantiateV2: {error}"),
+                }
+            });
+            let loaded = match loaded {
+                Ok(core) => core,
+                Err(message) => {
+                    send_protocol_error(
+                        stream,
+                        load_frame.request_id,
+                        IpcErrorCode::PluginError,
+                        &message,
+                        limits
+                    )?;
+                    return Err(message);
+                }
+            };
+            if let Err(message) = loaded.validate() {
+                // Validation failed, so callback pointers may be invalid. Do not call lifecycle
+                // functions through an ABI layout that has just failed validation, and do not
+                // dlclose the potentially malformed library while unwinding this scope.
+                send_protocol_error(
+                    stream,
+                    load_frame.request_id,
+                    IpcErrorCode::ProtocolViolation,
+                    &message,
+                    limits
+                )?;
+                std::process::exit(3);
+            }
+            let no_cancel = AtomicBool::new(false);
+            let cancellation = cancellation_for(&no_cancel);
+            let name_bytes = match loaded.name_bytes(cancellation) {
+                Ok(bytes) => bytes,
+                Err(message) => {
+                    loaded.emergency_shutdown();
+                    send_protocol_error(
+                        stream,
+                        load_frame.request_id,
+                        IpcErrorCode::PluginError,
+                        &message,
+                        limits
+                    )?;
+                    return Err(message);
+                }
+            };
+            let plugin_name: String = match serde_json::from_slice(&name_bytes) {
+                Ok(name) => name,
+                Err(error) => {
+                    loaded.emergency_shutdown();
+                    let message = format!("plugin name was not a JSON string: {error}");
+                    send_protocol_error(
+                        stream,
+                        load_frame.request_id,
+                        IpcErrorCode::PluginError,
+                        &message,
+                        limits
+                    )?;
+                    return Err(message);
+                }
+            };
+            let manifest_bytes = match loaded.manifest_bytes(cancellation) {
+                Ok(bytes) => bytes,
+                Err(message) => {
+                    loaded.emergency_shutdown();
+                    send_protocol_error(
+                        stream,
+                        load_frame.request_id,
+                        IpcErrorCode::PluginError,
+                        &message,
+                        limits
+                    )?;
+                    return Err(message);
+                }
+            };
+            let manifest_json = match String::from_utf8(manifest_bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    loaded.emergency_shutdown();
+                    let message = format!("plugin manifest is not UTF-8: {error}");
+                    send_protocol_error(
+                        stream,
+                        load_frame.request_id,
+                        IpcErrorCode::PluginError,
+                        &message,
+                        limits
+                    )?;
+                    return Err(message);
+                }
+            };
+            let manifest_value: serde_json::Value = match serde_json::from_str(&manifest_json) {
+                Ok(value) => value,
+                Err(error) => {
+                    loaded.emergency_shutdown();
+                    let message = format!("plugin manifest is not valid JSON: {error}");
+                    send_protocol_error(
+                        stream,
+                        load_frame.request_id,
+                        IpcErrorCode::PluginError,
+                        &message,
+                        limits
+                    )?;
+                    return Err(message);
+                }
+            };
+            let manifest_name = manifest_value.get("name").and_then(|value| value.as_str());
+            if manifest_name != Some(plugin_name.as_str()) {
+                loaded.emergency_shutdown();
+                let message = "plugin name and manifest name do not match";
+                send_protocol_error(
+                    stream,
+                    load_frame.request_id,
+                    IpcErrorCode::PluginError,
+                    message,
+                    limits
+                )?;
+                return Err(message.into());
+            }
+            let response = InitializedControl {
+                plugin_name,
+                manifest_json,
+                abi_version: PLUGIN_ABI_VERSION_V2,
+            };
+            core = Some(loaded);
+            send_control(
+                stream,
+                MessageType::Initialized,
+                load_frame.request_id,
+                &response,
+                Vec::new(),
+                limits
+            )?;
+
+            loop {
+                let frame = read_frame(stream, limits)?;
+                match frame.message_type {
+                    MessageType::Invoke => {
+                        let control: InvokeControl = decode_control(&frame)?;
+                        let destroys_instance = control.operation == InvokeOperation::Destroy;
+                        let calls_unload = control.operation == InvokeOperation::OnUnload;
+                        let result = invoke(core.as_ref(), control, &frame.payload);
+                        if calls_unload && result.is_ok() {
+                            on_unload_completed = true;
+                        }
+                        if destroys_instance && result.is_ok() {
+                            // destroy() may free the ABI instance. Drop the core only after the
+                            // callback returns and never call into that instance again.
+                            core = None;
+                            destroyed = true;
+                        }
+                        match result {
+                            Ok(payload) =>
+                                send_control(
+                                    stream,
+                                    MessageType::Result,
+                                    frame.request_id,
+                                    &(ResultControl {
+                                        success: true,
+                                        error_code: None,
+                                        error_message: None,
+                                    }),
+                                    payload,
+                                    limits
+                                )?,
+                            Err((code, message, payload)) =>
+                                send_control(
+                                    stream,
+                                    MessageType::Result,
+                                    frame.request_id,
+                                    &(ResultControl {
+                                        success: false,
+                                        error_code: Some(code),
+                                        error_message: Some(message),
+                                    }),
+                                    payload,
+                                    limits
+                                )?,
+                        }
+                    }
+                    MessageType::HealthProbe => {
+                        let probe: PluginIpc::HealthProbeControl = decode_control(&frame)?;
+                        send_control(
+                            stream,
+                            MessageType::Pong,
+                            frame.request_id,
+                            &(PongControl {
+                                probe_id: probe.probe_id,
+                                worker_uptime_ms: started_at.elapsed().as_millis() as u64,
+                            }),
+                            Vec::new(),
+                            limits
+                        )?;
+                    }
+                    MessageType::Cancel => {
+                        // This first worker is single-flight and reads Cancel only between calls.
+                        // Actual in-flight cancellation is added with the worker execution pool.
+                        eprintln!(
+                            "ezf-plugin-worker: ignored stale/idle Cancel request_id={}",
+                            frame.request_id
+                        );
+                    }
+                    MessageType::Shutdown => {
+                        let cleanup = if let Some(loaded) = core.as_ref() {
+                            let cancellation = never_cancelled_descriptor();
+                            let unload_result = if on_unload_completed {
+                                Ok(())
+                            } else {
+                                match loaded.on_unload(cancellation) {
+                                    Ok(PLUGIN_STATUS_OK) => {
+                                        on_unload_completed = true;
+                                        Ok(())
+                                    }
+                                    Ok(status) =>
+                                        Err(
+                                            format!("plugin on_unload failed with status {status}")
+                                        ),
+                                    Err(error) => Err(format!("plugin on_unload failed: {error}")),
+                                }
+                            };
+                            match unload_result {
+                                Ok(()) =>
+                                    match loaded.destroy(cancellation) {
+                                        Ok(PLUGIN_STATUS_OK) => {
+                                            destroyed = true;
+                                            Ok(())
+                                        }
+                                        Ok(status) =>
+                                            Err(
+                                                format!(
+                                                    "plugin destroy failed with status {status}"
+                                                )
+                                            ),
+                                        Err(error) =>
+                                            Err(format!("plugin destroy failed: {error}")),
+                                    }
+                                Err(error) => Err(error),
+                            }
+                        } else if destroyed && on_unload_completed {
+                            Ok(())
+                        } else if destroyed {
+                            Err(
+                                "plugin instance was destroyed without a successful on_unload".into()
+                            )
+                        } else {
+                            Err("plugin is not loaded".into())
+                        };
+                        let graceful = cleanup.is_ok();
+                        let message = cleanup.err();
+                        send_control(
+                            stream,
+                            MessageType::ShutdownComplete,
+                            frame.request_id,
+                            &(ShutdownCompleteControl { graceful, message }),
+                            Vec::new(),
+                            limits
+                        )?;
+                        if graceful {
+                            // destroy() may have invalidated the opaque ABI instance; only now
+                            // drop the wrapper and its library after both callbacks succeeded.
+                            core = None;
+                            return Ok(());
+                        }
+                        // Do not dlclose a library whose lifecycle callback failed. Exit the child
+                        // directly so OS process teardown reclaims all plugin resources together.
+                        std::process::exit(2);
+                    }
+                    MessageType::CapabilityResult => {
+                        return Err(
+                            "unexpected CapabilityResult: no capability request is pending".into()
+                        );
+                    }
+                    _ => {
+                        send_protocol_error(
+                            stream,
+                            frame.request_id,
+                            IpcErrorCode::ProtocolViolation,
+                            "message type is not valid in the worker request loop",
+                            limits
+                        )?;
+                        return Err(format!("unexpected message type {:?}", frame.message_type));
+                    }
+                }
+            }
+        })();
+
+        if result.is_err() {
+            if let Some(loaded) = core.as_ref() {
+                loaded.emergency_shutdown();
+            }
+        }
+        result
+    }
+
+    fn invoke(
+        core: Option<&PluginExecutionCore::PluginExecutionCore>,
+        control: InvokeControl,
+        payload: &[u8]
+    ) -> Result<Vec<u8>, (IpcErrorCode, String, Vec<u8>)> {
+        if control.remaining_budget_ms == 0 {
+            return Err((
+                IpcErrorCode::Cancelled,
+                "request budget expired before execution".into(),
+                Vec::new(),
+            ));
+        }
+        let core = core.ok_or_else(|| (
+            IpcErrorCode::WorkerExited,
+            "plugin is not loaded".into(),
+            Vec::new(),
+        ))?;
+        let cancelled = AtomicBool::new(false);
+        let cancellation = cancellation_for(&cancelled);
+        match control.operation {
+            InvokeOperation::Name => core.name_bytes(cancellation).map_err(plugin_error),
+            InvokeOperation::Manifest => core.manifest_bytes(cancellation).map_err(plugin_error),
+            InvokeOperation::IsLoaded =>
+                core
+                    .is_loaded(cancellation)
+                    .map(|loaded| serde_json::to_vec(&loaded).unwrap_or_else(|_| b"false".to_vec()))
+                    .map_err(plugin_error),
+            InvokeOperation::HandleEndpoint =>
+                match core.handle_endpoint(payload, cancellation).map_err(plugin_error)? {
+                    EndpointCallOutput::Serialized(bytes) => Ok(bytes),
+                    EndpointCallOutput::Raw { metadata, body } =>
+                        reassemble_raw_endpoint(metadata, body).map_err(plugin_error),
+                }
+            InvokeOperation::ExecuteDatabase =>
+                core.execute_database_bytes(payload, cancellation).map_err(plugin_error),
+            InvokeOperation::SessionClosed =>
+                core.on_session_closed_bytes(payload, cancellation).map_err(plugin_error),
+            InvokeOperation::OnUnload =>
+                core
+                    .on_unload(cancellation)
+                    .map_err(plugin_error)
+                    .and_then(|status| {
+                        if status == PLUGIN_STATUS_OK {
+                            Ok(serde_json::to_vec(&status).unwrap_or_default())
+                        } else {
+                            Err((
+                                IpcErrorCode::PluginError,
+                                format!("plugin on_unload failed with status {status}"),
+                                serde_json::to_vec(&status).unwrap_or_default(),
+                            ))
+                        }
+                    }),
+            InvokeOperation::Destroy => {
+                let status = core.destroy(cancellation).map_err(plugin_error)?;
+                if status == PLUGIN_STATUS_OK {
+                    Ok(serde_json::to_vec(&status).unwrap_or_default())
+                } else {
+                    Err((
+                        IpcErrorCode::PluginError,
+                        format!("plugin destroy failed with status {status}"),
+                        serde_json::to_vec(&status).unwrap_or_default(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn reassemble_raw_endpoint(metadata: Vec<u8>, body: Vec<u8>) -> Result<Vec<u8>, String> {
+        let mut value: serde_json::Value = serde_json
+            ::from_slice(&metadata)
+            .map_err(|error| format!("invalid raw endpoint metadata JSON: {error}"))?;
+        let object = value.as_object_mut().ok_or("raw endpoint metadata must be a JSON object")?;
+        if let Some(success) = object.get_mut("Ok") {
+            let response = success
+                .as_object_mut()
+                .ok_or("raw endpoint Ok value must be an object")?;
+            let current_body = response
+                .get("body")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !current_body.is_empty() {
+                return Err(
+                    "raw endpoint returned a body in both metadata and binary buffer".into()
+                );
+            }
+            let body_value = match std::str::from_utf8(&body) {
+                Ok(text) => serde_json::Value::String(text.to_owned()),
+                Err(_) =>
+                    serde_json::Value::Array(
+                        body.iter().copied().map(serde_json::Value::from).collect()
+                    ),
+            };
+            response.insert("body".to_owned(), body_value);
+        } else if !body.is_empty() {
+            return Err("raw endpoint returned a binary body alongside an error".into());
+        }
+        serde_json
+            ::to_vec(&value)
+            .map_err(|error| format!("could not encode raw endpoint response: {error}"))
+    }
+
+    fn plugin_error(message: String) -> (IpcErrorCode, String, Vec<u8>) {
+        (IpcErrorCode::PluginError, message, Vec::new())
+    }
+
+    fn cancellation_for(cancelled: &AtomicBool) -> PluginCancellationV2 {
+        PluginCancellationV2 {
+            context: (cancelled as *const AtomicBool).cast(),
+            is_cancelled: is_cancelled,
+        }
+    }
+
+    fn never_cancelled_descriptor() -> PluginCancellationV2 {
+        // `context` is only inspected during this synchronous call. The pointer must remain valid;
+        // the caller uses this helper only for immediate lifecycle callback invocation.
+        static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+        cancellation_for(&NEVER_CANCELLED)
+    }
+
+    unsafe extern "C" fn is_cancelled(context: *const c_void) -> bool {
+        if context.is_null() {
+            return true;
+        }
+        let flag = unsafe { &*(context as *const AtomicBool) };
+        flag.load(Ordering::Acquire)
+    }
+
+    unsafe extern "C" fn worker_log(level: u8, message: AbiSlice) {
+        let text = (unsafe { message.to_vec() })
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|| "<plugin supplied invalid log buffer>".to_owned());
+        eprintln!("ezf-plugin-worker plugin-log[{level}]: {text}");
+    }
+
+    fn read_frame(stream: &mut UnixStream, limits: FrameLimits) -> Result<IpcFrame, String> {
+        IpcFrame::read_from(stream, limits).map_err(|error| error.to_string())
+    }
+
+    fn decode_control<T: serde::de::DeserializeOwned>(frame: &IpcFrame) -> Result<T, String> {
+        frame.decode_control().map_err(|error| error.to_string())
+    }
+
+    fn send_control<T: serde::Serialize>(
+        stream: &mut UnixStream,
+        message_type: MessageType,
+        request_id: u64,
+        control: &T,
+        payload: Vec<u8>,
+        limits: FrameLimits
+    ) -> Result<(), String> {
+        let mut frame = IpcFrame::with_control(message_type, request_id, control).map_err(|error|
+            error.to_string()
+        )?;
+        frame.payload = payload;
+        frame.write_to(stream, limits).map_err(|error| error.to_string())
+    }
+
+    fn send_protocol_error(
+        stream: &mut UnixStream,
+        request_id: u64,
+        code: IpcErrorCode,
+        message: &str,
+        limits: FrameLimits
+    ) -> Result<(), String> {
+        send_control(
+            stream,
+            MessageType::ProtocolError,
+            request_id,
+            &(ProtocolErrorControl { code, message: message.to_owned() }),
+            Vec::new(),
+            limits
+        )
+    }
+}
+
+#[cfg(unix)]
+fn main() {
+    if let Err(error) = unix_worker::main_entry() {
+        eprintln!("ezf-plugin-worker: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "ezf-plugin-worker currently supports Unix-domain sockets only; no Windows transport is implemented"
+    );
+    std::process::exit(2);
+}

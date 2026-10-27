@@ -1,0 +1,10 @@
+[package]
+name = "PluginIpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Versioned and bounded IPC protocol framing for EZF plugin workers"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

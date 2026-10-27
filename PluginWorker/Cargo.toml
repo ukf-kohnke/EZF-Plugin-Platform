@@ -1,0 +1,20 @@
+[package]
+name = "PluginWorker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unconfined integration-test worker for EZF plugin process execution"
+publish = false
+
+[[bin]]
+name = "ezf-plugin-worker"
+path = "src/main.rs"
+
+[dependencies]
+PluginIpc = { path = "../PluginIpc" }
+PluginHost = { path = "../PluginHost" }
+PluginAbi = { path = "../Plugin-SDK/PluginAbi" }
+PluginContracts = { path = "../Plugin-SDK/PluginContracts" }
+PluginExecutionCore = { path = "../PluginExecutionCore" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

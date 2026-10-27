@@ -1,27 +1,16 @@
 //! Admission, cancellation, and caller/worker call-lifecycle state.
+use super::super::executor::{
+    PluginCancellationLocalState,
+    PluginCancellationSource,
+    PluginCancellationToken,
+};
 use PluginAbi::PluginCancellationV2;
-use std::sync::{ Arc, Condvar, Mutex, Weak, atomic::{ AtomicBool, Ordering } };
+use std::sync::{ Arc, Condvar, Mutex, Weak };
 use std::time::{ Duration, Instant };
-
-unsafe extern "C" fn plugin_is_cancelled(context: *const std::ffi::c_void) -> bool {
-    if context.is_null() {
-        return true;
-    }
-    let state = unsafe { &*(context as *const PluginCancellationState) };
-    if state.local.load(Ordering::Acquire) {
-        return true;
-    }
-    state.parent.is_some_and(|parent| unsafe { parent.is_cancelled() })
-}
-
-pub(super) struct PluginCancellationState {
-    pub(super) local: AtomicBool,
-    pub(super) parent: Option<PluginCancellationV2>,
-}
 
 pub(super) struct PluginCallGate {
     state: Mutex<usize>,
-    active_cancellations: Mutex<Vec<Weak<PluginCancellationState>>>,
+    active_cancellations: Mutex<Vec<Weak<PluginCancellationLocalState>>>,
     max_concurrent_calls: usize,
     idle: Condvar,
 }
@@ -41,7 +30,7 @@ impl PluginCallGate {
     /// timeout after admission.
     pub(super) fn try_acquire(
         self: &Arc<Self>,
-        cancellation: Arc<PluginCancellationState>
+        cancellation: PluginCancellationSource
     ) -> Result<PluginCallPermit, ()> {
         let mut active = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if *active >= self.max_concurrent_calls {
@@ -51,7 +40,7 @@ impl PluginCallGate {
         self.active_cancellations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(Arc::downgrade(&cancellation));
+            .push(cancellation.weak_local_state());
         Ok(PluginCallPermit {
             gate: Arc::clone(self),
             cancellation,
@@ -69,10 +58,10 @@ impl PluginCallGate {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cancellations.retain(|weak| {
-            let Some(flag) = weak.upgrade() else {
+            let Some(local_state) = weak.upgrade() else {
                 return false;
             };
-            flag.local.store(true, Ordering::Release);
+            local_state.cancel();
             true
         });
     }
@@ -99,7 +88,7 @@ impl PluginCallGate {
 
 pub(super) struct PluginCallPermit {
     gate: Arc<PluginCallGate>,
-    cancellation: Arc<PluginCancellationState>,
+    cancellation: PluginCancellationSource,
 }
 
 impl Drop for PluginCallPermit {
@@ -113,11 +102,12 @@ impl Drop for PluginCallPermit {
         }
         drop(active);
 
+        let local_state = self.cancellation.local_state();
         let mut cancellations = self.gate.active_cancellations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cancellations.retain(|weak| {
-            weak.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, &self.cancellation))
+            weak.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, &local_state))
         });
     }
 }
@@ -131,29 +121,28 @@ enum PluginCallLifecycleState {
 
 pub(super) struct PluginCallTracker {
     state: Mutex<PluginCallLifecycleState>,
-    cancellation: Arc<PluginCancellationState>,
+    cancellation: PluginCancellationSource,
 }
 
 impl PluginCallTracker {
     pub(super) fn new(parent: Option<PluginCancellationV2>) -> Self {
+        let parent_check = parent.map(|parent| {
+            Arc::new(move || unsafe { parent.is_cancelled() }) as Arc<
+                dyn (Fn() -> bool) + Send + Sync
+            >
+        });
         Self {
             state: Mutex::new(PluginCallLifecycleState::Pending),
-            cancellation: Arc::new(PluginCancellationState {
-                local: AtomicBool::new(false),
-                parent,
-            }),
+            cancellation: PluginCancellationSource::new(parent_check),
         }
     }
 
-    pub(super) fn cancellation(&self) -> Arc<PluginCancellationState> {
-        Arc::clone(&self.cancellation)
+    pub(super) fn cancellation_source(&self) -> PluginCancellationSource {
+        self.cancellation.clone()
     }
 
-    pub(super) fn abi_cancellation(&self) -> PluginCancellationV2 {
-        PluginCancellationV2 {
-            context: Arc::as_ptr(&self.cancellation).cast(),
-            is_cancelled: plugin_is_cancelled,
-        }
+    pub(super) fn cancellation_token(&self) -> PluginCancellationToken {
+        self.cancellation.token()
     }
 
     /// Marks the caller-visible timeout and requests cooperative cancellation atomically with the
@@ -163,7 +152,7 @@ impl PluginCallTracker {
         if *state != PluginCallLifecycleState::Pending {
             return false;
         }
-        self.cancellation.local.store(true, Ordering::Release);
+        self.cancellation.cancel();
         *state = PluginCallLifecycleState::TimedOut;
         on_marked();
         true

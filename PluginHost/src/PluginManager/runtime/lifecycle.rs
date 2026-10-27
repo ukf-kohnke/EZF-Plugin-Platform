@@ -1,7 +1,6 @@
 //! Quiescing, lifecycle callbacks, unload, and retry state transitions.
 
 use super::*;
-use PluginAbi::{ PluginDestroyFnV2, PluginLoadFnV2 };
 use std::{ sync::mpsc, time::Instant };
 
 unsafe extern "C" fn plugin_is_cancelled(context: *const std::ffi::c_void) -> bool {
@@ -19,8 +18,7 @@ impl PluginRuntime {
     fn start_lifecycle_operation(
         &self,
         operation: PluginLifecycleOperation,
-        callback: PluginLoadFnV2,
-        context: *mut std::ffi::c_void
+        executor: Arc<dyn PluginExecutor>
     ) -> Result<(), String> {
         let mut pending = self.pending_lifecycle
             .lock()
@@ -37,55 +35,28 @@ impl PluginRuntime {
             context: Arc::as_ptr(&cancellation).cast(),
             is_cancelled: plugin_is_cancelled,
         };
-        let context = context as usize;
+        // Keep the cancellation state alive for the full callback even if the caller times out.
+        let cancellation_guard = Arc::clone(&cancellation);
         let receiver = self.lifecycle_executor.submit(
             Box::new(move || {
-                let context = context as *mut std::ffi::c_void;
-                Ok(unsafe { callback(context, callback_cancellation) })
+                let _cancellation_guard = cancellation_guard;
+                match operation {
+                    PluginLifecycleOperation::OnUnload => executor.on_unload(callback_cancellation),
+                    PluginLifecycleOperation::Destroy => executor.destroy(callback_cancellation),
+                }
             })
         )?;
         *pending = Some(PendingPluginLifecycle { operation, receiver, cancellation });
         Ok(())
     }
 
-    fn start_destroy_operation(
-        &self,
-        callback: PluginDestroyFnV2,
-        instance: *mut PluginInstanceV2
-    ) -> Result<(), String> {
-        let mut pending = self.pending_lifecycle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pending.is_some() {
-            return Err("a plugin lifecycle callback is already in progress".to_owned());
-        }
-
-        let cancellation = Arc::new(PluginCancellationState {
-            local: AtomicBool::new(false),
-            parent: None,
-        });
-        let callback_cancellation = PluginCancellationV2 {
-            context: Arc::as_ptr(&cancellation).cast(),
-            is_cancelled: plugin_is_cancelled,
-        };
-        let instance = instance as usize;
-        let receiver = self.lifecycle_executor.submit(
-            Box::new(move || {
-                let instance = instance as *mut PluginInstanceV2;
-                Ok(unsafe { callback(instance, callback_cancellation) })
-            })
-        )?;
-        *pending = Some(PendingPluginLifecycle {
-            operation: PluginLifecycleOperation::Destroy,
-            receiver,
-            cancellation,
-        });
-        Ok(())
+    fn start_destroy_operation(&self, executor: Arc<dyn PluginExecutor>) -> Result<(), String> {
+        self.start_lifecycle_operation(PluginLifecycleOperation::Destroy, executor)
     }
 
     fn wait_for_pending_lifecycle(
         &self
-    ) -> Result<Option<(PluginLifecycleOperation, Result<i32, String>)>, bool> {
+    ) -> Result<Option<(PluginLifecycleOperation, Result<PluginLifecycleStatus, String>)>, bool> {
         let pending = {
             let mut pending = self.pending_lifecycle
                 .lock()
@@ -117,20 +88,17 @@ impl PluginRuntime {
         }
     }
 
-    fn validate_lifecycle_instance(
-        &self
-    ) -> Result<(*mut PluginInstanceV2, PluginLoadFnV2, PluginDestroyFnV2), String> {
-        let state = self.read_state();
-        let instance = state.instance.ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
-        let instance_ref = unsafe { &*instance };
-        if instance_ref.vtable.is_null() || instance_ref.context.is_null() {
-            return Err("plugin runtime contains invalid ABI pointers".to_owned());
+    fn validate_lifecycle_executor(&self) -> Result<Arc<dyn PluginExecutor>, String> {
+        let state = self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.destroyed {
+            return Err("plugin runtime is unloaded".to_owned());
         }
-        let vtable = unsafe { &*instance_ref.vtable };
-        if !vtable.is_compatible() {
-            return Err("plugin runtime contains an incompatible ABI vtable".to_owned());
-        }
-        Ok((instance, vtable.on_unload, vtable.destroy))
+        let executor = state.executor
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
+        executor.validate_for_lifecycle()?;
+        Ok(executor)
     }
 
     fn complete_destroy_success(&self) -> bool {
@@ -138,9 +106,12 @@ impl PluginRuntime {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if state.instance.take().is_none() {
+        if state.executor.is_none() || state.destroyed {
             return false;
         }
+        // Mark the opaque instance as destroyed, but retain the executor/library image until the
+        // final PluginRuntime reference is dropped, matching the previous unload behavior.
+        state.destroyed = true;
         self.set_health(PluginHealthState::Unloaded);
         self.unloading.store(false, Ordering::Release);
         self.worker_pool.shutdown();
@@ -151,12 +122,8 @@ impl PluginRuntime {
     /// Runs or retries the destroy phase after `on_unload` has completed successfully.
     /// Keeping the phases separate ensures a timeout or destroy failure never causes a
     /// completed `on_unload` callback to be invoked a second time.
-    fn finish_destroy_lifecycle(
-        &self,
-        instance: *mut PluginInstanceV2,
-        destroy: PluginDestroyFnV2
-    ) -> bool {
-        if let Err(message) = self.start_destroy_operation(destroy, instance) {
+    fn finish_destroy_lifecycle(&self, executor: Arc<dyn PluginExecutor>) -> bool {
+        if let Err(message) = self.start_destroy_operation(executor) {
             self.unloading.store(false, Ordering::Release);
             self.set_health_error(PluginHealthState::Failed, message);
             return false;
@@ -171,10 +138,13 @@ impl PluginRuntime {
                 self.set_health_error(PluginHealthState::Stopping, message);
                 false
             }
-            Ok(Some((PluginLifecycleOperation::Destroy, Ok(status)))) if
-                status == PLUGIN_STATUS_OK
-            => self.complete_destroy_success(),
-            Ok(Some((PluginLifecycleOperation::Destroy, Ok(status)))) => {
+            Ok(Some((PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Success)))) =>
+                self.complete_destroy_success(),
+            Ok(
+                Some(
+                    (PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Failed(status))),
+                ),
+            ) => {
                 self.unloading.store(false, Ordering::Release);
                 self.set_health_error(
                     PluginHealthState::Failed,
@@ -198,7 +168,19 @@ impl PluginRuntime {
                 );
                 false
             }
-            Ok(Some((PluginLifecycleOperation::OnUnload, Ok(status)))) => {
+            Ok(Some((PluginLifecycleOperation::OnUnload, Ok(PluginLifecycleStatus::Success)))) => {
+                self.unloading.store(false, Ordering::Release);
+                self.set_health_error(
+                    PluginHealthState::Failed,
+                    "unexpected on_unload result while waiting for plugin destroy: 0"
+                );
+                false
+            }
+            Ok(
+                Some(
+                    (PluginLifecycleOperation::OnUnload, Ok(PluginLifecycleStatus::Failed(status))),
+                ),
+            ) => {
                 self.unloading.store(false, Ordering::Release);
                 self.set_health_error(
                     PluginHealthState::Failed,
@@ -254,13 +236,14 @@ impl PluginRuntime {
                 Ok(None) => {}
                 Ok(Some((operation, result))) => {
                     match (operation, result) {
-                        (PluginLifecycleOperation::OnUnload, Ok(status)) if
-                            status == PLUGIN_STATUS_OK
-                        => {
+                        (
+                            PluginLifecycleOperation::OnUnload,
+                            Ok(PluginLifecycleStatus::Success),
+                        ) => {
                             // The timed-out callback has now completed successfully. Persist the
                             // phase before resuming so later destroy retries never invoke it again.
                             self.on_unload_completed.store(true, Ordering::Release);
-                            let (instance, _, destroy) = match self.validate_lifecycle_instance() {
+                            let executor = match self.validate_lifecycle_executor() {
                                 Ok(value) => value,
                                 Err(message) => {
                                     self.unloading.store(false, Ordering::Release);
@@ -268,9 +251,12 @@ impl PluginRuntime {
                                     return false;
                                 }
                             };
-                            return self.finish_destroy_lifecycle(instance, destroy);
+                            return self.finish_destroy_lifecycle(executor);
                         }
-                        (PluginLifecycleOperation::OnUnload, Ok(status)) => {
+                        (
+                            PluginLifecycleOperation::OnUnload,
+                            Ok(PluginLifecycleStatus::Failed(status)),
+                        ) => {
                             self.unloading.store(false, Ordering::Release);
                             self.set_health_error(
                                 PluginHealthState::Failed,
@@ -278,12 +264,13 @@ impl PluginRuntime {
                             );
                             return false;
                         }
-                        (PluginLifecycleOperation::Destroy, Ok(status)) if
-                            status == PLUGIN_STATUS_OK
-                        => {
+                        (PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Success)) => {
                             return self.complete_destroy_success();
                         }
-                        (PluginLifecycleOperation::Destroy, Ok(status)) => {
+                        (
+                            PluginLifecycleOperation::Destroy,
+                            Ok(PluginLifecycleStatus::Failed(status)),
+                        ) => {
                             self.unloading.store(false, Ordering::Release);
                             self.set_health_error(
                                 PluginHealthState::Failed,
@@ -322,7 +309,7 @@ impl PluginRuntime {
             return false;
         }
 
-        let (instance, on_unload, destroy) = match self.validate_lifecycle_instance() {
+        let executor = match self.validate_lifecycle_executor() {
             Ok(value) => value,
             Err(message) => {
                 self.unloading.store(false, Ordering::Release);
@@ -332,16 +319,13 @@ impl PluginRuntime {
         };
 
         if self.on_unload_completed.load(Ordering::Acquire) {
-            return self.finish_destroy_lifecycle(instance, destroy);
+            return self.finish_destroy_lifecycle(executor);
         }
 
         if
             let Err(message) = self.start_lifecycle_operation(
                 PluginLifecycleOperation::OnUnload,
-                on_unload,
-                unsafe {
-                    (*instance).context
-                }
+                Arc::clone(&executor)
             )
         {
             self.unloading.store(false, Ordering::Release);
@@ -358,13 +342,15 @@ impl PluginRuntime {
                 self.set_health_error(PluginHealthState::Stopping, message);
                 false
             }
-            Ok(Some((PluginLifecycleOperation::OnUnload, Ok(status)))) if
-                status == PLUGIN_STATUS_OK
-            => {
+            Ok(Some((PluginLifecycleOperation::OnUnload, Ok(PluginLifecycleStatus::Success)))) => {
                 self.on_unload_completed.store(true, Ordering::Release);
-                self.finish_destroy_lifecycle(instance, destroy)
+                self.finish_destroy_lifecycle(executor)
             }
-            Ok(Some((PluginLifecycleOperation::OnUnload, Ok(status)))) => {
+            Ok(
+                Some(
+                    (PluginLifecycleOperation::OnUnload, Ok(PluginLifecycleStatus::Failed(status))),
+                ),
+            ) => {
                 self.unloading.store(false, Ordering::Release);
                 self.set_health_error(
                     PluginHealthState::Failed,
@@ -380,7 +366,19 @@ impl PluginRuntime {
                 );
                 false
             }
-            Ok(Some((PluginLifecycleOperation::Destroy, Ok(status)))) => {
+            Ok(Some((PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Success)))) => {
+                self.unloading.store(false, Ordering::Release);
+                self.set_health_error(
+                    PluginHealthState::Failed,
+                    "plugin destroy returned status 0 after on_unload completed"
+                );
+                false
+            }
+            Ok(
+                Some(
+                    (PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Failed(status))),
+                ),
+            ) => {
                 self.unloading.store(false, Ordering::Release);
                 self.set_health_error(
                     PluginHealthState::Failed,

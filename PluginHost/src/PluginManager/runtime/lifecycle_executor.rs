@@ -1,5 +1,5 @@
 //! Serialized lifecycle callback executor with timeout-safe retry semantics.
-use super::PluginCancellationState;
+use super::{ PluginCancellationState, PluginLifecycleStatus };
 use std::sync::{ Arc, Mutex, mpsc };
 use std::thread;
 
@@ -11,11 +11,13 @@ pub(super) enum PluginLifecycleOperation {
 
 pub(super) struct PendingPluginLifecycle {
     pub(super) operation: PluginLifecycleOperation,
-    pub(super) receiver: mpsc::Receiver<Result<i32, String>>,
+    pub(super) receiver: mpsc::Receiver<Result<PluginLifecycleStatus, String>>,
     pub(super) cancellation: Arc<PluginCancellationState>,
 }
 
-pub(super) type PluginLifecycleJob = Box<dyn (FnOnce() -> Result<i32, String>) + Send + 'static>;
+pub(super) type PluginLifecycleJob = Box<
+    dyn (FnOnce() -> Result<PluginLifecycleStatus, String>) + Send + 'static
+>;
 
 /// Dedicated single-worker executor for lifecycle callbacks. Lifecycle operations do not consume
 /// normal request-worker capacity. A timed-out callback is intentionally allowed to finish on this
@@ -54,7 +56,7 @@ impl PluginLifecycleExecutor {
     pub(super) fn submit(
         &self,
         job: PluginLifecycleJob
-    ) -> Result<mpsc::Receiver<Result<i32, String>>, String> {
+    ) -> Result<mpsc::Receiver<Result<PluginLifecycleStatus, String>>, String> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let wrapped: PluginLifecycleJob = Box::new(move || {
             let result = std::panic

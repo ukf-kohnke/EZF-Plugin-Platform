@@ -1,5 +1,9 @@
 //! Per-plugin runtime state and shared invariants.
 //! Calls, plugin operations, lifecycle transitions, scheduling, configuration, and health are split into child modules.
+use super::executor::{ PluginExecutor, PluginLifecycleStatus };
+use PluginAbi::PluginCancellationV2;
+use std::sync::{ Arc, Mutex, RwLock, atomic::{ AtomicBool, AtomicU64, Ordering } };
+
 mod worker_pool;
 mod lifecycle_executor;
 mod execution;
@@ -9,19 +13,6 @@ mod config;
 mod health;
 mod calls;
 
-use libloading::Library;
-use PluginAbi::{
-    AbiBuffer,
-    PluginCancellationV2,
-    PluginInstanceV2,
-    PluginVTableV2,
-    MAX_ABI_BUFFER_BYTES,
-    PLUGIN_ABI_VERSION_V2,
-    PLUGIN_STATUS_OK,
-};
-use std::{
-    sync::{ Arc, Mutex, RwLock, RwLockReadGuard, atomic::{ AtomicBool, AtomicU64, Ordering } },
-};
 use self::lifecycle_executor::{
     PendingPluginLifecycle,
     PluginLifecycleExecutor,
@@ -52,13 +43,10 @@ unsafe extern "C" fn never_cancelled(_context: *const std::ffi::c_void) -> bool 
 
 /// Runtime state of one loaded plugin.
 ///
-/// The dynamic library and opaque plugin instance remain together. Calls are admitted through a
-/// bounded gate and executed by persistent worker threads, so request traffic does not create a
-/// new OS thread per plugin call. Each worker invocation holds a shared read lock, allowing
-/// independent calls to execute concurrently. Unload first waits for all admitted calls to drain,
-/// then invokes `on_unload` and `destroy` on a dedicated single lifecycle worker. Lifecycle callback
-/// timeouts request cooperative cancellation; the runtime stays registered and the next unload
-/// attempt observes the actual callback result before progressing.
+/// The runtime owns scheduling, deadlines, health, admission, and lifecycle transitions. Plugin
+/// code is accessed only through `PluginExecutor`; no dynamic-library handles or ABI function
+/// pointers are exposed to the runtime core. Request work runs on a bounded persistent worker pool,
+/// while lifecycle operations use the dedicated lifecycle worker and preserve timeout/retry rules.
 pub(crate) struct PluginRuntime {
     state: RwLock<PluginRuntimeState>,
     unloading: AtomicBool,
@@ -80,87 +68,36 @@ pub(crate) struct PluginRuntime {
 }
 
 struct PluginRuntimeState {
-    instance: Option<*mut PluginInstanceV2>,
-    #[allow(dead_code)]
-    library: Library,
+    executor: Option<Arc<dyn PluginExecutor>>,
+    // Keep the executor (and therefore its library image) alive until the final Runtime Arc drops,
+    // matching the previous behavior where `Library` outlived `destroy()`.
+    destroyed: bool,
 }
 
-// Raw instance pointers are only dereferenced while the PluginRuntime state is protected by the
-// RwLock. Plugin implementations are Send + Sync, and the ABI exposes no Rust references.
-unsafe impl Send for PluginRuntimeState {}
-unsafe impl Sync for PluginRuntimeState {}
-unsafe impl Send for PluginRuntime {}
-unsafe impl Sync for PluginRuntime {}
-
 impl PluginRuntime {
-    fn is_valid_buffer(buffer: AbiBuffer) -> bool {
-        if buffer.ptr.is_null() {
-            return buffer.len == 0 && buffer.capacity == 0;
-        }
-
-        buffer.len > 0 &&
-            buffer.len <= MAX_ABI_BUFFER_BYTES &&
-            buffer.capacity >= buffer.len &&
-            buffer.capacity <= MAX_ABI_BUFFER_BYTES
-    }
-
     pub(super) fn new(
-        instance: *mut PluginInstanceV2,
-        library: Library,
+        executor: Arc<dyn PluginExecutor>,
         config: PluginRuntimeConfig
     ) -> Result<Arc<Self>, String> {
-        if instance.is_null() {
-            return Err("plugin constructor returned a null instance".to_owned());
-        }
-
-        let instance_ref = unsafe { &*instance };
-        if
-            instance_ref.abi_version != PLUGIN_ABI_VERSION_V2 ||
-            instance_ref.struct_size < (std::mem::size_of::<PluginInstanceV2>() as u32) ||
-            instance_ref.vtable.is_null() ||
-            instance_ref.context.is_null()
-        {
-            return Err("plugin instance reported an incompatible ABI layout".to_owned());
-        }
-
-        let vtable = unsafe { &*instance_ref.vtable };
-        if !vtable.is_compatible() {
-            return Err("plugin vtable reported an incompatible ABI layout".to_owned());
-        }
-
-        let pointers = [
-            vtable.name as usize,
-            vtable.manifest as usize,
-            vtable.on_load as usize,
-            vtable.is_loaded as usize,
-            vtable.handle_endpoint as usize,
-            vtable.execute_database as usize,
-            vtable.on_session_closed as usize,
-            vtable.on_unload as usize,
-            vtable.free_buffer as usize,
-            vtable.destroy as usize,
-        ];
-        if pointers.iter().any(|pointer| *pointer == 0) {
-            return Err("plugin vtable contains a null function pointer".to_owned());
-        }
+        executor.validate()?;
 
         let worker_pool = PluginWorkerPool::new(
             config.worker_threads,
             config.queue_capacity
         ).map_err(|error| {
-            let _ = unsafe { (vtable.destroy)(instance, never_cancelled_abi()) };
+            let _ = executor.destroy(never_cancelled_abi());
             error
         })?;
         let lifecycle_executor = PluginLifecycleExecutor::new().map_err(|error| {
-            let _ = unsafe { (vtable.destroy)(instance, never_cancelled_abi()) };
+            let _ = executor.destroy(never_cancelled_abi());
             error
         })?;
 
         Ok(
             Arc::new(Self {
                 state: RwLock::new(PluginRuntimeState {
-                    instance: Some(instance),
-                    library,
+                    executor: Some(executor),
+                    destroyed: false,
                 }),
                 unloading: AtomicBool::new(false),
                 on_unload_completed: AtomicBool::new(false),
@@ -181,14 +118,18 @@ impl PluginRuntime {
         )
     }
 
-    fn read_state(&self) -> RwLockReadGuard<'_, PluginRuntimeState> {
-        self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn with_instance<R, F>(&self, func: F) -> Result<R, String>
-        where F: FnOnce(*mut std::ffi::c_void, &PluginVTableV2) -> R
+    /// Executes one logical operation while retaining the read-side lifecycle guard for the full
+    /// operation. This prevents teardown from releasing the executor during an in-flight call.
+    fn with_executor<R, F>(&self, func: F) -> Result<R, String>
+        where F: FnOnce(&dyn PluginExecutor) -> Result<R, String>
     {
-        let state = self.read_state();
+        let state = self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `destroy()` invalidates the executor's opaque plugin instance. Check the authoritative
+        // state before health so even a poisoned/temporarily inconsistent health lock cannot let a
+        // post-destroy call reach the executor.
+        if state.destroyed {
+            return Err("plugin runtime is unloaded".to_owned());
+        }
         if self.unloading.load(Ordering::Acquire) {
             return Err("plugin runtime is unloading".to_owned());
         }
@@ -211,58 +152,10 @@ impl PluginRuntime {
         }
         drop(health);
 
-        let instance = state.instance.ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
-        let instance_ref = unsafe { &*instance };
-        if instance_ref.vtable.is_null() || instance_ref.context.is_null() {
-            return Err("plugin runtime contains invalid ABI pointers".to_owned());
-        }
-        let vtable = unsafe { &*instance_ref.vtable };
-        if !vtable.is_compatible() {
-            return Err("plugin runtime contains an incompatible ABI vtable".to_owned());
-        }
-        Ok(func(instance_ref.context, vtable))
-    }
-
-    /// Executes a raw ABI buffer-returning call. Lifecycle, timeout, panic isolation, accounting,
-    /// and admission control are provided by `call_with_timeout`; this helper must only be invoked
-    /// from inside that guarded execution path.
-    fn call_buffer<F>(
-        &self,
-        cancellation: PluginCancellationV2,
-        select_call: F
-    ) -> Result<Vec<u8>, String>
-        where
-            F: FnOnce(
-                &PluginVTableV2
-            ) -> unsafe extern "C" fn(
-                *mut std::ffi::c_void,
-                PluginCancellationV2,
-                *mut AbiBuffer
-            ) -> i32
-    {
-        self.with_instance(|context, vtable| {
-            let mut response = AbiBuffer::EMPTY;
-            let status = unsafe { select_call(vtable)(context, cancellation, &mut response) };
-            if status != PLUGIN_STATUS_OK {
-                if Self::is_valid_buffer(response) && !response.ptr.is_null() {
-                    unsafe {
-                        (vtable.free_buffer)(response);
-                    }
-                }
-                return Err(format!("plugin ABI call failed with status {status}"));
-            }
-
-            if !Self::is_valid_buffer(response) {
-                return Err("plugin returned an invalid response buffer".to_owned());
-            }
-
-            let bytes = unsafe { response.to_vec() };
-            // Release through the plugin's allocator regardless of whether conversion succeeded.
-            unsafe {
-                (vtable.free_buffer)(response);
-            }
-            bytes.ok_or_else(|| "plugin returned an invalid response buffer".to_owned())
-        })?
+        let executor = state.executor
+            .as_deref()
+            .ok_or_else(|| "plugin runtime is unloaded".to_owned())?;
+        func(executor)
     }
 
     fn set_health(&self, state: PluginHealthState) {
@@ -380,23 +273,17 @@ impl Drop for PluginRuntime {
         }
         self.worker_pool.shutdown();
         self.lifecycle_executor.shutdown();
-        let mut state = self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(instance) = state.instance.take() else {
-            return;
-        };
 
-        let instance_ref = unsafe { &*instance };
-        if instance_ref.vtable.is_null() || instance_ref.context.is_null() {
-            return;
+        let mut state = self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(executor) = state.executor.take() {
+            if !state.destroyed {
+                let _ = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        executor.emergency_shutdown();
+                    })
+                );
+            }
         }
-        let vtable = unsafe { &*instance_ref.vtable };
-        let _ = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(|| unsafe {
-                let cancellation = never_cancelled_abi();
-                let _ = (vtable.on_unload)(instance_ref.context, cancellation);
-                let _ = (vtable.destroy)(instance, cancellation);
-            })
-        );
     }
 }
 

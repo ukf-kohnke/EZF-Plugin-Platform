@@ -6,13 +6,12 @@ use PluginContracts::ApiContract::{
     PLUGIN_OVERLOADED_USER_MESSAGE,
     PluginManifest,
 };
-use PluginAbi::PLUGIN_STATUS_NOT_INITIALIZED;
 
 impl PluginRuntime {
     pub(crate) fn name(self: &Arc<Self>) -> Result<String, String> {
         let bytes = self
             .call_with_timeout_internal("name", |runtime, cancellation| {
-                runtime.call_buffer(cancellation, |vtable| vtable.name)
+                runtime.with_executor(|executor| executor.name_bytes(cancellation))
             })
             .map_err(|error| error.to_string())?;
         let name = serde_json
@@ -25,7 +24,7 @@ impl PluginRuntime {
     pub(crate) fn manifest(self: &Arc<Self>) -> Result<PluginManifest, String> {
         let bytes = self
             .call_with_timeout_internal("manifest", |runtime, cancellation| {
-                runtime.call_buffer(cancellation, |vtable| vtable.manifest)
+                runtime.with_executor(|executor| executor.manifest_bytes(cancellation))
             })
             .map_err(|error| error.to_string())?;
         serde_json
@@ -35,14 +34,7 @@ impl PluginRuntime {
 
     pub(crate) fn is_loaded(self: &Arc<Self>) -> Result<bool, String> {
         self.call_with_timeout("is_loaded", |runtime, cancellation| {
-            runtime.with_instance(|context, vtable| {
-                let status = unsafe { (vtable.is_loaded)(context, cancellation) };
-                match status {
-                    PLUGIN_STATUS_OK => Ok(true),
-                    PLUGIN_STATUS_NOT_INITIALIZED => Ok(false),
-                    _ => Err(format!("plugin ABI is_loaded call failed with status {status}")),
-                }
-            })?
+            runtime.with_executor(|executor| executor.is_loaded(cancellation))
         }).map_err(|error| error.to_string())
     }
 
@@ -68,7 +60,7 @@ impl PluginRuntime {
             let request_bytes = serde_json
                 ::to_vec(&request)
                 .map_err(|error| format!("failed to encode plugin request: {error}"))?;
-            runtime.call_endpoint_direct_from_bytes(&request_bytes, cancellation)
+            runtime.with_executor(|executor| executor.handle_endpoint(&request_bytes, cancellation))
         };
 
         let result = match parent_cancellation {
@@ -112,10 +104,8 @@ impl PluginRuntime {
             let request_bytes = serde_json
                 ::to_vec(&context)
                 .map_err(|error| format!("failed to encode session lifecycle request: {error}"))?;
-            runtime.call_json_direct_from_bytes(
-                &request_bytes,
-                cancellation,
-                |vtable| vtable.on_session_closed
+            runtime.with_executor(|executor|
+                executor.on_session_closed(&request_bytes, cancellation)
             )
         };
 
@@ -154,10 +144,8 @@ impl PluginRuntime {
         parent_cancellation: PluginCancellationV2
     ) -> Result<Vec<u8>, DatabaseContracts::DatabaseError> {
         let call = move |runtime: &PluginRuntime, cancellation: PluginCancellationV2| {
-            runtime.call_abi_bytes_direct_from_bytes(
-                &request_bytes,
-                cancellation,
-                |vtable| vtable.execute_database
+            runtime.with_executor(|executor|
+                executor.execute_database_bytes(&request_bytes, cancellation)
             )
         };
 
@@ -199,10 +187,8 @@ impl PluginRuntime {
             let response: Result<
                 DatabaseContracts::DatabaseResponse,
                 DatabaseContracts::DatabaseError
-            > = runtime.call_json_direct_from_bytes(
-                &request_bytes,
-                cancellation,
-                |vtable| vtable.execute_database
+            > = runtime.with_executor(|executor|
+                executor.execute_database(&request_bytes, cancellation)
             )?;
             response.map_err(|error| format!("plugin database operation failed: {error}"))
         };

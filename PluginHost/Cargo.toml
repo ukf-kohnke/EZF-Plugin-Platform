@@ -1,6 +1,6 @@
 [package]
 name = "PluginHost"
-version = "3.5.3"
+version = "3.5.4"
 edition = "2024"
 authors = ["Anselm Hoppmann <anselm.hoppmann@uniklinik-freiburg.de>", "Georg Kohnke <georg.kohnke@uniklinik-freiburg.de>", "Frederik Voigt <frederik.voigt@uniklinik-freiburg.de>", "Jonas Gassenschmidt <jonas.gassenschmidt@uniklinik-freiburg.de>"]
 description = "Dynamic plugin host and lifecycle runtime for EZF-Backend"

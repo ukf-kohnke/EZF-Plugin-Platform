@@ -1,9 +1,12 @@
 //! Process-backed worker with ABI V2 capability callbacks bridged over private IPC.
 //!
-//! This binary intentionally supports only the explicit DevelopmentUnconfined profile. It is
-//! not a production sandbox and must not be treated as one. The worker is single-flight: it
+//! This binary supports an explicitly opted-in DevelopmentUnconfined profile and Linux-first
+//! enforced DomainPlugin/DataSourcePlugin profiles. Enforced profiles fail closed when required
+//! kernel primitives are missing. The worker is single-flight: it
 //! executes one plugin callback at a time, while DB callbacks perform a correlated IPC exchange
 //! and logs are forwarded to the supervisor.
+
+mod sandbox;
 
 #[cfg(unix)]
 mod unix_worker {
@@ -47,6 +50,7 @@ mod unix_worker {
     };
     use std::ffi::c_void;
     use std::os::unix::net::UnixStream;
+    use std::os::fd::AsRawFd;
     use std::path::{ Path, PathBuf };
     use std::sync::atomic::{ AtomicBool, AtomicU64, Ordering };
     use std::sync::{ Arc, Mutex, OnceLock, Weak };
@@ -103,6 +107,12 @@ mod unix_worker {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .contains(&capability)
+        }
+
+        fn raw_fds(&self) -> Vec<i32> {
+            let writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+            let reader = self.reader.lock().unwrap_or_else(|p| p.into_inner());
+            vec![writer.as_raw_fd(), reader.as_raw_fd()]
         }
 
         fn begin_call(&self, request_id: u64, operation_id: u64, cancellation: &Arc<AtomicBool>) {
@@ -290,15 +300,24 @@ mod unix_worker {
         }
     }
 
+    #[derive(Debug)]
+    struct WorkerLaunchConfig {
+        socket_path: PathBuf,
+        profile: PluginIpc::SandboxProfile,
+        temp_directory: Option<PathBuf>,
+        extra_read_paths: Vec<PathBuf>,
+        extra_library_paths: Vec<PathBuf>,
+        datasource_tcp_ports: Vec<u16>,
+        datasource_egress_acknowledged: bool,
+    }
+
     pub fn main_entry() -> Result<(), String> {
-        let (socket_path, allow_unconfined) = parse_args()?;
-        if !allow_unconfined {
-            return Err(
-                "this integration worker only runs when --allow-unconfined is explicit; no OS sandbox is implemented".into()
-            );
-        }
-        let mut stream = UnixStream::connect(&socket_path).map_err(|error|
-            format!("could not connect to private IPC socket {}: {error}", socket_path.display())
+        let launch = parse_args()?;
+        let mut stream = UnixStream::connect(&launch.socket_path).map_err(|error|
+            format!(
+                "could not connect to private IPC socket {}: {error}",
+                launch.socket_path.display()
+            )
         )?;
         stream.set_read_timeout(None).map_err(|e| format!("could not configure IPC socket: {e}"))?;
         stream.set_write_timeout(None).map_err(|e| format!("could not configure IPC socket: {e}"))?;
@@ -307,34 +326,117 @@ mod unix_worker {
         WORKER_CHANNEL.set(WorkerCapabilityChannel::new(writer, reader)).map_err(|_|
             "worker IPC channel was initialized more than once".to_owned()
         )?;
-        serve(&mut stream, allow_unconfined)
+        serve(&mut stream, &launch)
     }
 
-    fn parse_args() -> Result<(PathBuf, bool), String> {
+    fn parse_args() -> Result<WorkerLaunchConfig, String> {
         let mut args = std::env::args_os().skip(1);
         let mut socket = None;
+        let mut profile = None;
         let mut allow_unconfined = false;
+        let mut temp_directory = None;
+        let mut extra_read_paths = Vec::new();
+        let mut extra_library_paths = Vec::new();
+        let mut datasource_tcp_ports = Vec::new();
+        let mut datasource_egress_acknowledged = false;
         while let Some(arg) = args.next() {
             if arg == "--ipc-socket" {
                 let value = args.next().ok_or("--ipc-socket requires a path")?;
                 socket = Some(PathBuf::from(value));
             } else if arg == "--allow-unconfined" {
+                if profile.is_some() {
+                    return Err(
+                        "--allow-unconfined and --sandbox-profile are mutually exclusive".into()
+                    );
+                }
                 allow_unconfined = true;
+                profile = Some(PluginIpc::SandboxProfile::DevelopmentUnconfined);
+            } else if arg == "--sandbox-profile" {
+                if profile.is_some() {
+                    return Err("sandbox mode may only be selected once".into());
+                }
+                let value = args.next().ok_or("--sandbox-profile requires a profile name")?;
+                profile = Some(match value.to_string_lossy().as_ref() {
+                    "domain_plugin" => PluginIpc::SandboxProfile::DomainPlugin,
+                    "data_source_plugin" => PluginIpc::SandboxProfile::DataSourcePlugin,
+                    other => {
+                        return Err(format!("unsupported enforced sandbox profile: {other}"));
+                    }
+                });
+            } else if arg == "--plugin-temp-dir" {
+                let value = args.next().ok_or("--plugin-temp-dir requires a path")?;
+                temp_directory = Some(PathBuf::from(value));
+            } else if arg == "--extra-read-path" {
+                let value = args.next().ok_or("--extra-read-path requires a path")?;
+                extra_read_paths.push(PathBuf::from(value));
+            } else if arg == "--extra-library-path" {
+                let value = args.next().ok_or("--extra-library-path requires a path")?;
+                extra_library_paths.push(PathBuf::from(value));
+            } else if arg == "--datasource-tcp-ports" {
+                let value = args
+                    .next()
+                    .ok_or("--datasource-tcp-ports requires a comma-separated list")?;
+                datasource_tcp_ports = value
+                    .to_string_lossy()
+                    .split(',')
+                    .map(|part| {
+                        let port = part
+                            .trim()
+                            .parse::<u16>()
+                            .map_err(|_| format!("invalid DataSource TCP port: {part}"))?;
+                        if port == 0 {
+                            return Err("DataSource TCP port must be between 1 and 65535".into());
+                        }
+                        Ok(port)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+            } else if arg == "--datasource-egress-policy-acknowledged" {
+                datasource_egress_acknowledged = true;
             } else if arg == "--help" || arg == "-h" {
-                println!("ezf-plugin-worker --ipc-socket <absolute-path> --allow-unconfined");
+                println!(
+                    "ezf-plugin-worker --ipc-socket <absolute-path> (--allow-unconfined | --sandbox-profile <domain_plugin|data_source_plugin>) [--plugin-temp-dir <absolute-path>] [--extra-read-path <absolute-path> ...] [--extra-library-path <absolute-path> ...] [--datasource-tcp-ports <ports>] [--datasource-egress-policy-acknowledged]"
+                );
                 std::process::exit(0);
             } else {
                 return Err(format!("unknown argument: {}", arg.to_string_lossy()));
             }
         }
-        let socket = socket.ok_or("missing required --ipc-socket <path>")?;
-        if !socket.is_absolute() {
+        let socket_path = socket.ok_or("missing required --ipc-socket <path>")?;
+        if !socket_path.is_absolute() {
             return Err("IPC socket path must be absolute".into());
         }
-        Ok((socket, allow_unconfined))
+        let profile = profile.ok_or(
+            "select --sandbox-profile or explicitly pass --allow-unconfined"
+        )?;
+        if profile == PluginIpc::SandboxProfile::DevelopmentUnconfined && !allow_unconfined {
+            return Err("DevelopmentUnconfined requires --allow-unconfined".into());
+        }
+        if profile != PluginIpc::SandboxProfile::DevelopmentUnconfined && allow_unconfined {
+            return Err("enforced sandbox mode cannot be combined with --allow-unconfined".into());
+        }
+        if profile != PluginIpc::SandboxProfile::DevelopmentUnconfined && temp_directory.is_none() {
+            return Err("enforced sandbox mode requires --plugin-temp-dir".into());
+        }
+        if
+            profile != PluginIpc::SandboxProfile::DataSourcePlugin &&
+            (!datasource_tcp_ports.is_empty() || datasource_egress_acknowledged)
+        {
+            return Err("DataSource egress options are valid only for data_source_plugin".into());
+        }
+        datasource_tcp_ports.sort_unstable();
+        datasource_tcp_ports.dedup();
+        Ok(WorkerLaunchConfig {
+            socket_path,
+            profile,
+            temp_directory,
+            extra_read_paths,
+            extra_library_paths,
+            datasource_tcp_ports,
+            datasource_egress_acknowledged,
+        })
     }
 
-    fn serve(stream: &mut UnixStream, allow_unconfined: bool) -> Result<(), String> {
+    fn serve(stream: &mut UnixStream, launch: &WorkerLaunchConfig) -> Result<(), String> {
         let mut limits = FrameLimits::default();
         let mut core: Option<PluginExecutionCore::PluginExecutionCore> = None;
         let mut initialized: Option<InitializeControl> = None;
@@ -343,8 +445,7 @@ mod unix_worker {
         let started_at = Instant::now();
 
         let result = (|| {
-            // No library is loaded until the host explicitly selects the development-only
-            // unconfined profile and sends LoadPlugin.
+            // No library is loaded until the selected sandbox has been installed and reported.
             let hello = read_frame(stream, limits)?;
             if hello.message_type != MessageType::Hello {
                 send_protocol_error(
@@ -406,18 +507,15 @@ mod unix_worker {
                 )?;
                 return Err("unsupported IPC version in Initialize".into());
             }
-            if
-                !allow_unconfined ||
-                init.sandbox_profile != PluginIpc::SandboxProfile::DevelopmentUnconfined
-            {
+            if init.sandbox_profile != launch.profile {
                 send_protocol_error(
                     stream,
                     init_frame.request_id,
                     IpcErrorCode::SandboxSetupFailed,
-                    "this worker build only supports explicit DevelopmentUnconfined integration mode",
+                    "Initialize sandbox profile does not match the worker's command-line policy",
                     limits
                 )?;
-                return Err("this worker build only supports DevelopmentUnconfined".into());
+                return Err("sandbox profile mismatch between command line and Initialize".into());
             }
             if init.runtime_limits.max_concurrent_calls == 0 {
                 send_protocol_error(
@@ -441,11 +539,58 @@ mod unix_worker {
                 channel.set_limits(limits);
                 channel.set_capabilities(init.allowed_capabilities.clone());
             }
+
+            let sandbox_report = if
+                launch.profile == PluginIpc::SandboxProfile::DevelopmentUnconfined
+            {
+                crate::sandbox::activate(
+                    launch.profile,
+                    Path::new(&init.plugin_path),
+                    Path::new(&init.plugin_directory),
+                    None,
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                    &[]
+                )
+            } else {
+                let plugin_path = PathBuf::from(&init.plugin_path);
+                let plugin_directory = PathBuf::from(&init.plugin_directory);
+                let mut ipc_fds = vec![stream.as_raw_fd()];
+                if let Some(channel) = WORKER_CHANNEL.get() {
+                    ipc_fds.extend(channel.raw_fds());
+                }
+                crate::sandbox::activate(
+                    launch.profile,
+                    &plugin_path,
+                    &plugin_directory,
+                    launch.temp_directory.as_deref(),
+                    &launch.extra_read_paths,
+                    &launch.extra_library_paths,
+                    &launch.datasource_tcp_ports,
+                    launch.datasource_egress_acknowledged,
+                    &ipc_fds
+                )
+            };
+            let sandbox_report = match sandbox_report {
+                Ok(report) => report,
+                Err(message) => {
+                    send_protocol_error(
+                        stream,
+                        init_frame.request_id,
+                        IpcErrorCode::SandboxSetupFailed,
+                        &message,
+                        limits
+                    )?;
+                    return Err(format!("sandbox setup failed: {message}"));
+                }
+            };
             let sandbox = SandboxReadyControl {
-                profile: PluginIpc::SandboxProfile::DevelopmentUnconfined,
-                sandbox_enforced: false,
-                active_features: vec!["ipc_capability_broker".to_owned(), "ipc_logging".to_owned()],
-                missing_features: vec!["os_sandbox_not_implemented".to_owned()],
+                profile: launch.profile,
+                sandbox_enforced: sandbox_report.enforced,
+                active_features: sandbox_report.active_features,
+                missing_features: sandbox_report.missing_features,
             };
             send_control(
                 stream,
@@ -625,6 +770,28 @@ mod unix_worker {
                 }
             };
             let manifest_name = manifest_value.get("name").and_then(|value| value.as_str());
+            let manifest_kind = manifest_value.get("kind").and_then(|value| value.as_str());
+            let expected_kind = match launch.profile {
+                PluginIpc::SandboxProfile::DomainPlugin => Some("Domain"),
+                PluginIpc::SandboxProfile::DataSourcePlugin => Some("DataSource"),
+                PluginIpc::SandboxProfile::DevelopmentUnconfined => None,
+            };
+            if expected_kind.is_some() && manifest_kind != expected_kind {
+                loaded.emergency_shutdown();
+                let message = format!(
+                    "plugin manifest kind {:?} does not match selected sandbox profile {:?}",
+                    manifest_kind,
+                    launch.profile
+                );
+                send_protocol_error(
+                    stream,
+                    load_frame.request_id,
+                    IpcErrorCode::SandboxSetupFailed,
+                    &message,
+                    limits
+                )?;
+                return Err(message);
+            }
             if manifest_name != Some(plugin_name.as_str()) {
                 loaded.emergency_shutdown();
                 let message = "plugin name and manifest name do not match";

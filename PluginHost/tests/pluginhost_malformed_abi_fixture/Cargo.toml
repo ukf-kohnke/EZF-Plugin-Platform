@@ -1,6 +1,6 @@
 [package]
 name = "pluginhost-malformed-abi-fixture"
-version = "3.5.3"
+version = "3.5.4"
 edition = "2024"
 publish = false
 

@@ -1,52 +1,108 @@
-# ezf-plugin-worker (Phase 4/5 development worker)
+# ezf-plugin-worker (Phase 8 Linux sandbox)
 
-This binary is used by the internal `ProcessExecutor` for real child-process integration. It uses
-`PluginIpc` framing, loads ABI V2 libraries through `PluginExecutionCore`, serves all `PluginExecutor`
-operations over IPC, and participates in the host-owned process lifecycle and timeout escalation.
+`ezf-plugin-worker` is the process-isolated runtime for one plugin shared library. It uses ABI V2
+and `PluginExecutionCore`, speaks the bounded `PluginIpc` protocol, and forwards database/logging
+capabilities to the host broker. The worker does not host the backend HTTP API or own the plugin
+registry.
 
-## Explicit development-only invocation
+## Development-only mode
 
-The worker requires both an absolute Unix-domain socket path and an explicit opt-in flag:
+Local integration tests may explicitly use:
 
 ```bash
 ezf-plugin-worker --ipc-socket /absolute/path/to/private.sock --allow-unconfined
 ```
 
-The supervisor/test harness owns and binds the socket. The worker connects to it; the IPC stream is
-not multiplexed onto stdout. The host sends `Hello`, `Initialize` with profile
-`DevelopmentUnconfined`, then `LoadPlugin`. The worker responds with `Hello`, `SandboxReady`, and
-`Initialized`. It accepts `Invoke`, `HealthProbe`, and `Shutdown` messages after loading.
+The host must separately opt in with `EZF_PLUGIN_ALLOW_UNCONFINED=1`. This mode reports
+`sandbox_enforced = false`; it is not a production security boundary.
 
-## Current limits
+## Enforced Linux profiles
 
-- **Not a production sandbox.** The worker reports `sandbox_enforced = false` and explicitly lists
-  that OS sandboxing is not implemented. It refuses startup unless `--allow-unconfined` is passed.
-- **Unix-domain sockets only.** Windows transport is not implemented.
-- **Single-flight.** Plugin callbacks execute serially. The host sends `Cancel` while a callback is
-  in flight; this worker cannot process that frame until the callback returns, so the host kills
-  and reaps the entire worker after its bounded cancellation grace period if the callback does not
-  finish. There is no automatic retry.
-- **No capability broker yet.** Host-provided database capability callbacks are not forwarded across
-  IPC. The worker can execute a datasource plugin's explicit `ExecuteDatabase` operation, but
-  plugins that rely on the host-services database callback are not ready for process mode.
-- **Opt-in internal ProcessExecutor integration.** The public factory API is unchanged and remains
-  in-process by default. For local tests, set `EZF_PLUGIN_EXECUTOR=process`,
-  `EZF_PLUGIN_ALLOW_UNCONFINED=1`, and `EZF_PLUGIN_WORKER_PATH` to the absolute worker binary path.
+Enforced profiles are supported on Linux x86_64 and aarch64. The worker installs the sandbox
+before loading plugin code, reports the active/missing controls over `SandboxReady`, and exits on
+setup failure rather than silently falling back to unconfined execution.
 
-Integration tests build the existing `PluginHost/tests/pluginhost_integration_fixture` SDK plugin
-as a separate `cdylib`. They exercise both the protocol directly and the unchanged Factory API through
-`ProcessExecutor`, including `ping`, graceful unload/destroy, process reaping, and timeout escalation
-against an endpoint configured to ignore cancellation. All tests run unconfined and are not sandbox
-acceptance tests.
+- `DomainPlugin`: Landlock read-only filesystem allowlist, private writable plugin temp directory,
+  seccomp restrictions on direct networking, process creation, privilege/capability changes and
+  cross-process signals, `no_new_privs`, capability-set verification, inherited-FD reduction and
+  `RLIMIT` limits. Database access must use the host capability broker.
+- `DataSourcePlugin`: the same filesystem/process restrictions, plus Landlock TCP-connect port
+  allowlisting. Its IP-level egress allowlist and any non-TCP egress restriction **must be enforced
+  by the deployment firewall/container/network namespace**. The worker only checks that the
+  operator acknowledged this requirement; it cannot verify the firewall rules.
+- Non-Linux enforced mode is rejected. A Linux kernel without the required Landlock ABI or seccomp
+  support is rejected. DataSource requires Landlock ABI 4 or later for TCP port rules.
 
-## Integration test
+The worker must run as a non-root user with all Linux capability sets empty. Configure it under a
+dedicated worker identity/user namespace where feasible. The worker also reports deployment-managed
+requirements for cgroup CPU/memory limits and a total quota for the temp filesystem. `RLIMIT_FSIZE`
+limits each individual file, not total temp storage. The status is therefore not a claim that these
+external controls are active.
 
-From the backend workspace root, run:
+## Host configuration
+
+Process mode remains explicitly selected. Use a per-plugin profile map when both Domain and
+DataSource plugins are loaded; map keys must match the canonical absolute shared-library path:
 
 ```bash
-cargo test -p PluginWorker
+export EZF_PLUGIN_EXECUTOR=process
+export EZF_PLUGIN_WORKER_PATH=/absolute/path/to/ezf-plugin-worker
+export EZF_PLUGIN_SANDBOX_PROFILES='{"/opt/ezf/plugins/VariantFilter/libvariant_filter.so":"domain_plugin","/opt/ezf/plugins/MolgenDB/libmolgendb.so":"data_source_plugin"}'
 ```
 
-The tests compile the fixture cdylib in separate temporary target directories, launch the worker
-binary, perform real endpoint invocations, verify graceful shutdown, and verify that an uncooperative
-call is force-terminated after the cancellation grace period. They need Rust and Cargo.
+For a Domain-only development/staging installation, `EZF_PLUGIN_SANDBOX_PROFILE=domain_plugin`
+can be used instead of a map. Avoid `EZF_PLUGIN_ALLOW_UNCONFINED=1` except in local development.
+
+Optional worker file/library access is explicit:
+
+- `EZF_PLUGIN_SANDBOX_READ_PATHS`: OS path-list separated list of specific config files or narrowly
+  scoped directories. Files are read-only and do not automatically receive library execute rights.
+  `/`, `/proc`, `/sys`, `/dev`, `/run`, and broad `/etc`, `/home`, `/root`, `/var`, `/tmp` roots
+  are rejected.
+- `EZF_PLUGIN_SANDBOX_LIBRARY_PATHS`: OS path-list separated list of trusted, non-group/world-
+  writable library directories. These are the only paths used to synthesize the worker's
+  `LD_LIBRARY_PATH`; inherited loader overrides are not copied.
+- `EZF_PLUGIN_WORKER_ENV_ALLOWLIST`: comma-separated names of environment variables to pass to
+  enforced workers. Loader overrides, `EZF_PLUGIN_*`, `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP` and `RUSTFLAGS`
+  are prohibited. Secret/database-like environment names are also rejected for Domain plugins.
+  The host supplies `HOME` and `TMPDIR` as the private temp directory. DataSource secret variables
+  should be allowed only for that profile and only when operationally required.
+
+For DataSource:
+
+```bash
+export EZF_PLUGIN_DATASOURCE_EGRESS_POLICY=externally-enforced
+export EZF_PLUGIN_DATASOURCE_ALLOWED_TCP_PORTS=1433
+```
+
+The TCP port list is enforced by Landlock (ABI 4+), but is not an IP allowlist. Configure firewall
+or container policy to restrict **all** permitted network traffic to the database destination and
+necessary DNS resolver. The host logs this as deployment-managed; if such an egress policy cannot
+be guaranteed, use a separate DataSource container/service or DB broker instead.
+
+## Resource and isolation limits
+
+The worker applies `RLIMIT_CORE=0`, `RLIMIT_NOFILE=128` and `RLIMIT_FSIZE=64 MiB` (only lowering any
+stricter inherited limit), sets `PR_SET_DUMPABLE=0` and `PR_SET_NO_NEW_PRIVS=1`, and closes inherited
+file descriptors except standard descriptors and the worker IPC channels. It does not set cgroups,
+create a user namespace, change UID, mount a private filesystem, or impose a total temp-storage
+quota. Those controls must be configured by deployment and remain in `SandboxReady.missing_features`.
+
+Landlock and seccomp are defense-in-depth, not a complete virtual machine. In particular, the host
+capability broker's generic SQL policy is a separate authorization boundary: process isolation does
+not make arbitrary SQL safe. Do not treat `sandbox_enforced = true` alone as proof that deployment
+firewall, cgroup, UID/user-namespace and temp-quota controls are active.
+
+## Integration tests
+
+From the backend workspace root:
+
+```bash
+cargo test -p PluginWorker --test process_integration -- --test-threads=1
+cargo test -p PluginHost --test dynamic_library_loader -- --test-threads=1
+```
+
+The Linux integration test either verifies denied network/file/process/signal/capability operations
+and allowed private-temp writes, or verifies that the worker fails closed when a required kernel
+primitive is unavailable. Run the tests on every supported Linux architecture and in the target
+container image before enabling enforced mode for a plugin.

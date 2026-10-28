@@ -316,3 +316,249 @@ fn real_worker_process_loads_plugin_invokes_endpoint_and_shuts_down() -> io::Res
     let _ = fs::remove_file(&socket_path);
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn enforced_domain_sandbox_blocks_network_filesystem_and_process_creation_or_fails_closed() -> io::Result<()> {
+    let plugin = build_real_plugin();
+    assert!(plugin.is_file(), "fixture shared library must exist: {}", plugin.display());
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let sandbox_dir = std::env
+        ::temp_dir()
+        .join(
+            format!(
+                "ezf-sandbox-it-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            )
+        );
+    fs::create_dir(&sandbox_dir)?;
+    fs::set_permissions(&sandbox_dir, fs::Permissions::from_mode(0o700))?;
+    let socket_path = sandbox_dir.join("worker.sock");
+    let plugin_temp = sandbox_dir.join("plugin-tmp");
+    fs::create_dir(&plugin_temp)?;
+    fs::set_permissions(&plugin_temp, fs::Permissions::from_mode(0o700))?;
+    let listener = UnixListener::bind(&socket_path)?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+
+    let worker_binary = env!("CARGO_BIN_EXE_ezf-plugin-worker");
+    let child = Command::new(worker_binary)
+        .arg("--ipc-socket")
+        .arg(&socket_path)
+        .arg("--sandbox-profile")
+        .arg("domain_plugin")
+        .arg("--plugin-temp-dir")
+        .arg(&plugin_temp)
+        .env_clear()
+        .env("TMPDIR", &plugin_temp)
+        .env("HOME", &plugin_temp)
+        .current_dir(plugin.parent().expect("fixture plugin has parent"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    let (mut stream, _) = listener.accept()?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+    send_control(
+        &mut stream,
+        MessageType::Hello,
+        1,
+        &(HelloControl {
+            protocol_major: IPC_MAJOR_VERSION,
+            protocol_minor: IPC_MINOR_VERSION,
+            worker_build: "phase8-sandbox-test".into(),
+        }),
+        Vec::new()
+    );
+    let hello = read_frame(&mut stream);
+    assert_eq!(hello.message_type, MessageType::Hello);
+
+    send_control(
+        &mut stream,
+        MessageType::Initialize,
+        2,
+        &(InitializeControl {
+            protocol_major: IPC_MAJOR_VERSION,
+            protocol_minor: IPC_MINOR_VERSION,
+            worker_build: "phase8-sandbox-test".into(),
+            plugin_path: plugin.to_string_lossy().into_owned(),
+            plugin_directory: plugin
+                .parent()
+                .expect("fixture plugin has parent")
+                .to_string_lossy()
+                .into_owned(),
+            allowed_capabilities: vec![PluginIpc::CapabilityKind::Log],
+            runtime_limits: RuntimeLimits {
+                max_concurrent_calls: 1,
+                max_payload_bytes: 1024 * 1024,
+                cancellation_grace_ms: 100,
+            },
+            sandbox_profile: SandboxProfile::DomainPlugin,
+        }),
+        Vec::new()
+    );
+    let sandbox_frame = read_frame(&mut stream);
+    if sandbox_frame.message_type == MessageType::ProtocolError {
+        let error: ProtocolErrorControl = sandbox_frame
+            .decode_control()
+            .expect("ProtocolError must decode");
+        assert_eq!(error.code, PluginIpc::IpcErrorCode::SandboxSetupFailed);
+        if
+            std::env
+                ::var("EZF_REQUIRE_ACTIVE_SANDBOX_TEST")
+                .map(|value| value == "1")
+                .unwrap_or(false)
+        {
+            panic!(
+                "EZF_REQUIRE_ACTIVE_SANDBOX_TEST=1, but enforced sandbox setup failed closed: {}",
+                error.message
+            );
+        }
+        assert!(
+            !error.message.trim().is_empty(),
+            "fail-closed diagnostic should identify why sandbox setup was refused"
+        );
+        let status = child.0.wait().expect("sandbox setup failure must reap the worker");
+        assert!(!status.success(), "worker must not continue unconfined when enforcement fails");
+        drop(listener);
+        let _ = fs::remove_dir_all(&sandbox_dir);
+        return Ok(());
+    }
+    assert_eq!(sandbox_frame.message_type, MessageType::SandboxReady);
+    let sandbox: SandboxReadyControl = sandbox_frame
+        .decode_control()
+        .expect("SandboxReady must decode");
+    assert_eq!(sandbox.profile, SandboxProfile::DomainPlugin);
+    assert!(
+        sandbox.sandbox_enforced,
+        "worker must not report an enforced profile without applying it"
+    );
+    for required in [
+        "prctl_no_new_privs",
+        "seccomp_direct_network_syscalls_denied",
+        "seccomp_process_creation_and_privilege_syscalls_restricted",
+        "seccomp_cross_process_signals_and_capability_mutation_denied",
+        "effective_capabilities_zero",
+        "inherited_file_descriptors_closed",
+        "landlock_private_writable_temp_directory",
+    ] {
+        assert!(
+            sandbox.active_features.iter().any(|feature| feature == required),
+            "missing sandbox feature {required}: {:?}",
+            sandbox.active_features
+        );
+    }
+
+    send_control(
+        &mut stream,
+        MessageType::LoadPlugin,
+        3,
+        &(LoadPluginControl { expected_abi_version: 2 }),
+        Vec::new()
+    );
+    let initialized = read_frame(&mut stream);
+    assert_eq!(
+        initialized.message_type,
+        MessageType::Initialized,
+        "enforced sandbox must be active before loading the plugin"
+    );
+    let initialized: InitializedControl = initialized
+        .decode_control()
+        .expect("Initialized must decode");
+    assert_eq!(initialized.plugin_name, "PluginHostIntegration");
+
+    send_control(
+        &mut stream,
+        MessageType::Invoke,
+        81,
+        &(InvokeControl {
+            operation: InvokeOperation::HandleEndpoint,
+            remaining_budget_ms: 5_000,
+            operation_id: 1,
+        }),
+        serde_json
+            ::to_vec(
+                &serde_json::json!({
+            "endpoint_id": "sandboxProbe",
+            "method": "Get",
+            "raw_path": "/pluginhost-integration/sandbox-probe",
+            "base_path": "/",
+            "raw_query": null,
+            "content_type": null,
+            "body": "",
+            "principal": {
+                "user_id": "sandbox-test",
+                "username": "sandbox-test",
+                "given_name": "Sandbox",
+                "family_name": "Test",
+                "groups": [],
+                "session_id": "sandbox-session"
+            }
+        })
+            )
+            .expect("sandbox probe request must serialize")
+    );
+    let result = read_frame(&mut stream);
+    assert_eq!(result.message_type, MessageType::Result);
+    assert_eq!(result.request_id, 81);
+    let result_control: ResultControl = result.decode_control().expect("Result must decode");
+    assert!(result_control.success, "sandbox probe failed: {:?}", result_control.error_message);
+    let wrapper: serde_json::Value = serde_json
+        ::from_slice(&result.payload)
+        .expect("wrapper payload must be JSON");
+    let response_body: serde_json::Value = serde_json
+        ::from_str(wrapper["Ok"]["body"].as_str().expect("endpoint body must be encoded as text"))
+        .expect("endpoint body must be JSON");
+    assert_eq!(
+        response_body["network_denied"],
+        true,
+        "domain network socket creation must be denied: {response_body}"
+    );
+    assert_eq!(
+        response_body["restricted_file_denied"],
+        true,
+        "unlisted filesystem paths must be denied: {response_body}"
+    );
+    assert_eq!(
+        response_body["process_creation_denied"],
+        true,
+        "process creation must be denied: {response_body}"
+    );
+    assert_eq!(
+        response_body["cross_process_signal_denied"],
+        true,
+        "plugins must not signal the backend or other processes: {response_body}"
+    );
+    assert_eq!(
+        response_body["capability_mutation_denied"],
+        true,
+        "plugins must not mutate Linux capabilities: {response_body}"
+    );
+    assert_eq!(
+        response_body["temp_write_allowed"],
+        true,
+        "the explicitly granted worker temp directory must remain writable: {response_body}"
+    );
+
+    send_control(
+        &mut stream,
+        MessageType::Shutdown,
+        99,
+        &(ShutdownControl { grace_budget_ms: 1_000 }),
+        Vec::new()
+    );
+    let shutdown = read_frame(&mut stream);
+    assert_eq!(shutdown.message_type, MessageType::ShutdownComplete);
+    let shutdown: ShutdownCompleteControl = shutdown
+        .decode_control()
+        .expect("ShutdownComplete must decode");
+    assert!(shutdown.graceful, "worker cleanup failed: {:?}", shutdown.message);
+    assert_child_clean_exit(&mut child.0);
+    drop(listener);
+    let _ = fs::remove_dir_all(&sandbox_dir);
+    Ok(())
+}

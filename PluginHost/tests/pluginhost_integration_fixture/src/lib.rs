@@ -244,6 +244,18 @@ impl IPlugin for PluginHostIntegration {
             );
             manifest.endpoints.push(
                 PluginEndpointDescriptor::get(
+                    "sandboxProbe",
+                    "/pluginhost-integration/sandbox-probe"
+                ).documented(
+                    "PluginHostIntegration",
+                    "Sandbox probe",
+                    Some(
+                        "Test-only endpoint proving filesystem, network, process, and private-temp restrictions"
+                    )
+                )
+            );
+            manifest.endpoints.push(
+                PluginEndpointDescriptor::get(
                     "database",
                     "/pluginhost-integration/database"
                 ).documented(
@@ -277,6 +289,71 @@ impl IPlugin for PluginHostIntegration {
                         "worker_thread_id": current_worker_thread_id()
                     })
                 ),
+            "sandboxProbe" if request.raw_path == "/pluginhost-integration/sandbox-probe" => {
+                use std::net::{ SocketAddr, TcpStream };
+                use std::time::Duration;
+                let network_denied = match
+                    TcpStream::connect_timeout(
+                        &SocketAddr::from(([127, 0, 0, 1], 9)),
+                        Duration::from_millis(100)
+                    )
+                {
+                    Err(error) => error.kind() == std::io::ErrorKind::PermissionDenied,
+                    Ok(_) => false,
+                };
+                let restricted_file_denied =
+                    matches!(
+                    std::fs::File::open("/etc/passwd"),
+                    Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied
+                );
+                let process_creation_denied = std::process::Command
+                    ::new("/bin/true")
+                    .status()
+                    .is_err();
+                // Signal syscalls are denied so a same-UID plugin cannot signal the backend or a
+                // neighbouring process when the deployment has not yet assigned a dedicated UID.
+                let cross_process_signal_denied =
+                    (unsafe { libc::kill(std::process::id() as libc::pid_t, 0) }) == -1 &&
+                    std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied;
+                // Seccomp rejects capability-set mutation before the kernel examines arguments.
+                #[cfg(target_os = "linux")]
+                let capability_mutation_denied =
+                    (unsafe {
+                        libc::syscall(
+                            libc::SYS_capset,
+                            std::ptr::null::<libc::c_void>(),
+                            std::ptr::null::<libc::c_void>()
+                        )
+                    }) == -1 &&
+                    std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied;
+                #[cfg(not(target_os = "linux"))]
+                let capability_mutation_denied = false;
+                let temp_path = std::env
+                    ::temp_dir()
+                    .join(format!("ezf-sandbox-probe-{}.tmp", std::process::id()));
+                let temp_write_allowed = match
+                    OpenOptions::new().write(true).create_new(true).open(&temp_path)
+                {
+                    Ok(mut file) => {
+                        let written = file.write_all(b"sandbox-temp-ok").is_ok();
+                        drop(file);
+                        let removed = std::fs::remove_file(&temp_path).is_ok();
+                        written && removed
+                    }
+                    Err(_) => false,
+                };
+                PluginEndpointResponse::json(
+                    200,
+                    &serde_json::json!({
+                    "network_denied": network_denied,
+                    "restricted_file_denied": restricted_file_denied,
+                    "process_creation_denied": process_creation_denied,
+                    "cross_process_signal_denied": cross_process_signal_denied,
+                    "capability_mutation_denied": capability_mutation_denied,
+                    "temp_write_allowed": temp_write_allowed,
+                })
+                )
+            }
             "database" if
                 (self.mode == "database_broker" || self.mode == "database_broker_datasource") &&
                 request.raw_path == "/pluginhost-integration/database"

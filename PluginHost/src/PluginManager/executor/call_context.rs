@@ -101,7 +101,7 @@ impl PluginCancellationToken {
         self.local.is_cancelled() || self.parent_check.as_ref().is_some_and(|check| check())
     }
 
-    pub(crate) fn subscribe(&self) -> Receiver<()> {
+    pub(crate) fn _subscribe(&self) -> Receiver<()> {
         let (sender, receiver) = mpsc::channel();
         // Evaluate a possible inherited ABI cancellation before taking the subscriber lock. The
         // parent callback is supplied by the caller and must not run while internal state is locked.
@@ -190,7 +190,7 @@ mod tests {
     fn cancellation_subscription_observes_local_cancellation() {
         let source = PluginCancellationSource::new(None);
         let token = source.token();
-        let notified = token.subscribe();
+        let notified = token._subscribe();
 
         assert!(!token.is_cancelled());
         source.cancel();
@@ -202,7 +202,7 @@ mod tests {
     fn subscription_after_cancellation_is_not_lost() {
         let source = PluginCancellationSource::new(None);
         source.cancel();
-        let notified = source.token().subscribe();
+        let notified = source.token()._subscribe();
         assert!(notified.try_recv().is_ok());
     }
 }

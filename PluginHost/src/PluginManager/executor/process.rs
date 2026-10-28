@@ -54,6 +54,7 @@ use PluginIpc::{
     IPC_MINOR_VERSION,
 };
 use std::path::{ Path, PathBuf };
+use std::ffi::OsString;
 use std::sync::atomic::{ AtomicBool, AtomicU64, AtomicUsize, Ordering };
 use std::sync::{ mpsc, Mutex };
 use std::thread::{ self, JoinHandle };
@@ -337,6 +338,25 @@ impl SocketDirectory {
         self.0.join("worker.sock")
     }
 
+    fn create_plugin_temp_directory(&self) -> Result<PathBuf, String> {
+        let path = self.0.join("plugin-tmp");
+        fs::DirBuilder
+            ::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| {
+                format!("could not create private plugin temp directory: {error}")
+            })?;
+        fs
+            ::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| {
+                format!("could not restrict plugin temp directory permissions: {error}")
+            })?;
+        path.canonicalize().map_err(|error|
+            format!("could not canonicalize plugin temp directory: {error}")
+        )
+    }
+
     fn cleanup(&self) {
         let _ = fs::remove_dir_all(&self.0);
     }
@@ -388,12 +408,6 @@ struct ProcessExecutor {
 
 impl ProcessExecutor {
     fn start(plugin_path: &Path, _config: &PluginRuntimeConfig) -> Result<Self, String> {
-        if !unconfined_mode_explicitly_allowed() {
-            return Err(
-                "process execution currently requires EZF_PLUGIN_ALLOW_UNCONFINED=1 because no OS sandbox is implemented".to_owned()
-            );
-        }
-
         let plugin_path = plugin_path
             .canonicalize()
             .map_err(|error| {
@@ -405,6 +419,7 @@ impl ProcessExecutor {
             );
         }
         let plugin_directory = plugin_path.parent().unwrap_or_else(|| Path::new("/"));
+        let sandbox_launch = configured_sandbox_launch(&plugin_path)?;
         let worker_binary = resolve_worker_binary()?;
         let socket_directory = SocketDirectory::create()?;
         let socket_path = socket_directory.socket_path();
@@ -418,15 +433,65 @@ impl ProcessExecutor {
             .set_nonblocking(true)
             .map_err(|error| format!("could not configure worker IPC listener: {error}"))?;
 
-        // This is deliberately an explicit development-only launch. It must not be treated as a
-        // production sandbox and will fail closed if the explicit opt-in is missing.
-        let child = Command::new(&worker_binary)
-            .arg("--ipc-socket")
-            .arg(&socket_path)
-            .arg("--allow-unconfined")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+        let mut command = Command::new(&worker_binary);
+        command.arg("--ipc-socket").arg(&socket_path);
+        match sandbox_launch.profile {
+            SandboxProfile::DevelopmentUnconfined => {
+                command.arg("--allow-unconfined");
+            }
+            SandboxProfile::DomainPlugin | SandboxProfile::DataSourcePlugin => {
+                command
+                    .arg("--sandbox-profile")
+                    .arg(sandbox_profile_argument(sandbox_launch.profile));
+                let temp_directory = socket_directory.create_plugin_temp_directory()?;
+                command.arg("--plugin-temp-dir").arg(&temp_directory);
+                for path in &sandbox_launch.extra_read_paths {
+                    command.arg("--extra-read-path").arg(path);
+                }
+                for path in &sandbox_launch.library_paths {
+                    command.arg("--extra-library-path").arg(path);
+                }
+                if sandbox_launch.profile == SandboxProfile::DataSourcePlugin {
+                    let ports = sandbox_launch.datasource_tcp_ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    command
+                        .arg("--datasource-tcp-ports")
+                        .arg(ports)
+                        .arg("--datasource-egress-policy-acknowledged");
+                }
+                // Enforced workers do not inherit backend secrets, proxy settings, loader overrides,
+                // or arbitrary open-environment configuration. Only explicitly allowlisted names
+                // are copied across this process boundary.
+                command.env_clear().current_dir(plugin_directory);
+                for (name, value) in &sandbox_launch.worker_environment {
+                    command.env(name, value);
+                }
+                if !sandbox_launch.library_paths.is_empty() {
+                    let paths = std::env
+                        ::join_paths(&sandbox_launch.library_paths)
+                        .map_err(|error|
+                            format!("could not encode trusted worker library paths: {error}")
+                        )?;
+                    // This is assembled only from canonical, operator-configured read-only paths;
+                    // arbitrary inherited LD_LIBRARY_PATH/LD_PRELOAD values are never propagated.
+                    command.env("LD_LIBRARY_PATH", paths);
+                }
+                command.env("TMPDIR", &temp_directory);
+                command.env("HOME", &temp_directory);
+            }
+        }
+        command.stdin(Stdio::null()).stdout(Stdio::null());
+        if sandbox_launch.profile == SandboxProfile::DevelopmentUnconfined {
+            command.stderr(Stdio::inherit());
+        } else {
+            // An enforced worker must not inherit the backend's stderr/log file descriptor. Setup
+            // diagnostics are returned through ProtocolError and exit telemetry is host-owned.
+            command.stderr(Stdio::null());
+        }
+        let child = command
             .spawn()
             .map_err(|error|
                 format!("could not start worker {}: {error}", worker_binary.display())
@@ -452,6 +517,7 @@ impl ProcessExecutor {
                 worker_build: format!("PluginHost/{}", env!("CARGO_PKG_VERSION")),
             }),
             MessageType::Hello,
+            None,
             limits
         )?;
 
@@ -467,7 +533,7 @@ impl ProcessExecutor {
             Duration::from_millis(100),
             Duration::from_secs(15)
         );
-        startup_round_trip(
+        let sandbox_status_frame = startup_round_trip(
             &mut stream,
             MessageType::Initialize,
             2,
@@ -482,22 +548,42 @@ impl ProcessExecutor {
                 // a DataSource plugin cannot recurse through the broker.
                 allowed_capabilities: vec![CapabilityKind::DatabaseExecute, CapabilityKind::Log],
                 runtime_limits: RuntimeLimits {
-                    // The current worker request loop is single-flight. Host admission may still
-                    // be concurrent, but this executor serializes requests to preserve framing.
                     max_concurrent_calls: 1,
                     max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES as u32,
                     cancellation_grace_ms: cancellation_grace
                         .as_millis()
                         .min(u64::MAX as u128) as u64,
                 },
-                sandbox_profile: SandboxProfile::DevelopmentUnconfined,
+                sandbox_profile: sandbox_launch.profile,
             }),
             MessageType::SandboxReady,
+            Some(sandbox_launch.profile),
             limits
         )?;
-        // `startup_round_trip` has checked SandboxReady's request ID, profile, and explicit
-        // `sandbox_enforced = false` declaration. No plugin request is dispatched until the
-        // subsequent Initialized response has also been validated.
+        let sandbox_status: SandboxReadyControl = sandbox_status_frame
+            .decode_control()
+            .map_err(|error| format!("invalid SandboxReady control: {error}"))?;
+        if sandbox_launch.profile == SandboxProfile::DevelopmentUnconfined {
+            log::warn!(
+                "starting plugin worker in DevelopmentUnconfined mode; no OS sandbox is active"
+            );
+        } else {
+            log::info!(
+                "plugin worker sandbox profile {:?} active features: {}",
+                sandbox_launch.profile,
+                sandbox_status.active_features.join(",")
+            );
+            for missing in &sandbox_status.missing_features {
+                log::warn!("plugin worker sandbox requires deployment control: {missing}");
+            }
+            if sandbox_launch.profile == SandboxProfile::DataSourcePlugin {
+                log::warn!(
+                    "DataSourcePlugin TCP port restrictions do not enforce destination IP allowlists; deployment firewall/container egress policy must be active"
+                );
+            }
+        }
+        // No plugin request is dispatched until SandboxReady has been validated and the worker
+        // has confirmed the selected policy before loading plugin code.
         let load = IpcFrame::with_control(
             MessageType::LoadPlugin,
             3,
@@ -541,6 +627,18 @@ impl ProcessExecutor {
         }
         let plugin_name = manifest.name.clone();
         let plugin_kind = manifest.kind;
+        match (sandbox_launch.profile, plugin_kind) {
+            | (SandboxProfile::DomainPlugin, PluginKind::Domain)
+            | (SandboxProfile::DataSourcePlugin, PluginKind::DataSource)
+            | (SandboxProfile::DevelopmentUnconfined, _) => {}
+            (profile, kind) => {
+                return Err(
+                    format!(
+                        "plugin manifest kind {kind:?} does not match configured sandbox profile {profile:?}; worker will be terminated"
+                    )
+                );
+            }
+        }
 
         // Disable startup timeouts before the long-lived reader takes ownership of a cloned stream.
         stream
@@ -569,7 +667,6 @@ impl ProcessExecutor {
             )
             .map_err(|error| format!("could not start worker IPC reader: {error}"))?;
 
-        log::warn!("starting plugin worker in DevelopmentUnconfined mode; no OS sandbox is active");
         let writer = Arc::new(Mutex::new(stream));
         let (capability_sender, capability_receiver) = mpsc::sync_channel::<CapabilityJob>(8);
         let broker_writer = Arc::clone(&writer);
@@ -1335,6 +1432,320 @@ pub(super) fn load_plugin(
     Ok(LoadedPlugin { runtime, manifest })
 }
 
+#[derive(Debug)]
+struct SandboxLaunchConfig {
+    profile: SandboxProfile,
+    extra_read_paths: Vec<PathBuf>,
+    library_paths: Vec<PathBuf>,
+    datasource_tcp_ports: Vec<u16>,
+    worker_environment: Vec<(String, OsString)>,
+}
+
+fn configured_sandbox_launch(plugin_path: &Path) -> Result<SandboxLaunchConfig, String> {
+    let path_key = plugin_path.to_string_lossy().into_owned();
+    let mapping_raw = std::env::var("EZF_PLUGIN_SANDBOX_PROFILES").ok();
+    let selected = if let Some(raw) = mapping_raw.as_ref() {
+        let value: serde_json::Value = serde_json
+            ::from_str(raw)
+            .map_err(|error| {
+                format!(
+                    "EZF_PLUGIN_SANDBOX_PROFILES must be a JSON object keyed by canonical absolute plugin path: {error}"
+                )
+            })?;
+        let mapping = value.as_object().ok_or("EZF_PLUGIN_SANDBOX_PROFILES must be a JSON object")?;
+        let value = mapping
+            .get(&path_key)
+            .ok_or_else(|| {
+                format!(
+                    "no sandbox profile configured for plugin path {path_key}; add this canonical path to EZF_PLUGIN_SANDBOX_PROFILES"
+                )
+            })?;
+        let value = value
+            .as_str()
+            .ok_or_else(|| { format!("sandbox profile value for {path_key} must be a string") })?;
+        Some(parse_sandbox_profile(value)?)
+    } else {
+        std::env
+            ::var("EZF_PLUGIN_SANDBOX_PROFILE")
+            .ok()
+            .map(|value| parse_sandbox_profile(&value))
+            .transpose()?
+    };
+    let profile = match selected {
+        Some(profile) => profile,
+        None if unconfined_mode_explicitly_allowed() => SandboxProfile::DevelopmentUnconfined,
+        None => {
+            return Err(
+                "process plugin execution requires EZF_PLUGIN_SANDBOX_PROFILE=domain_plugin (Linux enforced mode), a per-plugin EZF_PLUGIN_SANDBOX_PROFILES mapping, or the explicit development opt-in EZF_PLUGIN_ALLOW_UNCONFINED=1".into()
+            );
+        }
+    };
+
+    if profile == SandboxProfile::DevelopmentUnconfined {
+        if !unconfined_mode_explicitly_allowed() {
+            return Err(
+                "DevelopmentUnconfined requires the explicit EZF_PLUGIN_ALLOW_UNCONFINED=1 opt-in".into()
+            );
+        }
+        return Ok(SandboxLaunchConfig {
+            profile,
+            extra_read_paths: Vec::new(),
+            library_paths: Vec::new(),
+            datasource_tcp_ports: Vec::new(),
+            worker_environment: Vec::new(),
+        });
+    }
+    if !cfg!(target_os = "linux") {
+        return Err(
+            format!(
+                "sandbox profile {profile:?} is enforced only on Linux; this platform must remain in explicit DevelopmentUnconfined mode"
+            )
+        );
+    }
+
+    let mut library_paths = Vec::new();
+    if let Some(raw) = std::env::var_os("EZF_PLUGIN_SANDBOX_LIBRARY_PATHS") {
+        for path in std::env::split_paths(&raw) {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let canonical = path
+                .canonicalize()
+                .map_err(|error| {
+                    format!(
+                        "configured sandbox library path {} does not exist or cannot be canonicalized: {error}",
+                        path.display()
+                    )
+                })?;
+            if !canonical.is_dir() || canonical == Path::new("/") {
+                return Err(
+                    format!(
+                        "sandbox library path must be a specific directory, not {}",
+                        canonical.display()
+                    )
+                );
+            }
+            for forbidden in ["/proc", "/sys", "/dev", "/run"] {
+                if canonical == Path::new(forbidden) || canonical.starts_with(forbidden) {
+                    return Err(
+                        format!(
+                            "configured sandbox library path {} is not permitted",
+                            canonical.display()
+                        )
+                    );
+                }
+            }
+            for broad_root in ["/etc", "/home", "/root", "/var", "/tmp"] {
+                if canonical == Path::new(broad_root) {
+                    return Err(
+                        format!(
+                            "sandbox library path {broad_root} is too broad; configure a specific library directory"
+                        )
+                    );
+                }
+            }
+            let metadata = fs
+                ::metadata(&canonical)
+                .map_err(|error|
+                    format!("could not inspect library directory {}: {error}", canonical.display())
+                )?;
+            if (metadata.permissions().mode() & 0o022) != 0 {
+                return Err(
+                    format!(
+                        "sandbox library directory {} must not be group- or world-writable",
+                        canonical.display()
+                    )
+                );
+            }
+            library_paths.push(canonical);
+        }
+    }
+    library_paths.sort();
+    library_paths.dedup();
+
+    let mut extra_read_paths = library_paths.clone();
+    if let Some(raw) = std::env::var_os("EZF_PLUGIN_SANDBOX_READ_PATHS") {
+        for path in std::env::split_paths(&raw) {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let canonical = path
+                .canonicalize()
+                .map_err(|error| {
+                    format!(
+                        "configured sandbox read path {} does not exist or cannot be canonicalized: {error}",
+                        path.display()
+                    )
+                })?;
+            if canonical == Path::new("/") {
+                return Err(
+                    "EZF_PLUGIN_SANDBOX_READ_PATHS may not grant access to filesystem root".into()
+                );
+            }
+            for forbidden in ["/proc", "/sys", "/dev", "/run"] {
+                if canonical == Path::new(forbidden) || canonical.starts_with(forbidden) {
+                    return Err(
+                        format!(
+                            "configured sandbox read path {} is not permitted",
+                            canonical.display()
+                        )
+                    );
+                }
+            }
+            for broad_root in ["/etc", "/home", "/root", "/var", "/tmp"] {
+                if canonical == Path::new(broad_root) {
+                    return Err(
+                        format!(
+                            "sandbox read path {broad_root} is too broad; configure a specific file or subdirectory"
+                        )
+                    );
+                }
+            }
+            extra_read_paths.push(canonical);
+        }
+    }
+    extra_read_paths.sort();
+    extra_read_paths.dedup();
+
+    let mut datasource_tcp_ports = Vec::new();
+    if profile == SandboxProfile::DataSourcePlugin {
+        let acknowledged = std::env
+            ::var("EZF_PLUGIN_DATASOURCE_EGRESS_POLICY")
+            .map(|value| value.trim().eq_ignore_ascii_case("externally-enforced"))
+            .unwrap_or(false);
+        if !acknowledged {
+            return Err(
+                "DataSourcePlugin requires EZF_PLUGIN_DATASOURCE_EGRESS_POLICY=externally-enforced because IP-level egress allowlisting must be enforced by the deployment firewall/container".into()
+            );
+        }
+        let raw = std::env
+            ::var("EZF_PLUGIN_DATASOURCE_ALLOWED_TCP_PORTS")
+            .map_err(|_| {
+                "DataSourcePlugin requires EZF_PLUGIN_DATASOURCE_ALLOWED_TCP_PORTS (for example 1433)".to_owned()
+            })?;
+        for item in raw.split(',') {
+            let port = item
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("invalid DataSource TCP port {item:?}"))?;
+            if port == 0 {
+                return Err("DataSource TCP ports must be between 1 and 65535".into());
+            }
+            datasource_tcp_ports.push(port);
+        }
+        datasource_tcp_ports.sort_unstable();
+        datasource_tcp_ports.dedup();
+        if datasource_tcp_ports.is_empty() || datasource_tcp_ports.len() > 32 {
+            return Err("DataSource TCP port allowlist must contain between 1 and 32 ports".into());
+        }
+    }
+
+    let worker_environment = configured_worker_environment(profile)?;
+    Ok(SandboxLaunchConfig {
+        profile,
+        extra_read_paths,
+        library_paths,
+        datasource_tcp_ports,
+        worker_environment,
+    })
+}
+
+fn parse_sandbox_profile(value: &str) -> Result<SandboxProfile, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "domain_plugin" | "domain" => Ok(SandboxProfile::DomainPlugin),
+        "data_source_plugin" | "datasource" | "data_source" => Ok(SandboxProfile::DataSourcePlugin),
+        "development_unconfined" | "unconfined" => Ok(SandboxProfile::DevelopmentUnconfined),
+        other =>
+            Err(
+                format!(
+                    "unsupported plugin sandbox profile {other:?}; expected domain_plugin, data_source_plugin, or development_unconfined"
+                )
+            ),
+    }
+}
+
+fn sandbox_profile_argument(profile: SandboxProfile) -> &'static str {
+    match profile {
+        SandboxProfile::DomainPlugin => "domain_plugin",
+        SandboxProfile::DataSourcePlugin => "data_source_plugin",
+        SandboxProfile::DevelopmentUnconfined => "development_unconfined",
+    }
+}
+
+fn configured_worker_environment(
+    profile: SandboxProfile
+) -> Result<Vec<(String, OsString)>, String> {
+    let Some(raw) = std::env::var("EZF_PLUGIN_WORKER_ENV_ALLOWLIST").ok() else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    for name in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty()) {
+        if
+            !name.chars().all(|ch| { ch.is_ascii_alphanumeric() || ch == '_' }) ||
+            name.as_bytes()[0].is_ascii_digit()
+        {
+            return Err(
+                format!(
+                    "invalid environment variable name in EZF_PLUGIN_WORKER_ENV_ALLOWLIST: {name:?}"
+                )
+            );
+        }
+        let upper = name.to_ascii_uppercase();
+        if
+            upper.starts_with("LD_") ||
+            upper.starts_with("DYLD_") ||
+            upper.starts_with("EZF_PLUGIN_") ||
+            upper == "RUSTFLAGS" ||
+            upper == "TMPDIR" ||
+            upper == "TMP" ||
+            upper == "TEMP" ||
+            upper == "HOME" ||
+            upper == "PATH"
+        {
+            return Err(
+                format!(
+                    "environment variable {name} is not permitted in the plugin worker allowlist"
+                )
+            );
+        }
+        if
+            profile == SandboxProfile::DomainPlugin &&
+            [
+                "SECRET",
+                "TOKEN",
+                "PASSWORD",
+                "PASSWD",
+                "CREDENTIAL",
+                "DATABASE",
+                "CONNECTION",
+                "DB_",
+                "SQL",
+                "ODBC",
+                "MOLGENDB",
+                "PRIVATE_KEY",
+                "API_KEY",
+            ]
+                .iter()
+                .any(|marker| upper.contains(marker))
+        {
+            return Err(
+                format!(
+                    "secret/database-like environment variable name {name} cannot be passed to a DomainPlugin worker"
+                )
+            );
+        }
+        if let Some(value) = std::env::var_os(name) {
+            result.push((name.to_owned(), value));
+        }
+    }
+    result.sort_by(|left, right| left.0.cmp(&right.0));
+    result.dedup_by(|left, right| left.0 == right.0);
+    Ok(result)
+}
+
 fn unconfined_mode_explicitly_allowed() -> bool {
     std::env
         ::var("EZF_PLUGIN_ALLOW_UNCONFINED")
@@ -1443,6 +1854,7 @@ fn startup_round_trip<T: serde::Serialize>(
     request_id: u64,
     control: &T,
     expected_type: MessageType,
+    expected_sandbox_profile: Option<SandboxProfile>,
     limits: FrameLimits
 ) -> Result<IpcFrame, String> {
     let frame = IpcFrame::with_control(outgoing_type, request_id, control).map_err(|error|
@@ -1459,10 +1871,61 @@ fn startup_round_trip<T: serde::Serialize>(
         let sandbox: SandboxReadyControl = response
             .decode_control()
             .map_err(|error| format!("invalid SandboxReady control: {error}"))?;
-        if sandbox.profile != SandboxProfile::DevelopmentUnconfined || sandbox.sandbox_enforced {
+        let expected = expected_sandbox_profile.ok_or(
+            "missing expected sandbox profile for SandboxReady"
+        )?;
+        if sandbox.profile != expected {
             return Err(
-                "worker returned an unexpected sandbox status for DevelopmentUnconfined mode".to_owned()
+                format!(
+                    "worker returned sandbox profile {:?}, expected {:?}",
+                    sandbox.profile,
+                    expected
+                )
             );
+        }
+        if expected == SandboxProfile::DevelopmentUnconfined {
+            if sandbox.sandbox_enforced {
+                return Err(
+                    "worker incorrectly claimed an OS sandbox for DevelopmentUnconfined mode".to_owned()
+                );
+            }
+        } else {
+            if !sandbox.sandbox_enforced {
+                return Err(format!("worker did not enforce sandbox profile {:?}", expected));
+            }
+            for required in [
+                "prctl_no_new_privs",
+                "dumpable_disabled",
+                "effective_capabilities_zero",
+                "seccomp_process_creation_and_privilege_syscalls_restricted",
+                "seccomp_cross_process_signals_and_capability_mutation_denied",
+            ] {
+                if !sandbox.active_features.iter().any(|feature| feature == required) {
+                    return Err(
+                        format!(
+                            "worker reported enforced sandbox without required feature {required}"
+                        )
+                    );
+                }
+            }
+            if !sandbox.active_features.iter().any(|feature| feature.starts_with("landlock_abi_")) {
+                return Err(
+                    "worker reported enforced sandbox without active Landlock ABI".to_owned()
+                );
+            }
+            let profile_feature = match expected {
+                SandboxProfile::DomainPlugin => "seccomp_direct_network_syscalls_denied",
+                SandboxProfile::DataSourcePlugin => "landlock_tcp_connect_port_allowlist",
+                SandboxProfile::DevelopmentUnconfined => unreachable!(),
+            };
+            if !sandbox.active_features.iter().any(|feature| feature == profile_feature) {
+                return Err(
+                    format!(
+                        "worker reported enforced profile {:?} without required feature {profile_feature}",
+                        expected
+                    )
+                );
+            }
         }
     }
     Ok(response)

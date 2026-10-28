@@ -25,9 +25,29 @@ use self::lifecycle_executor::{
 };
 use self::worker_pool::{ PluginJob, PluginWorkerPool, PluginWorkerSubmitError };
 pub use self::config::PluginRuntimeConfig;
-pub use self::health::{ PluginHealthSnapshot, PluginHealthState };
+pub use self::health::{ PluginExecutorKind, PluginHealthSnapshot, PluginHealthState };
 use self::health::PluginHealthRuntimeState;
 use self::calls::{ PluginCallAccounting, PluginCallFailure, PluginCallGate, PluginCallTracker };
+
+/// Result of a runtime unload attempt. `ForcedTermination` means the worker process has been
+/// confirmed terminated/reaped and the registry entry can be removed, but plugin cleanup did not
+/// finish through the graceful lifecycle handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PluginUnloadOutcome {
+    Unloaded,
+    ForcedTermination,
+    Failed,
+}
+
+impl PluginUnloadOutcome {
+    pub(crate) fn is_graceful(self) -> bool {
+        self == Self::Unloaded
+    }
+
+    pub(crate) fn completed(self) -> bool {
+        matches!(self, Self::Unloaded | Self::ForcedTermination)
+    }
+}
 
 fn cleanup_call_context(operation_id: u64, timeout: std::time::Duration) -> PluginCallContext {
     PluginCallContext::new(
@@ -253,12 +273,18 @@ impl PluginRuntime {
         // Readiness/health probes must also notice a worker that exited while idle, before a new
         // endpoint happens to exercise the executor. `validate()` is non-blocking for both
         // implementations (the process executor uses Child::try_wait).
-        let executor_error = {
+        let (executor_kind, worker_pid, executor_error) = {
             let state = self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.destroyed {
-                None
-            } else {
-                state.executor.as_deref().and_then(|executor| executor.validate().err())
+            match state.executor.as_deref() {
+                Some(executor) => {
+                    let error = if state.destroyed {
+                        None
+                    } else {
+                        executor.validate().err()
+                    };
+                    (executor.kind(), executor.worker_pid(), error)
+                }
+                None => (PluginExecutorKind::InProcess, None, None),
             }
         };
         let mut health = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -271,6 +297,8 @@ impl PluginRuntime {
         PluginHealthSnapshot {
             name,
             state: health.state,
+            executor: executor_kind,
+            worker_pid,
             worker_threads: self.config.worker_threads,
             max_concurrent_calls: self.config.max_concurrent_calls,
             queue_capacity: self.worker_pool.queue_capacity,

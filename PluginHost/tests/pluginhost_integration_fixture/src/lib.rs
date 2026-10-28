@@ -1,6 +1,14 @@
 #![allow(non_snake_case)]
 
-use DatabaseContracts::{ DatabaseError, DatabaseRequest, DatabaseResponse };
+use DatabaseContracts::{
+    DatabaseColumn,
+    DatabaseError,
+    DatabaseRequest,
+    DatabaseResponse,
+    DatabaseRow,
+    DatabaseValue,
+    ResultSet,
+};
 use std::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
 use std::{ fs::OpenOptions, io::Write, path::PathBuf, thread, time::Duration };
 
@@ -42,6 +50,7 @@ struct PluginHostIntegration {
     loaded: bool,
     plugin_directory: Option<PathBuf>,
     database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>,
+    logger: Option<PluginContracts::ApiContract::PluginLogger>,
     mode: String,
 }
 
@@ -76,6 +85,9 @@ impl IPlugin for PluginHostIntegration {
         match self.mode.as_str() {
             "catalog_conflict" => "PluginHostIntegrationConflict".to_owned(),
             "database" => "PluginHostDatabaseBridge".to_owned(),
+            "database_broker" => "PluginHostDatabaseBroker".to_owned(),
+            "database_broker_datasource" => "PluginHostDatabaseBrokerDataSource".to_owned(),
+            "database_provider" => "PluginHostDatabaseProvider".to_owned(),
             _ => "PluginHostIntegration".to_owned(),
         }
     }
@@ -96,6 +108,7 @@ impl IPlugin for PluginHostIntegration {
     ) -> bool {
         self.plugin_directory = host_services.plugin_directory();
         self.database = host_services.database;
+        self.logger = Some(host_services.logger);
         self.mode = std::env::var("EZF_PLUGIN_FIXTURE_MODE").unwrap_or_default();
         if self.mode == "catalog_conflict" {
             self.write_marker("load-conflict.marker");
@@ -108,9 +121,14 @@ impl IPlugin for PluginHostIntegration {
     fn on_unload(&mut self, cancellation: &PluginCancellation) -> bool {
         self.record_lifecycle_event("on_unload");
         self.write_marker("unload.marker");
-        if self.mode == "slow_on_unload" && SLOW_ON_UNLOAD_ONCE.swap(false, Ordering::AcqRel) {
-            for _ in 0..30 {
-                if cancellation.is_cancelled() {
+        if
+            matches!(self.mode.as_str(), "slow_on_unload" | "slow_on_unload_ignore_cancel") &&
+            SLOW_ON_UNLOAD_ONCE.swap(false, Ordering::AcqRel)
+        {
+            let ignore_cancellation = self.mode == "slow_on_unload_ignore_cancel";
+            let iterations = if ignore_cancellation { 300 } else { 30 };
+            for _ in 0..iterations {
+                if !ignore_cancellation && cancellation.is_cancelled() {
                     self.write_marker("unload-cancelled.marker");
                     break;
                 }
@@ -127,9 +145,14 @@ impl IPlugin for PluginHostIntegration {
     fn on_destroy(&mut self, cancellation: &PluginCancellation) -> bool {
         self.record_lifecycle_event("on_destroy");
         self.write_marker("destroy.marker");
-        if self.mode == "slow_destroy" && SLOW_DESTROY_ONCE.swap(false, Ordering::AcqRel) {
-            for _ in 0..30 {
-                if cancellation.is_cancelled() {
+        if
+            matches!(self.mode.as_str(), "slow_destroy" | "slow_destroy_ignore_cancel") &&
+            SLOW_DESTROY_ONCE.swap(false, Ordering::AcqRel)
+        {
+            let ignore_cancellation = self.mode == "slow_destroy_ignore_cancel";
+            let iterations = if ignore_cancellation { 300 } else { 30 };
+            for _ in 0..iterations {
+                if !ignore_cancellation && cancellation.is_cancelled() {
                     self.write_marker("destroy-cancelled.marker");
                     break;
                 }
@@ -185,31 +208,51 @@ impl IPlugin for PluginHostIntegration {
             ("PluginHostIntegrationConflict".to_owned(), PluginKind::Domain)
         } else if self.mode == "database" {
             ("PluginHostDatabaseBridge".to_owned(), PluginKind::DataSource)
+        } else if self.mode == "database_broker" {
+            ("PluginHostDatabaseBroker".to_owned(), PluginKind::Domain)
+        } else if self.mode == "database_broker_datasource" {
+            ("PluginHostDatabaseBrokerDataSource".to_owned(), PluginKind::DataSource)
+        } else if self.mode == "database_provider" {
+            ("PluginHostDatabaseProvider".to_owned(), PluginKind::DataSource)
         } else {
             (self.name(), PluginKind::Domain)
         };
         let mut manifest = PluginManifest::new(name, "0.0.1", kind);
-        manifest.endpoints.push(
-            PluginEndpointDescriptor::get("ping", "/pluginhost-integration/ping").documented(
-                "PluginHostIntegration",
-                "Ping",
-                Some("Minimal endpoint used by PluginHost lifecycle integration tests")
-            )
-        );
-        manifest.endpoints.push(
-            PluginEndpointDescriptor::get("panic", "/pluginhost-integration/panic").documented(
-                "PluginHostIntegration",
-                "Panic",
-                Some("Endpoint used to verify ABI panic isolation")
-            )
-        );
-        manifest.endpoints.push(
-            PluginEndpointDescriptor::get("slow", "/pluginhost-integration/slow").documented(
-                "PluginHostIntegration",
-                "Slow",
-                Some("Endpoint used to verify concurrent calls and unload quiescing")
-            )
-        );
+        // The DataSource fixture is invoked only through ExecuteDatabase and deliberately exports
+        // no HTTP endpoints, so it can be loaded beside the Domain fixture without catalog clashes.
+        if self.mode != "database_provider" {
+            manifest.endpoints.push(
+                PluginEndpointDescriptor::get("ping", "/pluginhost-integration/ping").documented(
+                    "PluginHostIntegration",
+                    "Ping",
+                    Some("Minimal endpoint used by PluginHost lifecycle integration tests")
+                )
+            );
+            manifest.endpoints.push(
+                PluginEndpointDescriptor::get("panic", "/pluginhost-integration/panic").documented(
+                    "PluginHostIntegration",
+                    "Panic",
+                    Some("Endpoint used to verify ABI panic isolation")
+                )
+            );
+            manifest.endpoints.push(
+                PluginEndpointDescriptor::get("slow", "/pluginhost-integration/slow").documented(
+                    "PluginHostIntegration",
+                    "Slow",
+                    Some("Endpoint used to verify concurrent calls and unload quiescing")
+                )
+            );
+            manifest.endpoints.push(
+                PluginEndpointDescriptor::get(
+                    "database",
+                    "/pluginhost-integration/database"
+                ).documented(
+                    "PluginHostDatabaseBroker",
+                    "Database broker integration",
+                    Some("Endpoint that exercises database and logging callbacks through IPC")
+                )
+            );
+        }
         manifest
     }
 
@@ -234,6 +277,52 @@ impl IPlugin for PluginHostIntegration {
                         "worker_thread_id": current_worker_thread_id()
                     })
                 ),
+            "database" if
+                (self.mode == "database_broker" || self.mode == "database_broker_datasource") &&
+                request.raw_path == "/pluginhost-integration/database"
+            => {
+                if let Some(logger) = self.logger {
+                    logger.log(
+                        PluginContracts::ApiContract::PluginLogLevel::Info,
+                        "integration fixture starting database capability request"
+                    );
+                }
+                let query = DatabaseRequest::Query(DatabaseContracts::QueryRequest {
+                    statement: "SELECT 42".to_owned(),
+                    parameters: Vec::new(),
+                    columns: Vec::new(),
+                });
+                match self.execute_database(query, cancellation) {
+                    Ok(DatabaseResponse::Query(result)) =>
+                        PluginEndpointResponse::json(
+                            200,
+                            &serde_json::json!({
+                            "plugin": self.name(),
+                            "endpoint": "database",
+                            "rows": result.rows.len(),
+                            "loaded": self.loaded
+                        })
+                        ),
+                    Ok(DatabaseResponse::Execute(_)) =>
+                        Err(
+                            PluginEndpointError::new(
+                                502,
+                                "unexpected_database_response",
+                                "database broker returned Execute for Query",
+                                None
+                            )
+                        ),
+                    Err(error) =>
+                        Err(
+                            PluginEndpointError::new(
+                                502,
+                                "database_broker_failed",
+                                error.to_string(),
+                                None
+                            )
+                        ),
+                }
+            }
             "panic" if self.mode == "panic" => {
                 panic!("intentional PluginHost integration panic");
             }
@@ -317,7 +406,33 @@ impl IPlugin for PluginHostIntegration {
         request: DatabaseRequest,
         cancellation: &PluginCancellation
     ) -> Result<DatabaseResponse, DatabaseError> {
-        if self.mode != "database" {
+        if self.mode == "database_provider" {
+            return match request {
+                DatabaseRequest::Query(query) if query.statement.trim() == "SELECT 42" => {
+                    Ok(
+                        DatabaseResponse::Query(ResultSet {
+                            rows: vec![DatabaseRow {
+                                columns: vec![DatabaseColumn {
+                                    name: "answer".to_owned(),
+                                    value: DatabaseValue::I32(42),
+                                }],
+                            }],
+                        })
+                    )
+                }
+                _ =>
+                    Err(
+                        DatabaseError::unsupported(
+                            "database provider fixture only accepts SELECT 42"
+                        )
+                    ),
+            };
+        }
+        if
+            self.mode != "database" &&
+            self.mode != "database_broker" &&
+            self.mode != "database_broker_datasource"
+        {
             return Err(
                 DatabaseError::unsupported(
                     "PluginHostIntegration test fixture does not implement database execution"
@@ -386,6 +501,7 @@ impl PluginHostIntegration {
             loaded: false,
             plugin_directory: None,
             database: None,
+            logger: None,
             mode: String::new(),
         }
     }

@@ -1,20 +1,27 @@
-//! First process-backed worker implementation for integration testing.
+//! Process-backed worker with ABI V2 capability callbacks bridged over private IPC.
 //!
 //! This binary intentionally supports only the explicit DevelopmentUnconfined profile. It is
-//! not a production sandbox and must not be treated as one. The initial worker is single-flight:
-//! it executes one plugin callback at a time while Phase 4 proves the real process/ABI/IPC path.
+//! not a production sandbox and must not be treated as one. The worker is single-flight: it
+//! executes one plugin callback at a time, while DB callbacks perform a correlated IPC exchange
+//! and logs are forwarded to the supervisor.
 
 #[cfg(unix)]
 mod unix_worker {
     use PluginAbi::{
+        AbiBuffer,
         AbiSlice,
         PluginCancellationV2,
         PluginHostServicesV2,
         PLUGIN_ABI_VERSION_V2,
+        PLUGIN_STATUS_INVALID_ARGUMENT,
         PLUGIN_STATUS_OK,
     };
+    use DatabaseContracts::{ DatabaseError, DatabaseErrorKind, DatabaseResponse };
     use PluginExecutionCore::{ EndpointCallOutput, PluginLoadError };
     use PluginIpc::{
+        CapabilityKind,
+        CapabilityRequestControl,
+        CapabilityResultControl,
         FrameLimits,
         HelloControl,
         InitializeControl,
@@ -24,6 +31,8 @@ mod unix_worker {
         IpcErrorCode,
         IpcFrame,
         LoadPluginControl,
+        LogControl,
+        LogLevel,
         MessageType,
         PongControl,
         ProtocolErrorControl,
@@ -39,10 +48,247 @@ mod unix_worker {
     use std::ffi::c_void;
     use std::os::unix::net::UnixStream;
     use std::path::{ Path, PathBuf };
-    use std::sync::atomic::{ AtomicBool, Ordering };
+    use std::sync::atomic::{ AtomicBool, AtomicU64, Ordering };
+    use std::sync::{ Arc, Mutex, OnceLock, Weak };
     use std::time::Instant;
 
     const WORKER_BUILD: &str = env!("CARGO_PKG_VERSION");
+    const MAX_DATABASE_CAPABILITY_BYTES: usize = 1024 * 1024;
+    const MAX_PLUGIN_LOG_BYTES: usize = 16 * 1024;
+    const CAPABILITY_REQUEST_ID_BASE: u64 = 1 << 48;
+
+    static WORKER_CHANNEL: OnceLock<WorkerCapabilityChannel> = OnceLock::new();
+
+    /// Local ABI callbacks have no userdata parameter, so this process-wide channel is safe only
+    /// because each Worker process loads exactly one plugin. The request gate serializes the full
+    /// synchronous capability exchange; the main request loop is blocked inside the ABI callback
+    /// while this dedicated reader consumes its matching response.
+    struct WorkerCapabilityChannel {
+        writer: Mutex<UnixStream>,
+        reader: Mutex<UnixStream>,
+        request_gate: Mutex<()>,
+        next_request_id: AtomicU64,
+        active_request_id: AtomicU64,
+        active_operation_id: AtomicU64,
+        active_cancellation: Mutex<Option<Weak<AtomicBool>>>,
+        allowed_capabilities: Mutex<Vec<CapabilityKind>>,
+        limits: Mutex<FrameLimits>,
+    }
+
+    impl WorkerCapabilityChannel {
+        fn new(writer: UnixStream, reader: UnixStream) -> Self {
+            Self {
+                writer: Mutex::new(writer),
+                reader: Mutex::new(reader),
+                request_gate: Mutex::new(()),
+                next_request_id: AtomicU64::new(CAPABILITY_REQUEST_ID_BASE),
+                active_request_id: AtomicU64::new(0),
+                active_operation_id: AtomicU64::new(0),
+                active_cancellation: Mutex::new(None),
+                allowed_capabilities: Mutex::new(Vec::new()),
+                limits: Mutex::new(FrameLimits::default()),
+            }
+        }
+
+        fn set_limits(&self, limits: FrameLimits) {
+            *self.limits.lock().unwrap_or_else(|p| p.into_inner()) = limits;
+        }
+
+        fn set_capabilities(&self, capabilities: Vec<CapabilityKind>) {
+            *self.allowed_capabilities.lock().unwrap_or_else(|p| p.into_inner()) = capabilities;
+        }
+
+        fn has_capability(&self, capability: CapabilityKind) -> bool {
+            self.allowed_capabilities
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&capability)
+        }
+
+        fn begin_call(&self, request_id: u64, operation_id: u64, cancellation: &Arc<AtomicBool>) {
+            *self.active_cancellation.lock().unwrap_or_else(|p| p.into_inner()) = Some(
+                Arc::downgrade(cancellation)
+            );
+            self.active_operation_id.store(operation_id, Ordering::Release);
+            self.active_request_id.store(request_id, Ordering::Release);
+        }
+
+        fn end_call(&self, request_id: u64) {
+            if
+                self.active_request_id
+                    .compare_exchange(request_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                self.active_operation_id.store(0, Ordering::Release);
+                *self.active_cancellation.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+        }
+
+        fn write_frame(&self, frame: &IpcFrame, limits: FrameLimits) -> Result<(), String> {
+            let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+            frame.write_to(&mut *writer, limits).map_err(|error| error.to_string())
+        }
+
+        fn request_database(
+            &self,
+            payload: &[u8],
+            cancellation: PluginCancellationV2
+        ) -> Result<Vec<u8>, (IpcErrorCode, String)> {
+            let _gate = self.request_gate.lock().unwrap_or_else(|p| p.into_inner());
+            if !self.has_capability(CapabilityKind::DatabaseExecute) {
+                return Err((
+                    IpcErrorCode::CapabilityDenied,
+                    "host did not advertise the database capability".into(),
+                ));
+            }
+            let parent_request_id = self.active_request_id.load(Ordering::Acquire);
+            if parent_request_id == 0 {
+                return Err((
+                    IpcErrorCode::CapabilityDenied,
+                    "database capability is unavailable before an invocation is active".into(),
+                ));
+            }
+
+            let cancelled = unsafe { (cancellation.is_cancelled)(cancellation.context) };
+            if cancelled {
+                return Err((
+                    IpcErrorCode::Cancelled,
+                    "database capability was cancelled before dispatch".into(),
+                ));
+            }
+            if payload.len() > MAX_DATABASE_CAPABILITY_BYTES {
+                return Err((
+                    IpcErrorCode::ResourceLimitExceeded,
+                    format!(
+                        "database capability request exceeded {MAX_DATABASE_CAPABILITY_BYTES} bytes"
+                    ),
+                ));
+            }
+
+            let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            let operation_id = self.active_operation_id.load(Ordering::Acquire);
+            let limits = *self.limits.lock().unwrap_or_else(|p| p.into_inner());
+            let mut frame = IpcFrame::with_control(
+                MessageType::CapabilityRequest,
+                request_id,
+                &(CapabilityRequestControl {
+                    operation_id,
+                    capability: CapabilityKind::DatabaseExecute,
+                })
+            ).map_err(|error| (
+                IpcErrorCode::ProtocolViolation,
+                format!("could not encode CapabilityRequest: {error}"),
+            ))?;
+            frame.correlation_id = Some(parent_request_id);
+            frame.payload = payload.to_vec();
+            self
+                .write_frame(&frame, limits)
+                .map_err(|error| (
+                    IpcErrorCode::WorkerExited,
+                    format!("could not send CapabilityRequest: {error}"),
+                ))?;
+
+            loop {
+                let incoming = (
+                    {
+                        let mut reader = self.reader.lock().unwrap_or_else(|p| p.into_inner());
+                        IpcFrame::read_from(&mut *reader, limits)
+                    }
+                ).map_err(|error| (
+                    IpcErrorCode::WorkerExited,
+                    format!("could not receive CapabilityResult: {error}"),
+                ))?;
+
+                if
+                    incoming.message_type == MessageType::Cancel &&
+                    incoming.request_id == parent_request_id
+                {
+                    if
+                        let Some(cancellation) = self.active_cancellation
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                    {
+                        cancellation.store(true, Ordering::Release);
+                    }
+                    continue;
+                }
+                if
+                    incoming.message_type != MessageType::CapabilityResult ||
+                    incoming.request_id != request_id ||
+                    incoming.correlation_id != Some(parent_request_id)
+                {
+                    return Err((
+                        IpcErrorCode::ProtocolViolation,
+                        format!(
+                            "expected CapabilityResult request_id={} correlation_id={}, received {:?} request_id={} correlation_id={:?}",
+                            request_id,
+                            parent_request_id,
+                            incoming.message_type,
+                            incoming.request_id,
+                            incoming.correlation_id
+                        ),
+                    ));
+                }
+                let result: CapabilityResultControl = incoming
+                    .decode_control()
+                    .map_err(|error| {
+                        (
+                            IpcErrorCode::ProtocolViolation,
+                            format!("invalid CapabilityResult control: {error}"),
+                        )
+                    })?;
+                if result.success {
+                    return Ok(incoming.payload);
+                }
+                return Err((
+                    result.error_code.unwrap_or(IpcErrorCode::CapabilityDenied),
+                    result.error_message.unwrap_or_else(||
+                        "host denied database capability".into()
+                    ),
+                ));
+            }
+        }
+
+        fn send_log(&self, level: LogLevel, message: String) {
+            if !self.has_capability(CapabilityKind::Log) {
+                eprintln!(
+                    "ezf-plugin-worker: host did not advertise logging capability; plugin log suppressed"
+                );
+                return;
+            }
+            let mut message = message;
+            if message.len() > MAX_PLUGIN_LOG_BYTES {
+                let mut end = MAX_PLUGIN_LOG_BYTES;
+                while !message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                message.truncate(end);
+                message.push_str("… [truncated]");
+            }
+            let limits = *self.limits.lock().unwrap_or_else(|p| p.into_inner());
+            match IpcFrame::with_control(MessageType::Log, 0, &(LogControl { level, message })) {
+                Ok(frame) => {
+                    if let Err(error) = self.write_frame(&frame, limits) {
+                        eprintln!("ezf-plugin-worker: failed to send plugin log over IPC: {error}");
+                    }
+                }
+                Err(error) => eprintln!("ezf-plugin-worker: failed to encode plugin log: {error}"),
+            }
+        }
+    }
+
+    struct ActiveCallGuard {
+        channel: &'static WorkerCapabilityChannel,
+        request_id: u64,
+    }
+
+    impl Drop for ActiveCallGuard {
+        fn drop(&mut self) {
+            self.channel.end_call(self.request_id);
+        }
+    }
 
     pub fn main_entry() -> Result<(), String> {
         let (socket_path, allow_unconfined) = parse_args()?;
@@ -56,6 +302,11 @@ mod unix_worker {
         )?;
         stream.set_read_timeout(None).map_err(|e| format!("could not configure IPC socket: {e}"))?;
         stream.set_write_timeout(None).map_err(|e| format!("could not configure IPC socket: {e}"))?;
+        let writer = stream.try_clone().map_err(|e| format!("could not clone IPC writer: {e}"))?;
+        let reader = stream.try_clone().map_err(|e| format!("could not clone IPC reader: {e}"))?;
+        WORKER_CHANNEL.set(WorkerCapabilityChannel::new(writer, reader)).map_err(|_|
+            "worker IPC channel was initialized more than once".to_owned()
+        )?;
         serve(&mut stream, allow_unconfined)
     }
 
@@ -92,8 +343,8 @@ mod unix_worker {
         let started_at = Instant::now();
 
         let result = (|| {
-            // Phase 4 handshake. No library is loaded until the host explicitly selects the
-            // development-only unconfined profile and sends LoadPlugin.
+            // No library is loaded until the host explicitly selects the development-only
+            // unconfined profile and sends LoadPlugin.
             let hello = read_frame(stream, limits)?;
             if hello.message_type != MessageType::Hello {
                 send_protocol_error(
@@ -186,11 +437,15 @@ mod unix_worker {
             limits.max_frame_bytes = IPC_HEADER_LEN.saturating_add(
                 DEFAULT_MAX_CONTROL_BYTES
             ).saturating_add(limits.max_payload_bytes);
+            if let Some(channel) = WORKER_CHANNEL.get() {
+                channel.set_limits(limits);
+                channel.set_capabilities(init.allowed_capabilities.clone());
+            }
             let sandbox = SandboxReadyControl {
                 profile: PluginIpc::SandboxProfile::DevelopmentUnconfined,
                 sandbox_enforced: false,
-                active_features: Vec::new(),
-                missing_features: vec!["os_sandbox_not_implemented_in_phase_4".to_owned()],
+                active_features: vec!["ipc_capability_broker".to_owned(), "ipc_logging".to_owned()],
+                missing_features: vec!["os_sandbox_not_implemented".to_owned()],
             };
             send_control(
                 stream,
@@ -225,18 +480,6 @@ mod unix_worker {
                 return Err("requested plugin ABI version is not supported".into());
             }
             let init = initialized.as_ref().ok_or("worker initialization state is missing")?;
-            if init.allowed_capabilities.contains(&PluginIpc::CapabilityKind::DatabaseExecute) {
-                send_protocol_error(
-                    stream,
-                    load_frame.request_id,
-                    IpcErrorCode::CapabilityDenied,
-                    "database capability broker is not implemented in phase 4",
-                    limits
-                )?;
-                return Err(
-                    "DatabaseExecute requested before the capability broker is implemented".into()
-                );
-            }
             let plugin_path = PathBuf::from(&init.plugin_path);
             if !plugin_path.is_absolute() || !plugin_path.is_file() {
                 send_protocol_error(
@@ -261,8 +504,14 @@ mod unix_worker {
             }
             let directory_bytes = plugin_directory.to_string_lossy().into_owned().into_bytes();
             let directory_slice = AbiSlice::from_bytes(&directory_bytes);
-            // Log is local to the worker for this phase; database execution remains unavailable.
-            let host_services = PluginHostServicesV2::new(worker_log, None, None, directory_slice);
+            // ABI callbacks stay process-local. Database requests and plugin logs are brokered
+            // over the private IPC channel; the supervisor applies per-plugin policy before DB IO.
+            let host_services = PluginHostServicesV2::new(
+                worker_log,
+                Some(worker_database_execute),
+                Some(worker_free_buffer),
+                directory_slice
+            );
             let loaded = PluginExecutionCore::PluginExecutionCore::load(
                 &plugin_path,
                 &host_services
@@ -410,7 +659,12 @@ mod unix_worker {
                         let control: InvokeControl = decode_control(&frame)?;
                         let destroys_instance = control.operation == InvokeOperation::Destroy;
                         let calls_unload = control.operation == InvokeOperation::OnUnload;
-                        let result = invoke(core.as_ref(), control, &frame.payload);
+                        let result = invoke(
+                            core.as_ref(),
+                            frame.request_id,
+                            control,
+                            &frame.payload
+                        );
                         if calls_unload && result.is_ok() {
                             on_unload_completed = true;
                         }
@@ -464,8 +718,10 @@ mod unix_worker {
                         )?;
                     }
                     MessageType::Cancel => {
-                        // This first worker is single-flight and reads Cancel only between calls.
-                        // Actual in-flight cancellation is added with the worker execution pool.
+                        // While an ABI callback is waiting for a brokered capability, its cloned
+                        // socket reader consumes the matching Cancel and flips the active call's
+                        // cancellation flag. Reaching this branch therefore means the Cancel is
+                        // stale/idle (for example, the call already returned before it arrived).
                         eprintln!(
                             "ezf-plugin-worker: ignored stale/idle Cancel request_id={}",
                             frame.request_id
@@ -565,6 +821,7 @@ mod unix_worker {
 
     fn invoke(
         core: Option<&PluginExecutionCore::PluginExecutionCore>,
+        request_id: u64,
         control: InvokeControl,
         payload: &[u8]
     ) -> Result<Vec<u8>, (IpcErrorCode, String, Vec<u8>)> {
@@ -580,8 +837,12 @@ mod unix_worker {
             "plugin is not loaded".into(),
             Vec::new(),
         ))?;
-        let cancelled = AtomicBool::new(false);
+        let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation = cancellation_for(&cancelled);
+        let _active_call = WORKER_CHANNEL.get().map(|channel| {
+            channel.begin_call(request_id, control.operation_id, &cancelled);
+            ActiveCallGuard { channel, request_id }
+        });
         match control.operation {
             InvokeOperation::Name => core.name_bytes(cancellation).map_err(plugin_error),
             InvokeOperation::Manifest => core.manifest_bytes(cancellation).map_err(plugin_error),
@@ -694,7 +955,84 @@ mod unix_worker {
         let text = (unsafe { message.to_vec() })
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_else(|| "<plugin supplied invalid log buffer>".to_owned());
-        eprintln!("ezf-plugin-worker plugin-log[{level}]: {text}");
+        let level = match level {
+            1 => LogLevel::Error,
+            2 => LogLevel::Warn,
+            3 => LogLevel::Info,
+            4 => LogLevel::Debug,
+            5 => LogLevel::Trace,
+            _ => LogLevel::Error,
+        };
+        if let Some(channel) = WORKER_CHANNEL.get() {
+            channel.send_log(level, text);
+        } else {
+            eprintln!("ezf-plugin-worker plugin-log[{level:?}]: {text}");
+        }
+    }
+
+    unsafe extern "C" fn worker_database_execute(
+        request: AbiSlice,
+        cancellation: PluginCancellationV2,
+        response_out: *mut AbiBuffer
+    ) -> i32 {
+        if response_out.is_null() {
+            return PLUGIN_STATUS_INVALID_ARGUMENT;
+        }
+        unsafe {
+            *response_out = AbiBuffer::EMPTY;
+        }
+
+        let vc = unsafe { request.to_vec() };
+        let Some(request_bytes) = vc else {
+            return PLUGIN_STATUS_INVALID_ARGUMENT;
+        };
+        let Some(channel) = WORKER_CHANNEL.get() else {
+            let result = database_error_envelope(
+                DatabaseErrorKind::Unsupported,
+                "worker IPC capability channel is unavailable"
+            );
+            unsafe {
+                *response_out = AbiBuffer::from_vec(result);
+            }
+            return PLUGIN_STATUS_OK;
+        };
+        let result = match channel.request_database(&request_bytes, cancellation) {
+            Ok(response) => response,
+            Err((code, message)) => database_error_envelope(database_error_kind(code), &message),
+        };
+        unsafe {
+            *response_out = AbiBuffer::from_vec(result);
+        }
+        PLUGIN_STATUS_OK
+    }
+
+    unsafe extern "C" fn worker_free_buffer(buffer: AbiBuffer) {
+        unsafe {
+            buffer.free();
+        }
+    }
+
+    fn database_error_kind(code: IpcErrorCode) -> DatabaseErrorKind {
+        match code {
+            IpcErrorCode::CapabilityDenied => DatabaseErrorKind::Unsupported,
+            IpcErrorCode::ResourceLimitExceeded | IpcErrorCode::ProtocolViolation =>
+                DatabaseErrorKind::InvalidRequest,
+            IpcErrorCode::Cancelled => DatabaseErrorKind::Query,
+            | IpcErrorCode::WorkerExited
+            | IpcErrorCode::SandboxSetupFailed
+            | IpcErrorCode::UnsupportedProtocol
+            | IpcErrorCode::PluginError => DatabaseErrorKind::Connection,
+        }
+    }
+
+    fn database_error_envelope(kind: DatabaseErrorKind, message: &str) -> Vec<u8> {
+        serde_json
+            ::to_vec(
+                &Result::<DatabaseResponse, DatabaseError>::Err(DatabaseError::new(kind, message))
+            )
+            .unwrap_or_else(|_|
+                b"{\"Err\":{\"kind\":\"unsupported\",\"message\":\"database capability failed\"}}".to_vec()
+            )
     }
 
     fn read_frame(stream: &mut UnixStream, limits: FrameLimits) -> Result<IpcFrame, String> {
@@ -717,7 +1055,11 @@ mod unix_worker {
             error.to_string()
         )?;
         frame.payload = payload;
-        frame.write_to(stream, limits).map_err(|error| error.to_string())
+        if let Some(channel) = WORKER_CHANNEL.get() {
+            channel.write_frame(&frame, limits)
+        } else {
+            frame.write_to(stream, limits).map_err(|error| error.to_string())
+        }
     }
 
     fn send_protocol_error(

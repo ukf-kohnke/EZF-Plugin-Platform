@@ -4,6 +4,7 @@
 //! cancellation context to a process-local ABI descriptor. Library loading, VTable validation,
 //! ABI calls, and producer-owned buffer handling live in `PluginExecutionCore`.
 use super::{ PluginCallContext, PluginCancellationToken, PluginExecutor, PluginLifecycleStatus };
+use super::super::runtime::PluginExecutorKind;
 use super::super::{ LoadedPlugin, PluginRuntime, PluginRuntimeConfig };
 use crate::Factory::PluginManagerError;
 use log::LevelFilter;
@@ -80,6 +81,10 @@ impl InProcessExecutor {
 }
 
 impl PluginExecutor for InProcessExecutor {
+    fn kind(&self) -> PluginExecutorKind {
+        PluginExecutorKind::InProcess
+    }
+
     fn validate(&self) -> Result<(), String> {
         self.core.validate()
     }

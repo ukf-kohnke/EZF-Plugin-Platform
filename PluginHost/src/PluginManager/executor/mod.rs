@@ -16,6 +16,7 @@ pub(super) use self::call_context::{
 };
 pub(crate) use self::call_context::PluginCancellationLocalState;
 use super::{ LoadedPlugin, PluginRuntimeConfig };
+use super::runtime::PluginExecutorKind;
 use crate::Factory::PluginManagerError;
 use PluginContracts::ApiContract::{
     PluginEndpointError,
@@ -29,6 +30,9 @@ use PluginContracts::ApiContract::{
 pub(super) enum PluginLifecycleStatus {
     Success,
     Failed(i32),
+    /// A process-backed executor confirmed worker termination/reaping before the full graceful
+    /// lifecycle completed. The runtime may detach it, but must report cleanup as non-graceful.
+    ForcedTermination,
 }
 
 /// Operations understood by the runtime, independent of how plugin code is executed.
@@ -38,6 +42,14 @@ pub(super) enum PluginLifecycleStatus {
 /// is safe to inspect locally; process-backed executors must send only the operation id, remaining
 /// budget, and cancellation messages across IPC.
 pub(super) trait PluginExecutor: Send + Sync {
+    /// Identifies the concrete executor without leaking executor internals into the runtime.
+    fn kind(&self) -> PluginExecutorKind;
+
+    /// Returns the current child worker PID for process-backed execution, if one is alive.
+    fn worker_pid(&self) -> Option<u32> {
+        None
+    }
+
     /// Validates a newly constructed executor before runtime workers are created.
     fn validate(&self) -> Result<(), String>;
 
@@ -83,14 +95,27 @@ pub(super) trait PluginExecutor: Send + Sync {
     fn on_unload(&self, context: &PluginCallContext) -> Result<PluginLifecycleStatus, String>;
     fn destroy(&self, context: &PluginCallContext) -> Result<PluginLifecycleStatus, String>;
 
+    /// Additional bounded wait after lifecycle cancellation so process-backed executors can finish
+    /// their Cancel-Grace/Kill/Wait escalation. In-process callbacks cannot be safely killed and
+    /// therefore retain the conservative zero-grace behavior.
+    fn lifecycle_escalation_grace(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
+    /// True only when this executor can prove that its worker process has exited and been reaped.
+    /// In-process executors must always return false.
+    fn process_exit_confirmed(&self) -> bool {
+        false
+    }
+
     /// Best-effort fallback used only when the runtime itself is dropped without a successful
     /// explicit unload. It preserves the previous in-process cleanup behavior.
     fn emergency_shutdown(&self);
 }
 
 /// Selects the implementation behind the unchanged factory API. In-process execution remains the
-/// default; process execution is an explicit local/integration opt-in until the capability broker
-/// and enforced OS sandbox are implemented.
+/// default; process execution is an explicit local/integration opt-in until an enforced OS sandbox
+/// is implemented. The IPC capability broker is implemented but does not itself provide isolation.
 pub(super) fn load_plugin(
     path: &std::path::Path,
     config: PluginRuntimeConfig

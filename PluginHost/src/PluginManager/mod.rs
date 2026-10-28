@@ -17,8 +17,8 @@ use super::Factory::PluginManagerError;
 use glob::{ glob, GlobError };
 use std::{ collections::HashMap, path::{ Path, PathBuf }, sync::Arc };
 
-pub use self::runtime::{ PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
-pub(crate) use self::runtime::PluginRuntime;
+pub use self::runtime::{ PluginExecutorKind, PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
+pub(crate) use self::runtime::{ PluginRuntime, PluginUnloadOutcome };
 
 const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
 
@@ -83,7 +83,7 @@ impl IPlugin for PluginProxy {
     }
 
     fn on_unload(&mut self, _cancellation: &PluginCancellation) -> bool {
-        self.runtime.unload()
+        self.runtime.unload().is_graceful()
     }
 
     fn on_session_closed(

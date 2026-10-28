@@ -100,6 +100,9 @@ fn held_slow_request() -> PluginEndpointRequest {
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct TestGuard {
+    // Drop this guard before releasing the test lock so another test cannot observe a transient
+    // executor mode while the process-global registry is being reused.
+    _executor_mode: EnvironmentVariableGuard,
     _lock: MutexGuard<'static, ()>,
 }
 
@@ -126,8 +129,15 @@ impl Drop for TestGuard {
 }
 
 fn lock_test() -> TestGuard {
+    let lock = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // This integration target exercises the in-process ABI/runtime semantics (parallel callbacks,
+    // local cancellation pointers, and synchronous lifecycle callbacks). Pin the backend rather
+    // than inheriting a shell-wide EZF_PLUGIN_EXECUTOR=process setting. Dedicated ProcessExecutor
+    // coverage lives in PluginWorker/tests and selects `process` explicitly there.
+    let executor_mode = EnvironmentVariableGuard::set("EZF_PLUGIN_EXECUTOR", "in_process");
     TestGuard {
-        _lock: TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        _executor_mode: executor_mode,
+        _lock: lock,
     }
 }
 
@@ -1194,10 +1204,17 @@ fn on_unload_timeout_keeps_the_plugin_registered_until_callback_finishes() {
     assert_eq!(Factory::plugin_count(), 0);
     assert!(library.parent().unwrap().join("destroy.marker").is_file());
 
-    let lifecycle = std::fs::read_to_string(library.parent().unwrap().join("lifecycle.order"))
+    let lifecycle = std::fs
+        ::read_to_string(library.parent().unwrap().join("lifecycle.order"))
         .expect("fixture must record lifecycle events");
-    let on_unload_count = lifecycle.lines().filter(|line| *line == "on_unload").count();
-    let on_destroy_count = lifecycle.lines().filter(|line| *line == "on_destroy").count();
+    let on_unload_count = lifecycle
+        .lines()
+        .filter(|line| *line == "on_unload")
+        .count();
+    let on_destroy_count = lifecycle
+        .lines()
+        .filter(|line| *line == "on_destroy")
+        .count();
     assert_eq!(
         on_unload_count,
         1,
@@ -1294,20 +1311,23 @@ fn destroy_failure_keeps_the_instance_and_library_loaded_until_retry_succeeds() 
     Factory::unload_plugin(id).expect("second destroy must succeed after the one-shot failure");
     assert_eq!(Factory::plugin_count(), 0);
 
-    let lifecycle = fs::read_to_string(library.parent().unwrap().join("lifecycle.order"))
+    let lifecycle = fs
+        ::read_to_string(library.parent().unwrap().join("lifecycle.order"))
         .expect("fixture must record lifecycle events");
-    let on_unload_count = lifecycle.lines().filter(|line| *line == "on_unload").count();
-    let on_destroy_count = lifecycle.lines().filter(|line| *line == "on_destroy").count();
+    let on_unload_count = lifecycle
+        .lines()
+        .filter(|line| *line == "on_unload")
+        .count();
+    let on_destroy_count = lifecycle
+        .lines()
+        .filter(|line| *line == "on_destroy")
+        .count();
     assert_eq!(
         on_unload_count,
         1,
         "successful on_unload must not be repeated when destroy is retried: {lifecycle}"
     );
-    assert_eq!(
-        on_destroy_count,
-        2,
-        "one failed destroy plus one retry are expected: {lifecycle}"
-    );
+    assert_eq!(on_destroy_count, 2, "one failed destroy plus one retry are expected: {lifecycle}");
     let _ = fs::remove_dir_all(library.parent().unwrap());
 }
 

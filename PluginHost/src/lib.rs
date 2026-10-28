@@ -58,8 +58,10 @@
 //!   and return. The host never terminates a plugin thread or invalidates plugin memory.
 //! - On unload, every admitted call receives the same cancellation request and the runtime waits
 //!   for those calls to drain before `on_unload` and `destroy` are started. Lifecycle callbacks
-//!   themselves also receive a cooperative cancellation token. A lifecycle timeout leaves the
-//!   runtime registered until the callback actually returns, so a retry can safely continue.
+//!   themselves also receive a cooperative cancellation token. In-process lifecycle timeouts keep
+//!   the runtime registered until the callback actually returns. Process-backed callbacks instead
+//!   get a bounded Cancel-Grace/Kill/Wait escalation; confirmed forced termination detaches the
+//!   dead worker but is still reported as an unload error because plugin cleanup may be incomplete.
 //!
 //! # Return conventions
 //!
@@ -94,8 +96,9 @@ pub mod Factory {
         PluginEndpointRoute,
         PluginManager,
         PluginProxy,
+        PluginUnloadOutcome,
     };
-    pub use super::PluginManager::{ PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
+    pub use super::PluginManager::{ PluginExecutorKind, PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
     use PluginContracts::{
         IPlugin::IPlugin,
         ApiContract::{
@@ -426,28 +429,45 @@ pub mod Factory {
         };
 
         let started = std::time::Instant::now();
-        if runtime.unload() {
-            let elapsed = started.elapsed();
-            let removed_item = {
-                let singleton = instance();
-                let mut manager = singleton.inner
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                manager.detach_plugin(id)?
-            };
-
-            emit_log(
-                log::LevelFilter::Info,
-                &format!("Plugin unloaded successfully: id={} after {:?}", id, elapsed)
-            );
-            drop(removed_item);
-            Ok(())
-        } else {
+        let outcome = runtime.unload();
+        if !outcome.completed() {
             emit_log(
                 log::LevelFilter::Error,
                 &format!("Plugin unload failed or timed out: id={}", id)
             );
-            Err(PluginManagerError::PluginUnloadFailed { id })
+            return Err(PluginManagerError::PluginUnloadFailed { id });
+        }
+
+        let elapsed = started.elapsed();
+        let removed_item = {
+            let singleton = instance();
+            let mut manager = singleton.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            manager.detach_plugin(id)?
+        };
+        drop(removed_item);
+
+        match outcome {
+            PluginUnloadOutcome::Unloaded => {
+                emit_log(
+                    log::LevelFilter::Info,
+                    &format!("Plugin unloaded gracefully: id={} after {:?}", id, elapsed)
+                );
+                Ok(())
+            }
+            PluginUnloadOutcome::ForcedTermination => {
+                emit_log(
+                    log::LevelFilter::Error,
+                    &format!(
+                        "Plugin unload ended non-gracefully; worker process reaped and registry entry removed: id={} after {:?}",
+                        id,
+                        elapsed
+                    )
+                );
+                Err(PluginManagerError::PluginUnloadFailed { id })
+            }
+            PluginUnloadOutcome::Failed => Err(PluginManagerError::PluginUnloadFailed { id }),
         }
     }
 
@@ -597,6 +617,7 @@ pub mod Factory {
                     canonical_path.display()
                 )
             );
+            log_plugin_executor_snapshot(&plugin_manifest.name, &canonical_path);
         }
         result
     }
@@ -726,7 +747,10 @@ pub mod Factory {
             };
 
             match registration {
-                Ok(_) => report.loaded.push(plugin_name),
+                Ok(_) => {
+                    report.loaded.push(plugin_name.clone());
+                    log_plugin_executor_snapshot(&plugin_name, &canonical_path);
+                }
                 Err(error) =>
                     report.failures.push(PluginLoadFailure {
                         path: canonical_path,
@@ -803,13 +827,13 @@ pub mod Factory {
             emit_log(
                 level,
                 &format!(
-                    "{} plugin '{}' at '{}' could not be loaded: {}",
+                    "PLUGIN_LOAD_FAILURE requirement={} plugin={:?} path={:?} error={:?}",
                     match failure.requirement {
-                        PluginRequirement::Required => "Required",
-                        PluginRequirement::Optional => "Optional",
+                        PluginRequirement::Required => "required",
+                        PluginRequirement::Optional => "optional",
                     },
                     failure.plugin_name.as_deref().unwrap_or("unknown"),
-                    failure.path.display(),
+                    failure.path.display().to_string(),
                     failure.error
                 )
             );
@@ -839,6 +863,37 @@ pub mod Factory {
         plugin_path: &str
     ) -> Result<bool, PluginManagerError> {
         is_plugin_loaded(plugin_name, plugin_path)
+    }
+
+    /// Emit the selected execution backend and current child PID after a plugin is registered.
+    /// This log is independent of EZF_API_TIMING so executor selection is visible in normal startup logs.
+    fn log_plugin_executor_snapshot(plugin_name: &str, path: &Path) {
+        match plugin_health_by_name(plugin_name) {
+            Some(snapshot) => {
+                let worker_pid = snapshot.worker_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "none".to_owned());
+                emit_log(
+                    log::LevelFilter::Info,
+                    &format!(
+                        "PLUGIN_EXECUTOR component={:?} executor={} worker_pid={} state={:?} path={:?}",
+                        snapshot.name,
+                        snapshot.executor.as_str(),
+                        worker_pid,
+                        snapshot.state,
+                        path.display().to_string()
+                    )
+                );
+            }
+            None => emit_log(
+                log::LevelFilter::Warn,
+                &format!(
+                    "PLUGIN_EXECUTOR component={:?} executor=unknown worker_pid=none state=unknown path={:?} diagnostic=health_snapshot_unavailable",
+                    plugin_name,
+                    path.display().to_string()
+                )
+            ),
+        }
     }
 
     /// Returns health/telemetry snapshots for all loaded plugins in deterministic plugin-id order.

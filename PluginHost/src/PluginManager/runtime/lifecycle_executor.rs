@@ -14,6 +14,7 @@ pub(super) struct PendingPluginLifecycle {
     pub(super) operation: PluginLifecycleOperation,
     pub(super) receiver: mpsc::Receiver<Result<PluginLifecycleStatus, String>>,
     pub(super) cancellation: PluginCancellationSource,
+    pub(super) escalation_grace: std::time::Duration,
 }
 
 pub(super) type PluginLifecycleJob = Box<
@@ -21,9 +22,10 @@ pub(super) type PluginLifecycleJob = Box<
 >;
 
 /// Dedicated single-worker executor for lifecycle callbacks. Lifecycle operations do not consume
-/// normal request-worker capacity. A timed-out callback is intentionally allowed to finish on this
-/// persistent worker; the runtime remains registered and will only proceed to the next lifecycle
-/// stage after the callback's actual result has been observed.
+/// normal request-worker capacity. A timed-out in-process callback is allowed to finish on this
+/// persistent worker and remains registered until its actual result is observed. For a process-backed
+/// executor, the runtime also waits for its bounded cancellation escalation and only detaches after
+/// process exit/reaping has been confirmed.
 pub(super) struct PluginLifecycleExecutor {
     sender: Mutex<Option<mpsc::SyncSender<PluginLifecycleJob>>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,

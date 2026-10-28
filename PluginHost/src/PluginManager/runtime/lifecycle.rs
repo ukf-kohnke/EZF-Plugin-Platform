@@ -17,6 +17,7 @@ impl PluginRuntime {
         }
 
         let cancellation = PluginCancellationSource::new(None);
+        let escalation_grace = executor.lifecycle_escalation_grace();
         let operation_id = self.next_call_id.fetch_add(1, Ordering::Relaxed) + 1;
         let deadline = Instant::now() + self.config.lifecycle_timeout;
         let call_context = PluginCallContext::new(operation_id, deadline, cancellation.token());
@@ -30,7 +31,12 @@ impl PluginRuntime {
                 }
             })
         )?;
-        *pending = Some(PendingPluginLifecycle { operation, receiver, cancellation });
+        *pending = Some(PendingPluginLifecycle {
+            operation,
+            receiver,
+            cancellation,
+            escalation_grace,
+        });
         Ok(())
     }
 
@@ -55,6 +61,39 @@ impl PluginRuntime {
             Ok(result) => Ok(Some((pending.operation, result))),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 pending.cancellation.cancel();
+
+                // Process-backed callbacks need a bounded interval to send Cancel, consume the
+                // configured cancellation grace, and kill/reap an uncooperative child. This is
+                // intentionally zero for InProcessExecutor: a native thread cannot be killed
+                // safely, so its callback remains pending and the plugin stays registered.
+                if !pending.escalation_grace.is_zero() {
+                    match pending.receiver.recv_timeout(pending.escalation_grace) {
+                        Ok(result) => {
+                            return Ok(Some((pending.operation, result)));
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Ok(
+                                Some((
+                                    pending.operation,
+                                    Err(
+                                        "plugin lifecycle worker disconnected during cancellation escalation".to_owned()
+                                    ),
+                                ))
+                            );
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+
+                // The child may already be reaped even if the lifecycle executor thread has not
+                // yet published its result. In that case the process boundary is complete and we
+                // must not require a second public unload attempt merely to observe the channel.
+                if self.process_exit_confirmed() {
+                    return Ok(
+                        Some((pending.operation, Ok(PluginLifecycleStatus::ForcedTermination)))
+                    );
+                }
+
                 let mut slot = self.pending_lifecycle
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -72,6 +111,11 @@ impl PluginRuntime {
         }
     }
 
+    fn process_exit_confirmed(&self) -> bool {
+        let state = self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.executor.as_ref().is_some_and(|executor| executor.process_exit_confirmed())
+    }
+
     fn validate_lifecycle_executor(&self) -> Result<Arc<dyn PluginExecutor>, String> {
         let state = self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.destroyed {
@@ -85,13 +129,13 @@ impl PluginRuntime {
         Ok(executor)
     }
 
-    fn complete_destroy_success(&self) -> bool {
+    fn complete_destroy_success(&self) -> PluginUnloadOutcome {
         let mut state = match self.state.write() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
         if state.executor.is_none() || state.destroyed {
-            return false;
+            return PluginUnloadOutcome::Failed;
         }
         // Mark the opaque instance as destroyed, but retain the executor/library image until the
         // final PluginRuntime reference is dropped, matching the previous unload behavior.
@@ -100,17 +144,39 @@ impl PluginRuntime {
         self.unloading.store(false, Ordering::Release);
         self.worker_pool.shutdown();
         self.lifecycle_executor.shutdown();
-        true
+        PluginUnloadOutcome::Unloaded
+    }
+
+    /// Detaches a process-backed plugin after the executor confirms that its worker is dead and
+    /// reaped, while preserving the fact that plugin cleanup did not finish gracefully. This also
+    /// covers a worker killed during `on_unload` or `destroy`, not just a failed shutdown handshake.
+    fn complete_forced_termination(&self) -> PluginUnloadOutcome {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.executor.is_none() || state.destroyed {
+            return PluginUnloadOutcome::Failed;
+        }
+        state.destroyed = true;
+        self.set_health_error(
+            PluginHealthState::Failed,
+            "plugin worker termination/reaping was confirmed before graceful lifecycle completion; plugin cleanup may be incomplete"
+        );
+        self.unloading.store(false, Ordering::Release);
+        self.worker_pool.shutdown();
+        self.lifecycle_executor.shutdown();
+        PluginUnloadOutcome::ForcedTermination
     }
 
     /// Runs or retries the destroy phase after `on_unload` has completed successfully.
     /// Keeping the phases separate ensures a timeout or destroy failure never causes a
     /// completed `on_unload` callback to be invoked a second time.
-    fn finish_destroy_lifecycle(&self, executor: Arc<dyn PluginExecutor>) -> bool {
+    fn finish_destroy_lifecycle(&self, executor: Arc<dyn PluginExecutor>) -> PluginUnloadOutcome {
         if let Err(message) = self.start_destroy_operation(executor) {
             self.unloading.store(false, Ordering::Release);
             self.set_health_error(PluginHealthState::Failed, message);
-            return false;
+            return PluginUnloadOutcome::Failed;
         }
 
         match self.wait_for_pending_lifecycle() {
@@ -120,10 +186,18 @@ impl PluginRuntime {
                     self.config.lifecycle_timeout
                 );
                 self.set_health_error(PluginHealthState::Stopping, message);
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(Some((PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Success)))) =>
                 self.complete_destroy_success(),
+            Ok(
+                Some(
+                    (
+                        PluginLifecycleOperation::Destroy,
+                        Ok(PluginLifecycleStatus::ForcedTermination),
+                    ),
+                ),
+            ) => self.complete_forced_termination(),
             Ok(
                 Some(
                     (PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Failed(status))),
@@ -134,7 +208,7 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     format!("plugin destroy returned status {status}")
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(Some((_, Err(message)))) => {
                 self.unloading.store(false, Ordering::Release);
@@ -142,7 +216,7 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     format!("plugin destroy failed: {message}")
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(None) => {
                 self.unloading.store(false, Ordering::Release);
@@ -150,7 +224,7 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     "plugin destroy lifecycle result was unexpectedly absent"
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(Some((PluginLifecycleOperation::OnUnload, Ok(PluginLifecycleStatus::Success)))) => {
                 self.unloading.store(false, Ordering::Release);
@@ -158,7 +232,7 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     "unexpected on_unload result while waiting for plugin destroy: 0"
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(
                 Some(
@@ -172,7 +246,22 @@ impl PluginRuntime {
                         "unexpected on_unload result while waiting for plugin destroy: {status}"
                     )
                 );
-                false
+                PluginUnloadOutcome::Failed
+            }
+            Ok(
+                Some(
+                    (
+                        PluginLifecycleOperation::OnUnload,
+                        Ok(PluginLifecycleStatus::ForcedTermination),
+                    ),
+                ),
+            ) => {
+                self.unloading.store(false, Ordering::Release);
+                self.set_health_error(
+                    PluginHealthState::Failed,
+                    "unexpected forced termination result while waiting for plugin on_unload"
+                );
+                PluginUnloadOutcome::Failed
             }
             Err(false) => {
                 self.unloading.store(false, Ordering::Release);
@@ -180,15 +269,15 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     "plugin destroy lifecycle wait failed"
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
         }
     }
 
-    /// Quiesces the plugin with a bounded wait. A timeout never forcefully unloads a library while
-    /// plugin work is still executing or queued; the manager keeps the plugin registered so the
-    /// operation can be retried safely after all admitted calls drain.
-    pub(crate) fn unload(&self) -> bool {
+    /// Quiesces the plugin with a bounded wait. In-process code is never forcefully removed while
+    /// its native callback is running. A process-backed executor may complete non-gracefully only
+    /// after it confirms the child has exited and has been reaped.
+    pub(crate) fn unload(&self) -> PluginUnloadOutcome {
         // A prior lifecycle callback may still be finishing after its caller-side timeout. In that
         // case the runtime remains in `Stopping`; a subsequent unload retries by first observing
         // the actual callback result. No lifecycle stage is invoked concurrently.
@@ -207,7 +296,7 @@ impl PluginRuntime {
                             self.config.lifecycle_timeout
                         )
                     );
-                    return false;
+                    return PluginUnloadOutcome::Failed;
                 }
                 Err(false) => {
                     self.unloading.store(false, Ordering::Release);
@@ -215,7 +304,7 @@ impl PluginRuntime {
                         PluginHealthState::Failed,
                         "plugin lifecycle callback failed".to_string()
                     );
-                    return false;
+                    return PluginUnloadOutcome::Failed;
                 }
                 Ok(None) => {}
                 Ok(Some((operation, result))) => {
@@ -230,9 +319,12 @@ impl PluginRuntime {
                             let executor = match self.validate_lifecycle_executor() {
                                 Ok(value) => value,
                                 Err(message) => {
+                                    if self.process_exit_confirmed() {
+                                        return self.complete_forced_termination();
+                                    }
                                     self.unloading.store(false, Ordering::Release);
                                     self.set_health_error(PluginHealthState::Failed, message);
-                                    return false;
+                                    return PluginUnloadOutcome::Failed;
                                 }
                             };
                             return self.finish_destroy_lifecycle(executor);
@@ -246,10 +338,22 @@ impl PluginRuntime {
                                 PluginHealthState::Failed,
                                 format!("plugin on_unload returned status {status}")
                             );
-                            return false;
+                            return PluginUnloadOutcome::Failed;
+                        }
+                        (
+                            PluginLifecycleOperation::OnUnload,
+                            Ok(PluginLifecycleStatus::ForcedTermination),
+                        ) => {
+                            return self.complete_forced_termination();
                         }
                         (PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Success)) => {
                             return self.complete_destroy_success();
+                        }
+                        (
+                            PluginLifecycleOperation::Destroy,
+                            Ok(PluginLifecycleStatus::ForcedTermination),
+                        ) => {
+                            return self.complete_forced_termination();
                         }
                         (
                             PluginLifecycleOperation::Destroy,
@@ -260,7 +364,7 @@ impl PluginRuntime {
                                 PluginHealthState::Failed,
                                 format!("plugin destroy returned status {status}")
                             );
-                            return false;
+                            return PluginUnloadOutcome::Failed;
                         }
                         (operation, Err(message)) => {
                             self.unloading.store(false, Ordering::Release);
@@ -270,13 +374,13 @@ impl PluginRuntime {
                                     "plugin lifecycle operation {operation:?} failed: {message}"
                                 )
                             );
-                            return false;
+                            return PluginUnloadOutcome::Failed;
                         }
                     }
                 }
             }
         } else if self.unloading.swap(true, Ordering::AcqRel) {
-            return false;
+            return PluginUnloadOutcome::Failed;
         }
 
         self.set_health(PluginHealthState::Stopping);
@@ -290,15 +394,18 @@ impl PluginRuntime {
                 self.config.unload_timeout
             );
             self.set_health_error(PluginHealthState::Degraded, message);
-            return false;
+            return PluginUnloadOutcome::Failed;
         }
 
         let executor = match self.validate_lifecycle_executor() {
             Ok(value) => value,
             Err(message) => {
+                if self.process_exit_confirmed() {
+                    return self.complete_forced_termination();
+                }
                 self.unloading.store(false, Ordering::Release);
                 self.set_health_error(PluginHealthState::Failed, message);
-                return false;
+                return PluginUnloadOutcome::Failed;
             }
         };
 
@@ -314,7 +421,7 @@ impl PluginRuntime {
         {
             self.unloading.store(false, Ordering::Release);
             self.set_health_error(PluginHealthState::Failed, message);
-            return false;
+            return PluginUnloadOutcome::Failed;
         }
 
         match self.wait_for_pending_lifecycle() {
@@ -324,7 +431,7 @@ impl PluginRuntime {
                     self.config.lifecycle_timeout
                 );
                 self.set_health_error(PluginHealthState::Stopping, message);
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(Some((PluginLifecycleOperation::OnUnload, Ok(PluginLifecycleStatus::Success)))) => {
                 self.on_unload_completed.store(true, Ordering::Release);
@@ -340,15 +447,23 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     format!("plugin on_unload returned status {status}")
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
+            Ok(
+                Some(
+                    (
+                        PluginLifecycleOperation::OnUnload,
+                        Ok(PluginLifecycleStatus::ForcedTermination),
+                    ),
+                ),
+            ) => self.complete_forced_termination(),
             Ok(Some((PluginLifecycleOperation::OnUnload, Err(message)))) => {
                 self.unloading.store(false, Ordering::Release);
                 self.set_health_error(
                     PluginHealthState::Failed,
                     format!("plugin on_unload failed: {message}")
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(Some((PluginLifecycleOperation::Destroy, Ok(PluginLifecycleStatus::Success)))) => {
                 self.unloading.store(false, Ordering::Release);
@@ -356,7 +471,7 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     "plugin destroy returned status 0 after on_unload completed"
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(
                 Some(
@@ -368,7 +483,22 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     format!("plugin destroy returned status {status} after on_unload completed")
                 );
-                false
+                PluginUnloadOutcome::Failed
+            }
+            Ok(
+                Some(
+                    (
+                        PluginLifecycleOperation::Destroy,
+                        Ok(PluginLifecycleStatus::ForcedTermination),
+                    ),
+                ),
+            ) => {
+                self.unloading.store(false, Ordering::Release);
+                self.set_health_error(
+                    PluginHealthState::Failed,
+                    "unexpected forced termination result for destroy before on_unload completed"
+                );
+                PluginUnloadOutcome::Failed
             }
             Ok(Some((PluginLifecycleOperation::Destroy, Err(message)))) => {
                 self.unloading.store(false, Ordering::Release);
@@ -376,7 +506,7 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     format!("plugin destroy failed after on_unload completed: {message}")
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
             Ok(None) => {
                 self.unloading.store(false, Ordering::Release);
@@ -384,7 +514,7 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     "plugin on_unload lifecycle result was unexpectedly absent"
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
             Err(false) => {
                 self.unloading.store(false, Ordering::Release);
@@ -392,7 +522,7 @@ impl PluginRuntime {
                     PluginHealthState::Failed,
                     "plugin on_unload lifecycle wait failed"
                 );
-                false
+                PluginUnloadOutcome::Failed
             }
         }
     }

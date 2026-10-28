@@ -1,8 +1,8 @@
-//! Versioned IPC protocol primitives for a future process-backed plugin executor.
+//! Versioned IPC protocol primitives for the process-backed plugin executor.
 //!
-//! This crate intentionally contains no process spawning, sockets, OS sandboxing, plugin loading,
-//! or host services. It defines a stable wire frame and bounded synchronous framing helpers. The
-//! actual transport and request multiplexing will be layered on top in a later phase.
+//! This crate intentionally contains no process spawning, OS sandboxing, plugin loading, or host
+//! services. It defines the stable wire frames and bounded synchronous framing helpers used for
+//! supervisor/worker calls, correlated capability requests/results, cancellation, and plugin logs.
 #![allow(non_snake_case)]
 use serde::{ de::DeserializeOwned, Deserialize, Serialize };
 use std::fmt;

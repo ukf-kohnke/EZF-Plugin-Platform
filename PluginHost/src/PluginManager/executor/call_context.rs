@@ -101,9 +101,6 @@ impl PluginCancellationToken {
         self.local.is_cancelled() || self.parent_check.as_ref().is_some_and(|check| check())
     }
 
-    /// Subscribe to local cancellation. If cancellation has already been requested (or the parent
-    /// is already cancelled), the returned receiver is notified immediately. Parent cancellation
-    /// that happens later remains observable through `is_cancelled()`.
     pub(crate) fn subscribe(&self) -> Receiver<()> {
         let (sender, receiver) = mpsc::channel();
         // Evaluate a possible inherited ABI cancellation before taking the subscriber lock. The

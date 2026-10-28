@@ -6,6 +6,14 @@ use log::LevelFilter;
 use std::sync::mpsc;
 use std::time::Instant;
 
+struct ParentCancellationContextGuard<'a>(&'a PluginCallTracker);
+
+impl Drop for ParentCancellationContextGuard<'_> {
+    fn drop(&mut self) {
+        self.0.invalidate_parent_context();
+    }
+}
+
 impl PluginRuntime {
     pub(super) fn call_with_timeout<R, F>(
         self: &Arc<Self>,
@@ -75,6 +83,9 @@ impl PluginRuntime {
             F: FnOnce(&PluginRuntime, PluginCallContext) -> Result<R, String> + Send + 'static
     {
         let tracker = Arc::new(PluginCallTracker::new(parent_cancellation));
+        // The nested job may continue draining after a caller-visible timeout. On every return
+        // path, invalidate the borrowed ABI callback under a mutex before the caller can drop it.
+        let _parent_context_guard = ParentCancellationContextGuard(tracker.as_ref());
         let permit = match self.gate.try_acquire(tracker.cancellation_source()) {
             Ok(permit) => permit,
             Err(_) => {

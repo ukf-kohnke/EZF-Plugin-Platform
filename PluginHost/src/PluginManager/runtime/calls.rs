@@ -122,18 +122,40 @@ enum PluginCallLifecycleState {
 pub(super) struct PluginCallTracker {
     state: Mutex<PluginCallLifecycleState>,
     cancellation: PluginCancellationSource,
+    // The ABI cancellation descriptor borrows its context from the caller. A nested call may
+    // outlive its caller after timeout, so gate callback access and invalidate it before return.
+    parent_context: Option<Arc<Mutex<Option<PluginCancellationV2>>>>,
 }
 
 impl PluginCallTracker {
     pub(super) fn new(parent: Option<PluginCancellationV2>) -> Self {
-        let parent_check = parent.map(|parent| {
-            Arc::new(move || unsafe { parent.is_cancelled() }) as Arc<
-                dyn (Fn() -> bool) + Send + Sync
-            >
+        let parent_context = parent.map(|parent| Arc::new(Mutex::new(Some(parent))));
+        let parent_check = parent_context.as_ref().map(|context| {
+            let context = Arc::clone(context);
+            Arc::new(move || {
+                // Keep the mutex guard held while invoking the callback. Invalidating the context
+                // must wait for any in-flight callback to return before the borrowed ABI context
+                // can leave scope; copying the raw descriptor and unlocking first would leave a
+                // narrow use-after-return race.
+                let parent = context.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                match *parent {
+                    Some(parent) => unsafe { parent.is_cancelled() }
+                    // A nested operation that is still unwinding after its caller returned must
+                    // treat that parent as cancelled instead of dereferencing a stale ABI pointer.
+                    None => true,
+                }
+            }) as Arc<dyn (Fn() -> bool) + Send + Sync>
         });
         Self {
             state: Mutex::new(PluginCallLifecycleState::Pending),
             cancellation: PluginCancellationSource::new(parent_check),
+            parent_context,
+        }
+    }
+
+    pub(super) fn invalidate_parent_context(&self) {
+        if let Some(context) = &self.parent_context {
+            *context.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
     }
 
@@ -195,5 +217,35 @@ impl std::fmt::Display for PluginCallFailure {
             Self::Timeout(timeout) => write!(f, "plugin call timed out after {:?}", timeout),
             Self::Failed(message) => write!(f, "{message}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod parent_context_tests {
+    use super::PluginCallTracker;
+    use PluginAbi::PluginCancellationV2;
+    use std::ffi::c_void;
+    use std::sync::atomic::{ AtomicBool, Ordering };
+
+    unsafe extern "C" fn parent_is_cancelled(context: *const c_void) -> bool {
+        if context.is_null() {
+            return true;
+        }
+        (unsafe { &*context.cast::<AtomicBool>() }).load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn invalidated_parent_context_is_treated_as_cancelled() {
+        let external_state = AtomicBool::new(false);
+        let parent = PluginCancellationV2 {
+            context: (&external_state as *const AtomicBool).cast(),
+            is_cancelled: parent_is_cancelled,
+        };
+        let tracker = PluginCallTracker::new(Some(parent));
+        let token = tracker.cancellation_token();
+
+        assert!(!token.is_cancelled());
+        tracker.invalidate_parent_context();
+        assert!(token.is_cancelled());
     }
 }

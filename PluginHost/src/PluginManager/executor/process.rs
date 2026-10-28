@@ -1,22 +1,35 @@
 //! Process-backed adapter for `PluginExecutor`.
 //!
-//! This first supervisor implementation deliberately runs one request at a time per worker because
-//! the Phase-4 worker has a single-flight request loop. It owns the child handle and is the only
-//! component that reaps it. Calls that exceed their deadline request cooperative cancellation over
-//! IPC and force-terminate/reap the worker after a bounded grace period. There is no retry policy.
+//! The process executor runs one plugin request at a time per worker and owns/reaps the child.
+//! Worker-originated database capabilities are dispatched to a bounded host broker, while logs
+//! travel over IPC with host-side plugin identity attached. Calls that exceed their deadline
+//! request cooperative cancellation and force-terminate/reap the worker after a bounded grace
+//! period. There is no automatic retry policy.
 
-use super::{ PluginCallContext, PluginExecutor, PluginLifecycleStatus };
+use super::{ PluginCallContext, PluginCancellationSource, PluginExecutor, PluginLifecycleStatus };
+use super::super::runtime::PluginExecutorKind;
 use super::super::{ LoadedPlugin, PluginRuntime, PluginRuntimeConfig };
 use crate::Factory::PluginManagerError;
-use PluginAbi::PLUGIN_ABI_VERSION_V2;
+use crate::PluginManager::executor::PluginCancellationToken;
+use PluginAbi::{
+    AbiBuffer,
+    AbiSlice,
+    PluginCancellationV2,
+    PLUGIN_ABI_VERSION_V2,
+    PLUGIN_STATUS_OK,
+};
 use PluginContracts::ApiContract::{
     PluginEndpointError,
     PluginEndpointResponse,
     PluginLifecycleError,
     PluginManifest,
+    PluginKind,
 };
 use PluginIpc::{
     CancelControl,
+    CapabilityKind,
+    CapabilityRequestControl,
+    CapabilityResultControl,
     FrameLimits,
     HelloControl,
     InitializeControl,
@@ -26,6 +39,8 @@ use PluginIpc::{
     IpcErrorCode,
     IpcFrame,
     LoadPluginControl,
+    LogControl,
+    LogLevel,
     MessageType,
     ProtocolErrorControl,
     ResultControl,
@@ -39,14 +54,15 @@ use PluginIpc::{
     IPC_MINOR_VERSION,
 };
 use std::path::{ Path, PathBuf };
-use std::sync::atomic::{ AtomicBool, AtomicU64, Ordering };
+use std::sync::atomic::{ AtomicBool, AtomicU64, AtomicUsize, Ordering };
 use std::sync::{ mpsc, Mutex };
 use std::thread::{ self, JoinHandle };
 use std::time::{ Duration, Instant };
 use std::{ fs, io };
-use std::process::{ Child, Command, Stdio };
+use std::process::{ Child, Command, ExitStatus, Stdio };
 use std::sync::Arc;
 use std::os::unix::fs::{ DirBuilderExt, PermissionsExt };
+use std::os::unix::process::ExitStatusExt;
 use std::net::Shutdown;
 use std::os::unix::net::{ UnixListener, UnixStream };
 
@@ -56,29 +72,79 @@ const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_CANCEL_GRACE: Duration = Duration::from_millis(500);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_BINARY_NAME: &str = "ezf-plugin-worker";
+const MAX_DATABASE_CAPABILITY_BYTES: usize = 1024 * 1024;
+const MAX_CAPABILITY_REQUESTS_PER_CALL: u32 = 32;
+const MAX_LOG_MESSAGES_PER_CALL: u32 = 256;
+const MAX_LOG_MESSAGE_BYTES: usize = 16 * 1024;
 
 static SOCKET_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct WorkerSupervisor {
     child: Mutex<Option<Child>>,
-    exit_success: Mutex<Option<bool>>,
+    exit_status: Mutex<Option<WorkerExit>>,
     terminated: AtomicBool,
+    active_calls: AtomicUsize,
+    pid: u32,
+    started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkerExit {
+    success: bool,
+    code: Option<i32>,
+    signal: Option<i32>,
+    elapsed: Duration,
+    forced: bool,
+}
+
+struct OpenCallGuard<'a>(&'a AtomicUsize);
+
+impl Drop for OpenCallGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct ActiveRequestGuard<'a> {
+    active_request_id: &'a AtomicU64,
+    request_id: u64,
+}
+
+impl Drop for ActiveRequestGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.active_request_id.compare_exchange(
+            self.request_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire
+        );
+    }
 }
 
 impl WorkerSupervisor {
     fn new(child: Child) -> Self {
+        let pid = child.id();
         Self {
             child: Mutex::new(Some(child)),
-            exit_success: Mutex::new(None),
+            exit_status: Mutex::new(None),
             terminated: AtomicBool::new(false),
+            active_calls: AtomicUsize::new(0),
+            pid,
+            started_at: Instant::now(),
         }
+    }
+
+    /// Tracks executor calls from before they wait for the single-flight IPC gate. Thus a child
+    /// exit report includes both the current wire request and calls blocked behind it.
+    fn track_call(&self) -> OpenCallGuard<'_> {
+        self.active_calls.fetch_add(1, Ordering::AcqRel);
+        OpenCallGuard(&self.active_calls)
     }
 
     fn ensure_alive(&self) -> Result<(), String> {
         match self.poll_exit()? {
             None => Ok(()),
-            Some(true) => Err("plugin worker has exited".to_owned()),
-            Some(false) => Err("plugin worker exited unsuccessfully".to_owned()),
+            Some(_) => Err(self.exit_description()),
         }
     }
 
@@ -86,19 +152,16 @@ impl WorkerSupervisor {
     fn poll_exit(&self) -> Result<Option<bool>, String> {
         let mut child_guard = self.child.lock().unwrap_or_else(|p| p.into_inner());
         let Some(child) = child_guard.as_mut() else {
-            let result = *self.exit_success.lock().unwrap_or_else(|p| p.into_inner());
-            return Ok(result.or(Some(false)));
+            let result = *self.exit_status.lock().unwrap_or_else(|p| p.into_inner());
+            return Ok(Some(result.map(|status| status.success).unwrap_or(false)));
         };
 
         match child.try_wait() {
             Ok(None) => Ok(None),
             Ok(Some(status)) => {
                 *child_guard = None;
-                *self.exit_success.lock().unwrap_or_else(|p| p.into_inner()) = Some(
-                    status.success()
-                );
-                self.terminated.store(true, Ordering::Release);
-                Ok(Some(status.success()))
+                let exit = self.record_exit(status, false, None);
+                Ok(Some(exit.success))
             }
             Err(error) => Err(format!("could not inspect plugin worker process: {error}")),
         }
@@ -120,30 +183,126 @@ impl WorkerSupervisor {
     }
 
     /// Kills (if needed) and waits for the worker. No other component owns or waits on `Child`.
-    fn terminate_and_reap(&self) -> Option<bool> {
+    /// Holding the `Child` mutex makes this the sole kill/wait path even when a timeout, a reader
+    /// disconnect and runtime teardown race with one another.
+    fn terminate_and_reap(&self, reason: Option<&str>) -> Option<bool> {
         let mut child_guard = self.child.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(mut child) = child_guard.take() else {
+        let Some(child) = child_guard.as_mut() else {
             self.terminated.store(true, Ordering::Release);
-            return *self.exit_success.lock().unwrap_or_else(|p| p.into_inner());
+            let exit = *self.exit_status.lock().unwrap_or_else(|p| p.into_inner());
+            return exit.map(|status| status.success);
         };
 
-        let status = match child.try_wait() {
-            Ok(Some(status)) => Some(status),
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                child.wait().ok()
+        let (status, forced) = match child.try_wait() {
+            Ok(Some(status)) => (Some(status), false),
+            Ok(None) => {
+                let kill_succeeded = child.kill().is_ok();
+                match child.wait() {
+                    Ok(status) => (Some(status), kill_succeeded),
+                    Err(error) => {
+                        log::error!(
+                            "could not reap plugin worker pid={} after kill request: {}; reason={:?}",
+                            self.pid,
+                            error,
+                            reason
+                        );
+                        (None, kill_succeeded)
+                    }
+                }
+            }
+            Err(poll_error) => {
+                log::warn!(
+                    "could not poll plugin worker pid={} before termination: {}; requesting kill; reason={:?}",
+                    self.pid,
+                    poll_error,
+                    reason
+                );
+                let kill_succeeded = child.kill().is_ok();
+                match child.wait() {
+                    Ok(status) => (Some(status), kill_succeeded),
+                    Err(error) => {
+                        log::error!(
+                            "could not reap plugin worker pid={} after poll and kill errors: {}; reason={:?}",
+                            self.pid,
+                            error,
+                            reason
+                        );
+                        (None, kill_succeeded)
+                    }
+                }
             }
         };
-        let success = status.map(|status| status.success());
-        *self.exit_success.lock().unwrap_or_else(|p| p.into_inner()) = success;
+        match status {
+            Some(status) => {
+                // Only clear the Child after `try_wait`/`wait` returned an ExitStatus. If wait
+                // fails, retain the handle so a later teardown path can retry instead of losing
+                // the only ability to reap the process.
+                *child_guard = None;
+                Some(self.record_exit(status, forced, reason).success)
+            }
+            None => {
+                self.terminated.store(false, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    fn record_exit(&self, status: ExitStatus, forced: bool, reason: Option<&str>) -> WorkerExit {
+        let exit = WorkerExit {
+            success: status.success(),
+            code: status.code(),
+            signal: status.signal(),
+            elapsed: self.started_at.elapsed(),
+            forced,
+        };
+        *self.exit_status.lock().unwrap_or_else(|p| p.into_inner()) = Some(exit);
         self.terminated.store(true, Ordering::Release);
-        success
+        let open_calls = self.active_calls.load(Ordering::Acquire);
+        if forced || !exit.success {
+            log::warn!(
+                "plugin worker exited: pid={} success={} exit_code={:?} signal={:?} runtime_ms={} open_calls={} forced={} restart_count=0 restart_policy=disabled reason={:?}",
+                self.pid,
+                exit.success,
+                exit.code,
+                exit.signal,
+                exit.elapsed.as_millis(),
+                open_calls,
+                exit.forced,
+                reason
+            );
+        } else {
+            log::info!(
+                "plugin worker exited cleanly: pid={} exit_code={:?} runtime_ms={} open_calls={} restart_count=0 restart_policy=disabled",
+                self.pid,
+                exit.code,
+                exit.elapsed.as_millis(),
+                open_calls
+            );
+        }
+        exit
+    }
+
+    fn exit_description(&self) -> String {
+        let exit = *self.exit_status.lock().unwrap_or_else(|p| p.into_inner());
+        match exit {
+            Some(exit) =>
+                format!(
+                    "plugin worker pid={} has exited (success={}, exit_code={:?}, signal={:?}, runtime_ms={}, forced={})",
+                    self.pid,
+                    exit.success,
+                    exit.code,
+                    exit.signal,
+                    exit.elapsed.as_millis(),
+                    exit.forced
+                ),
+            None => format!("plugin worker pid={} is no longer available", self.pid),
+        }
     }
 }
 
 impl Drop for WorkerSupervisor {
     fn drop(&mut self) {
-        let _ = self.terminate_and_reap();
+        let _ = self.terminate_and_reap(Some("supervisor dropped"));
     }
 }
 
@@ -199,18 +358,32 @@ struct InvocationResponse {
     payload: Vec<u8>,
 }
 
+struct CapabilityJob {
+    request_id: u64,
+    parent_request_id: u64,
+    operation_id: u64,
+    invocation_operation: InvokeOperation,
+    capability: CapabilityKind,
+    payload: Vec<u8>,
+    context: PluginCallContext,
+}
+
 struct ProcessExecutor {
     supervisor: Arc<WorkerSupervisor>,
-    writer: Mutex<UnixStream>,
+    writer: Arc<Mutex<UnixStream>>,
     events: Mutex<mpsc::Receiver<ReaderEvent>>,
     call_gate: Mutex<()>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     socket_directory: SocketDirectory,
     next_request_id: AtomicU64,
+    active_request_id: Arc<AtomicU64>,
     limits: FrameLimits,
     cancellation_grace: Duration,
     shutdown_timeout: Duration,
     destroyed: AtomicBool,
+    plugin_name: String,
+    plugin_kind: PluginKind,
+    capability_sender: mpsc::SyncSender<CapabilityJob>,
 }
 
 impl ProcessExecutor {
@@ -304,9 +477,10 @@ impl ProcessExecutor {
                 worker_build: format!("PluginHost/{}", env!("CARGO_PKG_VERSION")),
                 plugin_path: plugin_path.to_string_lossy().into_owned(),
                 plugin_directory: plugin_directory.to_string_lossy().into_owned(),
-                // The capability broker is a later architecture phase. Do not advertise a
-                // capability that this worker cannot service over IPC yet.
-                allowed_capabilities: Vec::new(),
+                // These are the capabilities this IPC implementation can transport. The host
+                // still authorizes every database request against the validated manifest kind;
+                // a DataSource plugin cannot recurse through the broker.
+                allowed_capabilities: vec![CapabilityKind::DatabaseExecute, CapabilityKind::Log],
                 runtime_limits: RuntimeLimits {
                     // The current worker request loop is single-flight. Host admission may still
                     // be concurrent, but this executor serializes requests to preserve framing.
@@ -330,9 +504,20 @@ impl ProcessExecutor {
             &(LoadPluginControl { expected_abi_version: PLUGIN_ABI_VERSION_V2 })
         ).map_err(|error| error.to_string())?;
         load.write_to(&mut stream, limits).map_err(|error| error.to_string())?;
-        let initialized_frame = IpcFrame::read_from(&mut stream, limits).map_err(|error|
-            format!("worker failed while loading plugin: {error}")
-        )?;
+        let initialized_frame = loop {
+            let frame = IpcFrame::read_from(&mut stream, limits).map_err(|error|
+                format!("worker failed while loading plugin: {error}")
+            )?;
+            if frame.message_type == MessageType::Log {
+                match frame.decode_control::<LogControl>() {
+                    Ok(log) => log_worker_message("plugin-startup", log.level, &log.message),
+                    Err(error) =>
+                        log::warn!("plugin worker sent malformed startup Log control: {error}"),
+                }
+                continue;
+            }
+            break frame;
+        };
         ensure_response_type(&initialized_frame, MessageType::Initialized, 3)?;
         let initialized: InitializedControl = initialized_frame
             .decode_control()
@@ -345,13 +530,17 @@ impl ProcessExecutor {
         if initialized.plugin_name.trim().is_empty() {
             return Err("worker returned an empty plugin name".to_owned());
         }
-        let manifest: serde_json::Value = serde_json
+        let manifest: PluginManifest = serde_json
             ::from_str(&initialized.manifest_json)
             .map_err(|error| format!("worker returned invalid manifest JSON: {error}"))?;
-        let manifest_name = manifest.get("name").and_then(serde_json::Value::as_str);
-        if !manifest_name.is_some_and(|name| name.eq_ignore_ascii_case(&initialized.plugin_name)) {
+        if !manifest.name.eq_ignore_ascii_case(&initialized.plugin_name) {
             return Err("worker plugin name and manifest name do not match".to_owned());
         }
+        if manifest.name.trim().is_empty() {
+            return Err("worker returned a manifest with an empty plugin name".to_owned());
+        }
+        let plugin_name = manifest.name.clone();
+        let plugin_kind = manifest.kind;
 
         // Disable startup timeouts before the long-lived reader takes ownership of a cloned stream.
         stream
@@ -365,25 +554,58 @@ impl ProcessExecutor {
             .map_err(|error| format!("could not clone worker IPC socket: {error}"))?;
         let (event_sender, event_receiver) = mpsc::channel();
         let reader_supervisor = Arc::clone(&supervisor);
+        let reader_disconnect_grace = cancellation_grace;
         let reader_thread = thread::Builder
             ::new()
             .name(format!("ezf-plugin-ipc-reader-{}", std::process::id()))
-            .spawn(move || reader_loop(reader, limits, event_sender, reader_supervisor))
+            .spawn(move ||
+                reader_loop(
+                    reader,
+                    limits,
+                    event_sender,
+                    reader_supervisor,
+                    reader_disconnect_grace
+                )
+            )
             .map_err(|error| format!("could not start worker IPC reader: {error}"))?;
 
         log::warn!("starting plugin worker in DevelopmentUnconfined mode; no OS sandbox is active");
+        let writer = Arc::new(Mutex::new(stream));
+        let (capability_sender, capability_receiver) = mpsc::sync_channel::<CapabilityJob>(8);
+        let broker_writer = Arc::clone(&writer);
+        let broker_active_request_id = Arc::new(AtomicU64::new(0));
+        let capability_active_request_id = Arc::clone(&broker_active_request_id);
+        let broker_plugin_name = plugin_name.clone();
+        let _capability_thread = thread::Builder
+            ::new()
+            .name(format!("ezf-plugin-capability-broker-{}", std::process::id()))
+            .spawn(move ||
+                capability_broker_loop(
+                    capability_receiver,
+                    broker_writer,
+                    broker_plugin_name,
+                    plugin_kind,
+                    capability_active_request_id,
+                    limits
+                )
+            )
+            .map_err(|error| format!("could not start capability broker dispatcher: {error}"))?;
         Ok(Self {
             supervisor,
-            writer: Mutex::new(stream),
+            writer,
             events: Mutex::new(event_receiver),
             call_gate: Mutex::new(()),
             reader_thread: Mutex::new(Some(reader_thread)),
             socket_directory,
             next_request_id: AtomicU64::new(100),
+            active_request_id: broker_active_request_id,
             limits,
             cancellation_grace,
             shutdown_timeout,
             destroyed: AtomicBool::new(false),
+            plugin_name,
+            plugin_kind,
+            capability_sender,
         })
     }
 
@@ -393,6 +615,9 @@ impl ProcessExecutor {
         payload: &[u8],
         context: &PluginCallContext
     ) -> Result<InvocationResponse, String> {
+        // Count calls before acquiring the single-flight gate. If the child exits while one call is
+        // executing, the supervisor diagnostics then include every caller queued behind it too.
+        let _open_call = self.supervisor.track_call();
         let _call_guard = self.call_gate.lock().unwrap_or_else(|p| p.into_inner());
         self.supervisor.ensure_alive()?;
         if self.destroyed.load(Ordering::Acquire) {
@@ -405,6 +630,11 @@ impl ProcessExecutor {
         }
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        self.active_request_id.store(request_id, Ordering::Release);
+        let _active_request = ActiveRequestGuard {
+            active_request_id: self.active_request_id.as_ref(),
+            request_id,
+        };
         let remaining = context.remaining_budget();
         let remaining_budget_ms = remaining
             .as_millis()
@@ -424,6 +654,9 @@ impl ProcessExecutor {
 
         let cancellation = context.cancellation_token();
         let mut cancellation_started: Option<Instant> = None;
+        let mut capability_requests = 0u32;
+        let mut log_messages = 0u32;
+        let mut log_limit_warned = false;
         loop {
             if
                 cancellation_started.is_none() &&
@@ -474,8 +707,48 @@ impl ProcessExecutor {
             match event {
                 Ok(ReaderEvent::Frame(response)) => {
                     if response.message_type == MessageType::Log {
-                        if let Ok(log) = response.decode_control::<PluginIpc::LogControl>() {
-                            log_worker_message(log.level, &log.message);
+                        log_messages = log_messages.saturating_add(1);
+                        if log_messages <= MAX_LOG_MESSAGES_PER_CALL {
+                            if let Ok(log) = response.decode_control::<LogControl>() {
+                                log_worker_message(&self.plugin_name, log.level, &log.message);
+                            } else {
+                                log::warn!(
+                                    "plugin={} sent malformed Log control data",
+                                    self.plugin_name
+                                );
+                            }
+                        } else if !log_limit_warned {
+                            log_limit_warned = true;
+                            log::warn!(
+                                "plugin={} exceeded the per-call logging limit ({}); additional worker logs are suppressed",
+                                self.plugin_name,
+                                MAX_LOG_MESSAGES_PER_CALL
+                            );
+                        }
+                        continue;
+                    }
+                    if response.message_type == MessageType::CapabilityRequest {
+                        capability_requests = capability_requests.saturating_add(1);
+                        if capability_requests > MAX_CAPABILITY_REQUESTS_PER_CALL {
+                            self.force_stop("worker exceeded per-call capability request limit");
+                            return Err(
+                                format!(
+                                    "plugin {} exceeded the per-call capability request limit ({MAX_CAPABILITY_REQUESTS_PER_CALL})",
+                                    self.plugin_name
+                                )
+                            );
+                        }
+                        if
+                            let Err(message) = self.dispatch_capability_request(
+                                response,
+                                request_id,
+                                context.operation_id(),
+                                operation,
+                                context
+                            )
+                        {
+                            self.force_stop("invalid or unserviceable capability request");
+                            return Err(message);
                         }
                         continue;
                     }
@@ -531,6 +804,32 @@ impl ProcessExecutor {
                                     "plugin operation was cancelled or timed out".to_owned()
                                 );
                             }
+                            if operation == InvokeOperation::Manifest {
+                                let manifest: PluginManifest = serde_json
+                                    ::from_slice(&response.payload)
+                                    .map_err(|error|
+                                        format!(
+                                            "worker returned invalid runtime manifest JSON: {error}"
+                                        )
+                                    )?;
+                                if
+                                    !manifest.name.eq_ignore_ascii_case(&self.plugin_name) ||
+                                    manifest.kind != self.plugin_kind
+                                {
+                                    self.force_stop(
+                                        "plugin runtime manifest changed after capability policy was bound"
+                                    );
+                                    return Err(
+                                        format!(
+                                            "plugin runtime manifest identity/policy changed: startup name={:?} kind={:?}, runtime name={:?} kind={:?}",
+                                            self.plugin_name,
+                                            self.plugin_kind,
+                                            manifest.name,
+                                            manifest.kind
+                                        )
+                                    );
+                                }
+                            }
                             return Ok(InvocationResponse { control, payload: response.payload });
                         }
                         MessageType::ProtocolError => {
@@ -578,6 +877,87 @@ impl ProcessExecutor {
                     self.force_stop("worker IPC reader disconnected");
                     return Err("plugin worker IPC reader disconnected".to_owned());
                 }
+            }
+        }
+    }
+
+    /// Validates and enqueues worker-originated capabilities. Database work runs on a bounded,
+    /// persistent dispatcher thread so the invocation loop can continue handling Cancel/Log and
+    /// the IPC reader never waits for database execution.
+    fn dispatch_capability_request(
+        &self,
+        request: IpcFrame,
+        invocation_request_id: u64,
+        operation_id: u64,
+        invocation_operation: InvokeOperation,
+        context: &PluginCallContext
+    ) -> Result<(), String> {
+        if
+            request.request_id == 0 ||
+            request.request_id == invocation_request_id ||
+            request.correlation_id != Some(invocation_request_id)
+        {
+            return Err(
+                format!(
+                    "worker capability correlation violation: expected parent request_id {}, got request_id={} correlation_id={:?}",
+                    invocation_request_id,
+                    request.request_id,
+                    request.correlation_id
+                )
+            );
+        }
+        let control: CapabilityRequestControl = request
+            .decode_control()
+            .map_err(|error| {
+                format!("worker sent malformed CapabilityRequest control: {error}")
+            })?;
+        if control.operation_id != operation_id {
+            return Err(
+                format!(
+                    "worker capability operation mismatch: expected operation_id {operation_id}, got {}",
+                    control.operation_id
+                )
+            );
+        }
+
+        let job = CapabilityJob {
+            request_id: request.request_id,
+            parent_request_id: invocation_request_id,
+            operation_id,
+            invocation_operation,
+            capability: control.capability,
+            payload: request.payload,
+            context: context.clone(),
+        };
+        match self.capability_sender.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(job)) => {
+                send_capability_result(
+                    &self.writer,
+                    job.request_id,
+                    job.parent_request_id,
+                    CapabilityResultControl {
+                        success: false,
+                        error_code: Some(IpcErrorCode::ResourceLimitExceeded),
+                        error_message: Some("host capability dispatcher queue is full".to_owned()),
+                    },
+                    Vec::new(),
+                    self.limits
+                )
+            }
+            Err(mpsc::TrySendError::Disconnected(job)) => {
+                send_capability_result(
+                    &self.writer,
+                    job.request_id,
+                    job.parent_request_id,
+                    CapabilityResultControl {
+                        success: false,
+                        error_code: Some(IpcErrorCode::WorkerExited),
+                        error_message: Some("host capability dispatcher is unavailable".to_owned()),
+                    },
+                    Vec::new(),
+                    self.limits
+                )
             }
         }
     }
@@ -689,7 +1069,7 @@ impl ProcessExecutor {
                 }
                 Ok(ReaderEvent::Frame(frame)) if frame.message_type == MessageType::Log => {
                     if let Ok(log) = frame.decode_control::<PluginIpc::LogControl>() {
-                        log_worker_message(log.level, &log.message);
+                        log_worker_message(&self.plugin_name, log.level, &log.message);
                     }
                 }
                 Ok(ReaderEvent::Frame(frame)) => {
@@ -722,7 +1102,9 @@ impl ProcessExecutor {
             log::warn!(
                 "plugin worker required forced termination or did not report graceful shutdown after destroy; plugin code has been isolated by process exit"
             );
-            let _ = self.supervisor.terminate_and_reap();
+            let _ = self.supervisor.terminate_and_reap(
+                Some("graceful shutdown did not complete cleanly")
+            );
         }
         self.close_transport_and_join_reader();
         self.socket_directory.cleanup();
@@ -733,7 +1115,7 @@ impl ProcessExecutor {
         if !self.supervisor.terminated.load(Ordering::Acquire) {
             log::warn!("stopping plugin worker: {reason}");
         }
-        let _ = self.supervisor.terminate_and_reap();
+        let _ = self.supervisor.terminate_and_reap(Some(reason));
         self.close_transport_and_join_reader();
         self.socket_directory.cleanup();
     }
@@ -755,6 +1137,14 @@ impl ProcessExecutor {
 }
 
 impl PluginExecutor for ProcessExecutor {
+    fn kind(&self) -> PluginExecutorKind {
+        PluginExecutorKind::Process
+    }
+
+    fn worker_pid(&self) -> Option<u32> {
+        (!self.supervisor.terminated.load(Ordering::Acquire)).then_some(self.supervisor.pid)
+    }
+
     fn validate(&self) -> Result<(), String> {
         self.supervisor.ensure_alive()?;
         if self.destroyed.load(Ordering::Acquire) {
@@ -764,6 +1154,24 @@ impl PluginExecutor for ProcessExecutor {
     }
 
     fn validate_for_lifecycle(&self) -> Result<(), String> {
+        // If the ABI destroy callback completed but the shutdown path could not confirm reaping,
+        // retain the Child handle and retry the one serialized kill/wait path on the next unload
+        // attempt. Do not detach a possibly-live worker just because the instance is already
+        // marked destroyed.
+        if
+            self.destroyed.load(Ordering::Acquire) &&
+            !self.supervisor.terminated.load(Ordering::Acquire)
+        {
+            log::warn!(
+                "retrying process termination/reaping for destroyed plugin worker pid={}",
+                self.supervisor.pid
+            );
+            let _ = self.supervisor.terminate_and_reap(
+                Some("retrying teardown after incomplete graceful shutdown")
+            );
+            self.close_transport_and_join_reader();
+            self.socket_directory.cleanup();
+        }
         self.validate()
     }
 
@@ -827,19 +1235,59 @@ impl PluginExecutor for ProcessExecutor {
     }
 
     fn on_unload(&self, context: &PluginCallContext) -> Result<PluginLifecycleStatus, String> {
-        self.invoke_lifecycle(InvokeOperation::OnUnload, context)
+        match self.invoke_lifecycle(InvokeOperation::OnUnload, context) {
+            Err(error) if self.supervisor.terminated.load(Ordering::Acquire) => {
+                log::warn!(
+                    "plugin worker exit/reaping was confirmed before graceful on_unload completion: {}",
+                    error
+                );
+                self.destroyed.store(true, Ordering::Release);
+                Ok(PluginLifecycleStatus::ForcedTermination)
+            }
+            result => result,
+        }
     }
 
     fn destroy(&self, context: &PluginCallContext) -> Result<PluginLifecycleStatus, String> {
-        let status = self.invoke_lifecycle(InvokeOperation::Destroy, context)?;
+        let status = match self.invoke_lifecycle(InvokeOperation::Destroy, context) {
+            Ok(status) => status,
+            Err(error) if self.supervisor.terminated.load(Ordering::Acquire) => {
+                log::warn!(
+                    "plugin worker exit/reaping was confirmed before graceful destroy completion: {}",
+                    error
+                );
+                self.destroyed.store(true, Ordering::Release);
+                return Ok(PluginLifecycleStatus::ForcedTermination);
+            }
+            Err(error) => {
+                return Err(error);
+            }
+        };
         if status == PluginLifecycleStatus::Success {
             self.destroyed.store(true, Ordering::Release);
             // The ABI destroy callback has succeeded. Even if the worker fails to acknowledge
             // graceful shutdown, process termination is the final resource-reclamation boundary;
             // do not keep a destroyed plugin registered solely because shutdown acknowledgement failed.
-            let _ = self.graceful_shutdown_after_destroy();
+            if !self.graceful_shutdown_after_destroy() {
+                if self.supervisor.terminated.load(Ordering::Acquire) {
+                    return Ok(PluginLifecycleStatus::ForcedTermination);
+                }
+                return Err(
+                    "graceful worker shutdown failed and process termination/reaping could not be confirmed; unload may be retried".to_owned()
+                );
+            }
         }
         Ok(status)
+    }
+
+    fn lifecycle_escalation_grace(&self) -> Duration {
+        // Allow the executor's cooperative Cancel and bounded kill/reap path to report back after
+        // the runtime has cancelled the lifecycle context at its deadline.
+        self.cancellation_grace.saturating_add(Duration::from_millis(250))
+    }
+
+    fn process_exit_confirmed(&self) -> bool {
+        self.supervisor.terminated.load(Ordering::Acquire)
     }
 
     fn emergency_shutdown(&self) {
@@ -1055,33 +1503,424 @@ fn reader_loop(
     mut stream: UnixStream,
     limits: FrameLimits,
     sender: mpsc::Sender<ReaderEvent>,
-    supervisor: Arc<WorkerSupervisor>
+    supervisor: Arc<WorkerSupervisor>,
+    shutdown_timeout: Duration
 ) {
     loop {
         match IpcFrame::read_from(&mut stream, limits) {
             Ok(frame) => {
                 if sender.send(ReaderEvent::Frame(frame)).is_err() {
-                    let _ = supervisor.wait_for_exit(SOCKET_STARTUP_TIMEOUT);
+                    reap_after_ipc_disconnect(&supervisor, shutdown_timeout);
                     return;
                 }
             }
             Err(error) => {
-                // The reader also watches for idle worker exit. It does not invent a restart: it
-                // reports disconnect and drives the one shared Child-reaping path to completion.
+                // Notify the active call before waiting. If the IPC channel closes while idle and
+                // the child remains alive, the reader still escalates and reaps it after the
+                // bounded cancellation grace. No operation is ever replayed and no automatic restart
+                // is performed in this migration phase.
                 let _ = sender.send(ReaderEvent::Disconnected(error.to_string()));
-                let _ = supervisor.wait_for_exit(SOCKET_STARTUP_TIMEOUT);
+                reap_after_ipc_disconnect(&supervisor, shutdown_timeout);
                 return;
             }
         }
     }
 }
 
-fn log_worker_message(level: PluginIpc::LogLevel, message: &str) {
+fn reap_after_ipc_disconnect(supervisor: &WorkerSupervisor, grace: Duration) {
+    match supervisor.wait_for_exit(grace) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            log::warn!(
+                "plugin worker pid={} closed IPC but remained alive after {:?}; terminating and reaping",
+                supervisor.pid,
+                grace
+            );
+            let _ = supervisor.terminate_and_reap(
+                Some("IPC disconnected while child remained alive")
+            );
+        }
+        Err(error) => {
+            log::error!(
+                "could not inspect plugin worker pid={} after IPC disconnect: {}; terminating and reaping",
+                supervisor.pid,
+                error
+            );
+            let _ = supervisor.terminate_and_reap(
+                Some("failed to inspect child after IPC disconnect")
+            );
+        }
+    }
+}
+
+fn capability_broker_loop(
+    receiver: mpsc::Receiver<CapabilityJob>,
+    writer: Arc<Mutex<UnixStream>>,
+    plugin_name: String,
+    plugin_kind: PluginKind,
+    active_request_id: Arc<AtomicU64>,
+    limits: FrameLimits
+) {
+    while let Ok(job) = receiver.recv() {
+        let (control, payload) = match job.capability {
+            CapabilityKind::DatabaseExecute =>
+                match
+                    execute_database_capability(
+                        plugin_kind,
+                        &plugin_name,
+                        job.invocation_operation,
+                        &job.payload,
+                        &job.context
+                    )
+                {
+                    Ok(payload) if payload.len() <= limits.max_payload_bytes =>
+                        (
+                            CapabilityResultControl {
+                                success: true,
+                                error_code: None,
+                                error_message: None,
+                            },
+                            payload,
+                        ),
+                    Ok(_) =>
+                        (
+                            CapabilityResultControl {
+                                success: false,
+                                error_code: Some(IpcErrorCode::ResourceLimitExceeded),
+                                error_message: Some(
+                                    format!(
+                                        "database capability result exceeded {} bytes",
+                                        limits.max_payload_bytes
+                                    )
+                                ),
+                            },
+                            Vec::new(),
+                        ),
+                    Err((code, message)) =>
+                        (
+                            CapabilityResultControl {
+                                success: false,
+                                error_code: Some(code),
+                                error_message: Some(message),
+                            },
+                            Vec::new(),
+                        ),
+                }
+            CapabilityKind::Log =>
+                (
+                    CapabilityResultControl {
+                        success: false,
+                        error_code: Some(IpcErrorCode::CapabilityDenied),
+                        error_message: Some(
+                            "logging uses the dedicated Log IPC message".to_owned()
+                        ),
+                    },
+                    Vec::new(),
+                ),
+        };
+        // Never deliver a late DB result to a call that timed out while the broker was working.
+        // Send a cancellation result instead so the callback waiting in the worker can unwind.
+        let (control, payload) = if
+            job.context.is_deadline_expired() ||
+            job.context.cancellation_token().is_cancelled()
+        {
+            (
+                CapabilityResultControl {
+                    success: false,
+                    error_code: Some(IpcErrorCode::Cancelled),
+                    error_message: Some(
+                        "capability result discarded because its parent call was cancelled or expired".to_owned()
+                    ),
+                },
+                Vec::new(),
+            )
+        } else {
+            (control, payload)
+        };
+        if active_request_id.load(Ordering::Acquire) != job.parent_request_id {
+            log::debug!(
+                "plugin={} discarded capability result for inactive parent_request_id={} operation_id={}",
+                plugin_name,
+                job.parent_request_id,
+                job.operation_id
+            );
+            continue;
+        }
+        if
+            let Err(error) = send_capability_result(
+                &writer,
+                job.request_id,
+                job.parent_request_id,
+                control,
+                payload,
+                limits
+            )
+        {
+            log::warn!(
+                "plugin={} failed to send capability result request_id={} operation_id={}: {}",
+                plugin_name,
+                job.request_id,
+                job.operation_id,
+                error
+            );
+        }
+    }
+}
+
+fn send_capability_result(
+    writer: &Arc<Mutex<UnixStream>>,
+    request_id: u64,
+    parent_request_id: u64,
+    control: CapabilityResultControl,
+    payload: Vec<u8>,
+    limits: FrameLimits
+) -> Result<(), String> {
+    let mut frame = IpcFrame::with_control(
+        MessageType::CapabilityResult,
+        request_id,
+        &control
+    ).map_err(|error| format!("could not encode CapabilityResult: {error}"))?;
+    frame.correlation_id = Some(parent_request_id);
+    frame.payload = payload;
+    let mut writer = writer.lock().unwrap_or_else(|p| p.into_inner());
+    frame.write_to(&mut *writer, limits).map_err(|error| error.to_string())
+}
+
+fn execute_database_capability(
+    plugin_kind: PluginKind,
+    plugin_name: &str,
+    invocation_operation: InvokeOperation,
+    payload: &[u8],
+    context: &PluginCallContext
+) -> Result<Vec<u8>, (IpcErrorCode, String)> {
+    // A DataSource is the terminal database provider. Letting it recurse through the same
+    // generic database broker can deadlock the datasource route or create an execution loop.
+    if !database_capability_allowed(plugin_kind, invocation_operation) {
+        return Err((
+            IpcErrorCode::CapabilityDenied,
+            format!(
+                "database capability denied for {:?} plugin {} during {:?}",
+                plugin_kind,
+                plugin_name,
+                invocation_operation
+            ),
+        ));
+    }
+    if payload.len() > MAX_DATABASE_CAPABILITY_BYTES {
+        return Err((
+            IpcErrorCode::ResourceLimitExceeded,
+            format!("database capability payload exceeded {MAX_DATABASE_CAPABILITY_BYTES} bytes"),
+        ));
+    }
+    let request: DatabaseContracts::DatabaseRequest = serde_json
+        ::from_slice(payload)
+        .map_err(|error| {
+            (
+                IpcErrorCode::ProtocolViolation,
+                format!("invalid database capability request: {error}"),
+            )
+        })?;
+    let statement = match &request {
+        DatabaseContracts::DatabaseRequest::Query(query) => query.statement.as_str(),
+        DatabaseContracts::DatabaseRequest::Execute(execute) => execute.statement.as_str(),
+    };
+    if statement.trim().is_empty() {
+        return Err((
+            IpcErrorCode::CapabilityDenied,
+            "database capability requires a non-empty statement".to_owned(),
+        ));
+    }
+    if context.is_deadline_expired() || context.cancellation_token().is_cancelled() {
+        return Err((
+            IpcErrorCode::Cancelled,
+            "database capability was cancelled or expired before execution".to_owned(),
+        ));
+    }
+    let capability = crate::Factory
+        ::database_capability()
+        .ok_or_else(|| (
+            IpcErrorCode::CapabilityDenied,
+            "host database executor has not been registered".to_owned(),
+        ))?;
+
+    // Extend the upstream cancellation check with the parent call's deadline. This matters when
+    // the DB provider is itself another ProcessExecutor: its ABI cancellation callback must see
+    // the endpoint deadline even if the endpoint process has already received Cancel.
+    let upstream_cancellation = context.cancellation_token();
+    let deadline = context.deadline();
+    let cancellation_source = PluginCancellationSource::new(
+        Some(
+            Arc::new(move || { upstream_cancellation.is_cancelled() || Instant::now() >= deadline })
+        )
+    );
+    let token = cancellation_source.token();
+    let cancellation = PluginCancellationV2 {
+        context: (&token as *const PluginCancellationToken).cast(),
+        is_cancelled: process_cancellation_is_cancelled,
+    };
+    let mut response = AbiBuffer::EMPTY;
+    let status = unsafe {
+        (capability.execute)(AbiSlice::from_bytes(payload), cancellation, &mut response)
+    };
+    if status != PLUGIN_STATUS_OK {
+        if !response.ptr.is_null() {
+            unsafe {
+                (capability.free)(response);
+            }
+        }
+        return Err((
+            if token.is_cancelled() { IpcErrorCode::Cancelled } else { IpcErrorCode::PluginError },
+            format!("host database executor returned ABI status {status}"),
+        ));
+    }
+    let bytes = (unsafe { response.to_vec() }).ok_or_else(|| {
+        if !response.ptr.is_null() {
+            unsafe {
+                (capability.free)(response);
+            }
+        }
+        (
+            IpcErrorCode::ProtocolViolation,
+            "host database executor returned an invalid response buffer".to_owned(),
+        )
+    })?;
+    unsafe {
+        (capability.free)(response);
+    }
+
+    let _ = serde_json
+        ::from_slice::<
+            Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError>
+        >(&bytes)
+        .map_err(|error| (
+            IpcErrorCode::ProtocolViolation,
+            format!("host database response was not a valid result envelope: {error}"),
+        ))?;
+
+    Ok(bytes)
+}
+
+fn database_capability_allowed(kind: PluginKind, operation: InvokeOperation) -> bool {
+    // Domain plugins may use the host broker only for productive/session work. DataSource plugins
+    // are terminal DB providers and must not recurse through this generic capability; lifecycle
+    // metadata and unload callbacks must not trigger database work either. Actual SQL/table rights
+    // still belong to the configured database role because DatabaseContracts carries raw SQL.
+    kind == PluginKind::Domain &&
+        matches!(operation, InvokeOperation::HandleEndpoint | InvokeOperation::SessionClosed)
+}
+
+unsafe extern "C" fn process_cancellation_is_cancelled(context: *const std::ffi::c_void) -> bool {
+    if context.is_null() {
+        return true;
+    }
+    let token = unsafe { &*(context as *const super::PluginCancellationToken) };
+    token.is_cancelled()
+}
+
+fn log_worker_message(plugin: &str, level: LogLevel, message: &str) {
+    // Plugin identity is supplied by the validated host-side manifest, never by the IPC payload.
+    // Truncate again on the host: a modified worker must not bypass the worker-side log limit.
+    let bounded = if message.len() > MAX_LOG_MESSAGE_BYTES {
+        let mut end = MAX_LOG_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… [truncated]", &message[..end])
+    } else {
+        message.to_owned()
+    };
     match level {
-        PluginIpc::LogLevel::Error => log::error!("plugin worker: {}", message),
-        PluginIpc::LogLevel::Warn => log::warn!("plugin worker: {}", message),
-        PluginIpc::LogLevel::Info => log::info!("plugin worker: {}", message),
-        PluginIpc::LogLevel::Debug => log::debug!("plugin worker: {}", message),
-        PluginIpc::LogLevel::Trace => log::trace!("plugin worker: {}", message),
+        LogLevel::Error => log::error!("plugin={} {}", plugin, bounded),
+        LogLevel::Warn => log::warn!("plugin={} {}", plugin, bounded),
+        LogLevel::Info => log::info!("plugin={} {}", plugin, bounded),
+        LogLevel::Debug => log::debug!("plugin={} {}", plugin, bounded),
+        LogLevel::Trace => log::trace!("plugin={} {}", plugin, bounded),
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+
+    #[test]
+    fn database_broker_policy_allows_domain_plugins_only() {
+        assert!(database_capability_allowed(PluginKind::Domain, InvokeOperation::HandleEndpoint));
+        assert!(database_capability_allowed(PluginKind::Domain, InvokeOperation::SessionClosed));
+        assert!(
+            !database_capability_allowed(PluginKind::DataSource, InvokeOperation::HandleEndpoint)
+        );
+        assert!(!database_capability_allowed(PluginKind::Domain, InvokeOperation::Name));
+        assert!(!database_capability_allowed(PluginKind::Domain, InvokeOperation::Manifest));
+        assert!(!database_capability_allowed(PluginKind::Domain, InvokeOperation::ExecuteDatabase));
+        assert!(!database_capability_allowed(PluginKind::Domain, InvokeOperation::OnUnload));
+    }
+
+    #[test]
+    fn supervisor_observes_and_caches_child_exit_status() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 17"])
+            .spawn()
+            .expect("test shell must start");
+        let supervisor = WorkerSupervisor::new(child);
+
+        assert_eq!(
+            supervisor
+                .wait_for_exit(Duration::from_secs(2))
+                .expect("child status must be readable"),
+            Some(false)
+        );
+        assert!(supervisor.terminated.load(Ordering::Acquire));
+        assert!(supervisor.exit_description().contains("exit_code=Some(17)"));
+        assert_eq!(
+            supervisor.poll_exit().expect("cached status must remain readable"),
+            Some(false)
+        );
+        assert!(
+            supervisor.child
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_termination_requests_share_one_kill_and_reap_path() {
+        let child = Command::new("/bin/sleep").arg("30").spawn().expect("test child must start");
+        let supervisor = Arc::new(WorkerSupervisor::new(child));
+        let first_supervisor = Arc::clone(&supervisor);
+        let second_supervisor = Arc::clone(&supervisor);
+
+        let first = thread::spawn(move || {
+            first_supervisor.terminate_and_reap(Some("supervisor unit test"))
+        });
+        let second = thread::spawn(move || {
+            second_supervisor.terminate_and_reap(Some("supervisor unit test"))
+        });
+
+        assert_eq!(first.join().expect("first termination must not panic"), Some(false));
+        assert_eq!(second.join().expect("second termination must not panic"), Some(false));
+        assert!(supervisor.terminated.load(Ordering::Acquire));
+        let exit = *supervisor.exit_status.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(exit.expect("exit status must be cached").forced);
+        assert!(
+            supervisor.child
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn open_call_count_includes_calls_waiting_for_the_ipc_gate() {
+        let child = Command::new("/bin/sleep").arg("30").spawn().expect("test child must start");
+        let supervisor = WorkerSupervisor::new(child);
+        let first = supervisor.track_call();
+        let second = supervisor.track_call();
+        assert_eq!(supervisor.active_calls.load(Ordering::Acquire), 2);
+        drop(first);
+        assert_eq!(supervisor.active_calls.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(supervisor.active_calls.load(Ordering::Acquire), 0);
+        let _ = supervisor.terminate_and_reap(Some("supervisor unit test cleanup"));
     }
 }

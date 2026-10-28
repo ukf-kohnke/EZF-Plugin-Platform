@@ -1,4 +1,21 @@
 //! Public plugin health snapshots and internal health state.
+/// Identifies how plugin code is hosted by the current runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginExecutorKind {
+    InProcess,
+    Process,
+}
+
+impl PluginExecutorKind {
+    /// Stable, machine-readable value suitable for logs and metrics labels.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InProcess => "in_process",
+            Self::Process => "process",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PluginHealthState {
@@ -14,6 +31,11 @@ pub enum PluginHealthState {
 pub struct PluginHealthSnapshot {
     pub name: String,
     pub state: PluginHealthState,
+    /// Concrete execution backend used for plugin code.
+    pub executor: PluginExecutorKind,
+    /// Process ID of the live child worker for the process executor; `None` for in-process
+    /// execution and when the process worker has already exited.
+    pub worker_pid: Option<u32>,
     /// Configured number of persistent workers for this plugin.
     pub worker_threads: usize,
     /// Maximum number of admitted calls, including calls waiting for a worker.

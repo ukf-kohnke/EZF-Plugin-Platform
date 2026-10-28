@@ -70,6 +70,7 @@
 //! - bulk loading returns a [`Factory::PluginLoadReport`] from the policy-aware API.
 #![allow(non_snake_case)]
 mod PluginManager;
+pub mod Factory;
 
 #[cfg(target_os = "linux")]
 const LOGGERDEF: &str = "unix";
@@ -88,8 +89,6 @@ fn emit_log(level: log::LevelFilter, message: &str) {
         log::LevelFilter::Off => {}
     }
 }
-
-pub mod Factory;
 
 #[cfg(test)]
 mod load_policy_tests {

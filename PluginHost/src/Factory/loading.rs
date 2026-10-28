@@ -30,25 +30,40 @@ pub fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
     };
 
     let started = std::time::Instant::now();
-    if runtime.unload() {
-        let elapsed = started.elapsed();
-        let removed_item = {
-            let singleton = instance();
-            let mut manager = singleton.inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            manager.detach_plugin(id)?
-        };
-
-        emit_log(
-            log::LevelFilter::Info,
-            &format!("Plugin unloaded successfully: id={} after {:?}", id, elapsed)
-        );
-        drop(removed_item);
-        Ok(())
-    } else {
+    let outcome = runtime.unload();
+    if !outcome.completed() {
         emit_log(log::LevelFilter::Error, &format!("Plugin unload failed or timed out: id={}", id));
-        Err(PluginManagerError::PluginUnloadFailed { id })
+        return Err(PluginManagerError::PluginUnloadFailed { id });
+    }
+
+    let elapsed = started.elapsed();
+    let removed_item = {
+        let singleton = instance();
+        let mut manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        manager.detach_plugin(id)?
+    };
+    drop(removed_item);
+
+    match outcome {
+        PluginUnloadOutcome::Unloaded => {
+            emit_log(
+                log::LevelFilter::Info,
+                &format!("Plugin unloaded gracefully: id={} after {:?}", id, elapsed)
+            );
+            Ok(())
+        }
+        PluginUnloadOutcome::ForcedTermination => {
+            emit_log(
+                log::LevelFilter::Error,
+                &format!(
+                    "Plugin unload ended non-gracefully; worker process reaped and registry entry removed: id={} after {:?}",
+                    id,
+                    elapsed
+                )
+            );
+            Err(PluginManagerError::PluginUnloadFailed { id })
+        }
+        PluginUnloadOutcome::Failed => Err(PluginManagerError::PluginUnloadFailed { id }),
     }
 }
 
@@ -115,6 +130,38 @@ fn begin_plugin_operation(
     }
     paths.insert(canonical_path.clone(), kind);
     Ok(PluginOperationGuard { path: canonical_path })
+}
+
+/// Emit the selected execution backend and current child PID after a plugin is registered.
+/// This log is independent of EZF_API_TIMING so executor selection is visible in normal startup logs.
+fn log_plugin_executor_snapshot(plugin_name: &str, path: &Path) {
+    match plugin_health_by_name(plugin_name) {
+        Some(snapshot) => {
+            let worker_pid = snapshot.worker_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "none".to_owned());
+            emit_log(
+                log::LevelFilter::Info,
+                &format!(
+                    "PLUGIN_EXECUTOR component={:?} executor={} worker_pid={} state={:?} path={:?}",
+                    snapshot.name,
+                    snapshot.executor.as_str(),
+                    worker_pid,
+                    snapshot.state,
+                    path.display().to_string()
+                )
+            );
+        }
+        None =>
+            emit_log(
+                log::LevelFilter::Warn,
+                &format!(
+                    "PLUGIN_EXECUTOR component={:?} executor=unknown worker_pid=none state=unknown path={:?} diagnostic=health_snapshot_unavailable",
+                    plugin_name,
+                    path.display().to_string()
+                )
+            ),
+    }
 }
 
 pub(super) fn plugin_operation_kind(path: &Path) -> Option<PluginOperationKind> {
@@ -189,13 +236,11 @@ fn load_plugin_file_inner(
                 canonical_path.display()
             )
         );
+        log_plugin_executor_snapshot(&plugin_manifest.name, &canonical_path);
     }
     result
 }
 
-#[deprecated(
-    note = "use load_plugins_with_policy or load_plugins_with_policy_and_config; the legacy required-all policy is implicit and provides no load report"
-)]
 pub fn load_plugins(plugin_path: &str) -> Result<usize, PluginManagerError> {
     let report = load_plugins_with_policy_and_config(
         plugin_path,
@@ -316,7 +361,10 @@ pub fn load_plugins_with_policy_and_config(
         };
 
         match registration {
-            Ok(_) => report.loaded.push(plugin_name),
+            Ok(_) => {
+                report.loaded.push(plugin_name.clone());
+                log_plugin_executor_snapshot(&plugin_name, &canonical_path);
+            }
             Err(error) =>
                 report.failures.push(PluginLoadFailure {
                     path: canonical_path,
@@ -393,13 +441,13 @@ pub fn load_plugins_with_policy_and_config(
         emit_log(
             level,
             &format!(
-                "{} plugin '{}' at '{}' could not be loaded: {}",
+                "PLUGIN_LOAD_FAILURE requirement={} plugin={:?} path={:?} error={:?}",
                 match failure.requirement {
-                    PluginRequirement::Required => "Required",
-                    PluginRequirement::Optional => "Optional",
+                    PluginRequirement::Required => "required",
+                    PluginRequirement::Optional => "optional",
                 },
                 failure.plugin_name.as_deref().unwrap_or("unknown"),
-                failure.path.display(),
+                failure.path.display().to_string(),
                 failure.error
             )
         );
@@ -421,9 +469,6 @@ pub fn load_plugins_with_policy_and_config(
     Ok(report)
 }
 
-#[deprecated(
-    note = "use is_plugin_loaded for lookup; explicit loading should use load_plugin_file or load_plugins_with_policy"
-)]
 pub fn load_plugin_if_missing(
     plugin_name: &str,
     plugin_path: &str

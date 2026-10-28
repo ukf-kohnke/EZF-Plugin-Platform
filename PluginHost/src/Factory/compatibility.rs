@@ -1,9 +1,6 @@
 //! Deprecated compatibility accessors for plugins.
 use super::*;
 
-#[deprecated(
-    note = "prefer catalog/endpoint dispatch; concrete plugin-name access is a compatibility API"
-)]
 pub fn with_plugin_by_name<R, F>(plugin_name: &str, func: F) -> Option<R>
     where F: FnOnce(&dyn IPlugin) -> R
 {
@@ -31,9 +28,6 @@ pub fn with_plugin_by_name<R, F>(plugin_name: &str, func: F) -> Option<R>
     }
 }
 
-#[deprecated(
-    note = "prefer catalog/health queries and explicit capability APIs; bulk raw plugin iteration is a compatibility API"
-)]
 pub fn with_all_plugins<R, F>(func: F) -> Option<Vec<R>> where F: Fn(&dyn IPlugin) -> R {
     let runtimes = {
         let singleton = instance();

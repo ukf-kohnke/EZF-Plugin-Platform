@@ -14,8 +14,14 @@ use super::PluginManager::{
     PluginEndpointRoute,
     PluginManager,
     PluginProxy,
+    PluginUnloadOutcome,
 };
-pub use super::PluginManager::{ PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
+pub use super::PluginManager::{
+    PluginExecutorKind,
+    PluginHealthSnapshot,
+    PluginHealthState,
+    PluginRuntimeConfig,
+};
 use PluginContracts::{
     IPlugin::IPlugin,
     ApiContract::{
@@ -62,7 +68,6 @@ pub use self::loading::{
     load_plugins_with_policy_and_config,
     unload_plugin,
 };
-pub(crate) use self::loading::find_id_by_name;
 pub use self::readiness::{ check_readiness, plugin_health, plugin_health_by_name };
 pub use self::database::{
     check_database_readiness,

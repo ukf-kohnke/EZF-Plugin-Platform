@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 PluginIpc = { path = "../PluginIpc" }
-PluginHost = { path = "../PluginHost" }
 PluginAbi = { path = "../Plugin-SDK/PluginAbi" }
 PluginContracts = { path = "../Plugin-SDK/PluginContracts" }
 DatabaseContracts = { path = "../Plugin-SDK/DatabaseContracts" }
@@ -20,3 +19,6 @@ PluginExecutionCore = { path = "../PluginExecutionCore" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
+
+[dev-dependencies]
+PluginHost = { path = "../PluginHost" }

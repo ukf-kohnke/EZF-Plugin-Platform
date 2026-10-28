@@ -32,9 +32,12 @@ pub struct PluginRuntimeConfig {
     /// cooperative cancellation; the callback remains active on the lifecycle worker until it
     /// returns and the runtime stays registered until that result is observed.
     pub lifecycle_timeout: Duration,
-    /// Number of persistent OS threads that can execute this plugin concurrently.
+    /// Number of persistent host-side runtime threads available to dispatch this plugin's calls.
+    /// For `ProcessExecutor`, these threads do not increase child-process parallelism: its current
+    /// single-flight IPC protocol executes one top-level plugin operation at a time.
     pub worker_threads: usize,
-    /// Maximum admitted calls across execution and queueing (not the number of worker threads).
+    /// Maximum admitted calls across execution, queueing, and (in process mode) the single-flight
+    /// IPC gate. This is an admission bound, not necessarily the number of parallel plugin calls.
     pub max_concurrent_calls: usize,
     /// Maximum number of jobs waiting for a worker. A full queue rejects new work with overload.
     pub queue_capacity: usize,

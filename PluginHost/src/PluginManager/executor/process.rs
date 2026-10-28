@@ -392,6 +392,10 @@ struct ProcessExecutor {
     supervisor: Arc<WorkerSupervisor>,
     writer: Arc<Mutex<UnixStream>>,
     events: Mutex<mpsc::Receiver<ReaderEvent>>,
+    // The current protocol has one in-flight top-level invocation per worker process. This gate
+    // serializes calls even when the host runtime admits/schedules more of them. Raising
+    // `max_concurrent_calls` or `worker_threads` therefore does not raise process-mode plugin
+    // parallelism; that requires a pool of worker processes or a multiplexed execution protocol.
     call_gate: Mutex<()>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     socket_directory: SocketDirectory,
@@ -547,6 +551,9 @@ impl ProcessExecutor {
                 // still authorizes every database request against the validated manifest kind;
                 // a DataSource plugin cannot recurse through the broker.
                 allowed_capabilities: vec![CapabilityKind::DatabaseExecute, CapabilityKind::Log],
+                // The child is deliberately configured for one call at a time. The runtime's
+                // `max_concurrent_calls` is an admission bound and must not be mistaken for
+                // effective process-mode execution parallelism.
                 runtime_limits: RuntimeLimits {
                     max_concurrent_calls: 1,
                     max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES as u32,
@@ -726,6 +733,9 @@ impl ProcessExecutor {
             );
         }
 
+        // This lock is intentionally held across the full IPC exchange: the current worker protocol
+        // is single-flight, not multiplexed. Calls admitted behind it consume runtime admission and
+        // host-side worker resources while waiting, but only one plugin operation runs in the child.
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         self.active_request_id.store(request_id, Ordering::Release);
         let _active_request = ActiveRequestGuard {

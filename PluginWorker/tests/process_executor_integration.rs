@@ -120,6 +120,26 @@ fn ping_request() -> PluginEndpointRequest {
     }
 }
 
+fn slow_request() -> PluginEndpointRequest {
+    PluginEndpointRequest {
+        endpoint_id: "slow".to_owned(),
+        method: PluginHttpMethod::Get,
+        raw_path: "/pluginhost-integration/slow".to_owned(),
+        base_path: "/".to_owned(),
+        raw_query: None,
+        content_type: None,
+        body: Vec::new(),
+        principal: PluginPrincipal {
+            user_id: "process-integration-test".to_owned(),
+            username: "process-integration-test".to_owned(),
+            given_name: "Process".to_owned(),
+            family_name: "Integration".to_owned(),
+            groups: Vec::new(),
+            session_id: "process-integration-session".to_owned(),
+        },
+    }
+}
+
 #[test]
 fn factory_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -128,17 +148,30 @@ fn factory_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
     let _mode = EnvGuard::set("EZF_PLUGIN_EXECUTOR", "process");
     let _unconfined = EnvGuard::set("EZF_PLUGIN_ALLOW_UNCONFINED", "1");
     let _worker_path = EnvGuard::set("EZF_PLUGIN_WORKER_PATH", worker.as_os_str());
+    let _fixture_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "normal");
 
     let plugin = build_real_plugin();
     assert!(plugin.is_file(), "fixture library must exist: {}", plugin.display());
 
-    let id = Factory::load_plugin_file_with_config(&plugin, PluginRuntimeConfig::default()).expect(
+    let mut config = PluginRuntimeConfig::default();
+    config.worker_threads = 4;
+    config.max_concurrent_calls = 4;
+    config.queue_capacity = 4;
+    let id = Factory::load_plugin_file_with_config(&plugin, config).expect(
         "Factory must load the fixture through ProcessExecutor"
     );
     assert_eq!(Factory::loaded_plugin_names(), vec!["PluginHostIntegration"]);
-    let diagnostics = Factory::plugin_health_by_name("PluginHostIntegration")
-        .expect("loaded process plugin must have a health snapshot");
+    let diagnostics = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+        "loaded process plugin must have a health snapshot"
+    );
     assert_eq!(diagnostics.executor, PluginExecutorKind::Process);
+    assert_eq!(diagnostics.worker_threads, 4);
+    assert_eq!(diagnostics.max_concurrent_calls, 4);
+    assert_eq!(
+        diagnostics.max_parallel_plugin_calls,
+        1,
+        "one process-backed worker must report single-flight plugin parallelism even when the host runtime has multiple worker threads"
+    );
     let worker_pid = diagnostics.worker_pid.expect("live process executor must report worker PID");
     assert!(worker_pid > 0, "worker PID must be a valid non-zero process id");
 
@@ -152,6 +185,30 @@ fn factory_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
     assert_eq!(body["plugin"], "PluginHostIntegration");
     assert_eq!(body["endpoint"], "ping");
     assert_eq!(body["loaded"], true);
+
+    // Despite four host-side runtime workers and four admitted-call slots, the current process
+    // executor must run only one top-level plugin callback inside its single worker process.
+    let callers = (0..2)
+        .map(|_|
+            std::thread::spawn(||
+                Factory::handle_endpoint(slow_request()).expect(
+                    "serialized slow endpoint call must succeed"
+                )
+            )
+        )
+        .collect::<Vec<_>>();
+    for caller in callers {
+        let response = caller.join().expect("concurrent caller thread must not panic");
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json
+            ::from_slice(&response.body)
+            .expect("slow endpoint response must contain JSON");
+        assert_eq!(
+            body["peak_active"],
+            1,
+            "one process worker must never execute two top-level plugin callbacks concurrently"
+        );
+    }
 
     Factory::unload_plugin(id).expect("ProcessExecutor must unload and reap the worker");
     assert!(Factory::loaded_plugin_names().is_empty());

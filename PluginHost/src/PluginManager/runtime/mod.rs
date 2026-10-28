@@ -1,14 +1,5 @@
 //! Per-plugin runtime state and shared invariants.
 //! Calls, plugin operations, lifecycle transitions, scheduling, configuration, and health are split into child modules.
-use super::executor::{
-    PluginCallContext,
-    PluginCancellationSource,
-    PluginExecutor,
-    PluginLifecycleStatus,
-};
-use std::sync::{ Arc, Mutex, RwLock, atomic::{ AtomicBool, AtomicU64, Ordering } };
-use std::time::Instant;
-
 mod worker_pool;
 mod lifecycle_executor;
 mod execution;
@@ -18,6 +9,14 @@ mod config;
 mod health;
 mod calls;
 
+use super::executor::{
+    PluginCallContext,
+    PluginCancellationSource,
+    PluginExecutor,
+    PluginLifecycleStatus,
+};
+use std::sync::{ Arc, Mutex, RwLock, atomic::{ AtomicBool, AtomicU64, Ordering } };
+use std::time::Instant;
 use self::lifecycle_executor::{
     PendingPluginLifecycle,
     PluginLifecycleExecutor,
@@ -277,11 +276,7 @@ impl PluginRuntime {
             let state = self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner());
             match state.executor.as_deref() {
                 Some(executor) => {
-                    let error = if state.destroyed {
-                        None
-                    } else {
-                        executor.validate().err()
-                    };
+                    let error = if state.destroyed { None } else { executor.validate().err() };
                     (executor.kind(), executor.worker_pid(), error)
                 }
                 None => (PluginExecutorKind::InProcess, None, None),
@@ -301,6 +296,10 @@ impl PluginRuntime {
             worker_pid,
             worker_threads: self.config.worker_threads,
             max_concurrent_calls: self.config.max_concurrent_calls,
+            max_parallel_plugin_calls: executor_kind.max_parallel_plugin_calls(
+                self.config.worker_threads,
+                self.config.max_concurrent_calls
+            ),
             queue_capacity: self.worker_pool.queue_capacity,
             queued_jobs: self.worker_pool.queued_jobs.load(Ordering::Relaxed),
             running_workers: self.worker_pool.running_workers.load(Ordering::Relaxed),
@@ -351,6 +350,7 @@ impl Drop for PluginRuntime {
 
 #[cfg(test)]
 mod tests {
+    use crate::Factory::PluginExecutorKind;
     use crate::PluginManager::runtime::config::{
         DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS,
         DEFAULT_PLUGIN_QUEUE_CAPACITY,
@@ -411,6 +411,14 @@ mod tests {
         assert!(parent.mark_timed_out(|| {}));
         assert!(parent_token.is_cancelled());
         assert!(child_token.is_cancelled());
+    }
+
+    #[test]
+    fn effective_plugin_parallelism_depends_on_executor_kind() {
+        assert_eq!(PluginExecutorKind::InProcess.max_parallel_plugin_calls(16, 32), 16);
+        assert_eq!(PluginExecutorKind::InProcess.max_parallel_plugin_calls(8, 3), 3);
+        assert_eq!(PluginExecutorKind::Process.max_parallel_plugin_calls(16, 32), 1);
+        assert_eq!(PluginExecutorKind::Process.max_parallel_plugin_calls(1, 1), 1);
     }
 
     #[test]

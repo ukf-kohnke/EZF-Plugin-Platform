@@ -18,7 +18,8 @@ use std::{
     io::{self, ErrorKind},
     path::{Path, PathBuf},
     process,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -58,6 +59,9 @@ fn run() -> AppResult<i32> {
     let external_fixtures = options.database_fixtures.as_deref().map(read_database_fixtures).transpose()?;
     match command.as_str() {
         "inspect" => {
+            if options.database_plugin.is_some() {
+                return Err(Box::new(cli_error("inspect does not use --database-plugin; use the test command with database.mode=live")));
+            }
             if options.request.is_some() || options.scenario.is_some() {
                 return Err(Box::new(cli_error("inspect does not accept --request or --scenario")));
             }
@@ -75,6 +79,9 @@ fn run() -> AppResult<i32> {
             Ok(if cleanup_ok { 0 } else { 1 })
         }
         "call" => {
+            if options.database_plugin.is_some() {
+                return Err(Box::new(cli_error("--database-plugin is currently supported for 'test' scenarios; use database.mode=live")));
+            }
             if options.scenario.is_some() {
                 return Err(Box::new(cli_error("call does not accept --scenario")));
             }
@@ -118,13 +125,33 @@ fn run() -> AppResult<i32> {
             if scenario.tests.is_empty() {
                 return Err(Box::new(cli_error("scenario must contain at least one test case")));
             }
+            let live_database = scenario.database.mode.as_deref().is_some_and(|mode| mode.eq_ignore_ascii_case("live"));
+            if live_database && options.database_fixtures.is_some() {
+                return Err(Box::new(cli_error("database.mode=live cannot be combined with --database-fixtures")));
+            }
             let fixtures = external_fixtures.unwrap_or(scenario.database.clone());
             fixtures.validate()?;
             let executor = options.executor.or(scenario.executor.as_deref().map(parse_executor).transpose()?).unwrap_or(ExecutorArg::InProcess);
-            let test_report = run_test_suite(&plugin_file, &scenario, executor, &options, fixtures)?;
-            let passed = test_report["summary"]["failed"].as_u64().unwrap_or(1) == 0;
-            print_json_output(&test_report, options.output.as_deref())?;
-            Ok(if passed { 0 } else { 1 })
+            if live_database {
+                let db_plugin = options.database_plugin.as_deref().ok_or_else(|| cli_error("database.mode=live requires --database-plugin <MolgenDB-library>"))?;
+                let runtime = runtime_config(&scenario.timeouts, &options);
+                start_live_database_plugin(db_plugin, executor, runtime)?;
+                let report_result = run_test_suite(&plugin_file, &scenario, executor, &options, fixtures, true);
+                let db_cleanup = stop_live_database_plugin();
+                let mut report = report_result?;
+                add_database_lifecycle_result(&mut report, db_cleanup);
+                let passed = report["summary"]["failed"].as_u64().unwrap_or(1) == 0;
+                print_json_output(&report, options.output.as_deref())?;
+                Ok(if passed { 0 } else { 1 })
+            } else {
+                if options.database_plugin.is_some() {
+                    return Err(Box::new(cli_error("--database-plugin requires scenario database.mode=live")));
+                }
+                let test_report = run_test_suite(&plugin_file, &scenario, executor, &options, fixtures, false)?;
+                let passed = test_report["summary"]["failed"].as_u64().unwrap_or(1) == 0;
+                print_json_output(&test_report, options.output.as_deref())?;
+                Ok(if passed { 0 } else { 1 })
+            }
         }
         other => Err(Box::new(cli_error(format!("unknown command '{other}'")))),
     }
@@ -166,6 +193,7 @@ struct CliOptions {
     scenario: Option<PathBuf>,
     output: Option<PathBuf>,
     database_fixtures: Option<PathBuf>,
+    database_plugin: Option<PathBuf>,
     executor: Option<ExecutorArg>,
     timeout_ms: Option<u64>,
     unload_timeout_ms: Option<u64>,
@@ -180,6 +208,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> AppResult<CliOptions
             "--scenario" | "-s" => set_path(&mut options.scenario, "--scenario", args.next())?,
             "--output" | "-o" => set_path(&mut options.output, "--output", args.next())?,
             "--database-fixtures" | "--db-fixtures" => set_path(&mut options.database_fixtures, "--database-fixtures", args.next())?,
+            "--database-plugin" => set_path(&mut options.database_plugin, "--database-plugin", args.next())?,
             "--executor" => {
                 let value = args.next().ok_or_else(|| cli_error("--executor requires in-process or process"))?;
                 options.executor = Some(parse_executor(&value)?);
@@ -526,10 +555,17 @@ struct TestCase {
 struct TestExpectation {
     status: Option<u16>,
     body_equals: Option<Value>,
+    body_json_path_equals: Option<JsonPathEquality>,
     error_contains: Option<String>,
     session_close_success: Option<bool>,
     health_state: Option<String>,
     database_call_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JsonPathEquality {
+    path: String,
+    equals: Value,
 }
 
 fn run_test_suite(
@@ -538,6 +574,7 @@ fn run_test_suite(
     executor: ExecutorArg,
     options: &CliOptions,
     fixtures: DatabaseFixtures,
+    live_database: bool,
 ) -> AppResult<Value> {
     fixtures.validate()?;
     suite.timeouts.validate()?;
@@ -551,15 +588,22 @@ fn run_test_suite(
             let _ = request.into_endpoint_request()?;
         }
     }
-    configure_database_mock(fixtures);
+    if !live_database { configure_database_mock(fixtures); }
     let runtime = runtime_config(&suite.timeouts, options);
     let host = PluginHostInstance::new(PluginHostConfig {
         plugin_root: plugin_file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(),
         runtime,
         executor: executor.host_selection(),
     });
-    host.register_database_executor(mock_database_execute, mock_database_free)
-        .map_err(|error| cli_error(format!("cannot install database mock: {error}")))?;
+    let registration = if live_database {
+        host.register_database_executor(live_database_execute, mock_database_free)
+    } else {
+        host.register_database_executor(mock_database_execute, mock_database_free)
+    };
+    registration.map_err(|error| cli_error(format!(
+        "cannot install {} database capability: {error}",
+        if live_database { "live" } else { "mock" }
+    )))?;
 
     let suite_name = suite.name.clone().unwrap_or_else(|| plugin_file.file_stem().and_then(|s| s.to_str()).unwrap_or("plugin-test-suite").to_owned());
     let started = Instant::now();
@@ -646,7 +690,7 @@ fn run_test_suite(
         db_cursor = db_calls_all.len();
         let mut checks = Vec::<Value>::new();
         let has_explicit_expectation = case.expect.status.is_some() || case.expect.body_equals.is_some()
-            || case.expect.error_contains.is_some() || case.expect.session_close_success.is_some()
+            || case.expect.body_json_path_equals.is_some() || case.expect.error_contains.is_some() || case.expect.session_close_success.is_some()
             || case.expect.health_state.is_some() || case.expect.database_call_count.is_some();
 
         if let Some(expected) = case.expect.status {
@@ -656,6 +700,11 @@ fn run_test_suite(
         if let Some(expected) = &case.expect.body_equals {
             let passed = outcome["kind"].as_str() == Some("response") && response_body.as_ref() == Some(expected);
             checks.push(check_json("body_equals", passed, format!("expected {expected}, got {}", response_body.as_ref().map(Value::to_string).unwrap_or_else(|| "<no response body>".to_owned()))));
+        }
+        if let Some(expected) = &case.expect.body_json_path_equals {
+            let actual = response_body.as_ref().and_then(|body| json_path_value(body, &expected.path));
+            let passed = outcome["kind"].as_str() == Some("response") && actual == Some(&expected.equals);
+            checks.push(check_json("body_json_path_equals", passed, format!("expected body path {:?} = {}, got {}", expected.path, expected.equals, actual.map(Value::to_string).unwrap_or_else(|| "<missing>".to_owned()))));
         }
         if let Some(expected) = &case.expect.error_contains {
             let actual = endpoint_error_text.as_deref().unwrap_or("");
@@ -718,6 +767,19 @@ fn run_test_suite(
     Ok(build_suite_report(&suite_name, plugin_file, executor, runtime, results, json!({"success":true,"plugin":manifest.name,"plugin_id":plugin_id}), started.elapsed().as_millis() as u64))
 }
 
+fn json_path_value<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        if segment.is_empty() { return None; }
+        current = match current {
+            Value::Object(object) => object.get(segment)?,
+            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
 fn check_json(name: &str, passed: bool, detail: String) -> Value {
     json!({"name":name,"passed":passed,"detail":detail})
 }
@@ -759,6 +821,8 @@ fn build_suite_report(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct DatabaseFixtures {
+    /// "mock" (default) uses controlled fixtures; "live" forwards requests to a real DataSource plugin.
+    mode: Option<String>,
     default_query: ResultSet,
     default_execute_rows_affected: u64,
     default_error: Option<DatabaseFixtureError>,
@@ -767,7 +831,7 @@ struct DatabaseFixtures {
 
 impl Default for DatabaseFixtures {
     fn default() -> Self {
-        Self { default_query: ResultSet::default(), default_execute_rows_affected: 1, default_error: None, rules: Vec::new() }
+        Self { mode: None, default_query: ResultSet::default(), default_execute_rows_affected: 1, default_error: None, rules: Vec::new() }
     }
 }
 
@@ -799,6 +863,17 @@ impl DatabaseFixtureError {
 
 impl DatabaseFixtures {
     fn validate(&self) -> AppResult<()> {
+        if let Some(mode) = self.mode.as_deref() {
+            if !matches!(mode.trim().to_ascii_lowercase().as_str(), "mock" | "live") {
+                return Err(Box::new(cli_error(format!("unknown database mode {mode:?}; use mock or live"))));
+            }
+            if mode.eq_ignore_ascii_case("live")
+                && (!self.rules.is_empty() || self.default_error.is_some()
+                    || !self.default_query.rows.is_empty() || self.default_execute_rows_affected != 1)
+            {
+                return Err(Box::new(cli_error("database.mode=live cannot be combined with mock fixture rules or non-default mock responses")));
+            }
+        }
         for (index, rule) in self.rules.iter().enumerate() {
             if rule.response.is_some() == rule.error.is_some() {
                 return Err(Box::new(cli_error(format!("database rule {} must contain exactly one of 'response' or 'error'", index + 1))));
@@ -848,6 +923,11 @@ fn configure_database_mock(fixtures: DatabaseFixtures) {
 }
 
 fn database_call_snapshot() -> Vec<Value> {
+    if let Some(state) = live_database_state().lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        let mut calls = state.calls.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        calls.sort_by_key(|item| item["call_number"].as_u64().unwrap_or(0));
+        return calls;
+    }
     database_mock_state().lock().unwrap_or_else(|p| p.into_inner()).calls.clone()
 }
 
@@ -938,6 +1018,156 @@ fn write_database_response(response_out: *mut AbiBuffer, response: &Result<Datab
 
 unsafe extern "C" fn mock_database_free(buffer: AbiBuffer) { unsafe { buffer.free(); } }
 
+// ------------------------------ Optional live DataSource plugin ------------------------------
+// ABI V2 has no user-data pointer on the DB callback. This CLI process therefore exposes one
+// explicitly configured database host at a time. The test plugin and the DataSource can each use
+// the selected existing executor (InProcess or Process); requests are forwarded through ABI V2.
+struct LiveDatabaseState {
+    host: Arc<PluginHostInstance>,
+    plugin_id: i64,
+    calls: Arc<Mutex<Vec<Value>>>,
+    next_call: Arc<AtomicUsize>,
+}
+
+static LIVE_DATABASE_STATE: OnceLock<Mutex<Option<LiveDatabaseState>>> = OnceLock::new();
+
+fn live_database_state() -> &'static Mutex<Option<LiveDatabaseState>> {
+    LIVE_DATABASE_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn start_live_database_plugin(path: &Path, executor: ExecutorArg, runtime: PluginRuntimeConfig) -> AppResult<()> {
+    let plugin_file = fs::canonicalize(path).map_err(|error| cli_error(format!("cannot resolve database plugin '{}': {error}", path.display())))?;
+    if !plugin_file.is_file() {
+        return Err(Box::new(cli_error(format!("database plugin path is not a file: {}", plugin_file.display()))));
+    }
+    if live_database_state().lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+        return Err(Box::new(cli_error("a live database plugin is already configured in this test-host process")));
+    }
+    let host = Arc::new(PluginHostInstance::new(PluginHostConfig {
+        plugin_root: plugin_file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(),
+        runtime,
+        executor: executor.host_selection(),
+    }));
+    let plugin_id = host.load_plugin_file(&plugin_file).map_err(|error| cli_error(format!("failed to load live database DataSource plugin '{}': {error}", plugin_file.display())))?;
+    if !host.has_database_plugin() {
+        let _ = host.unload_plugin(plugin_id);
+        return Err(Box::new(cli_error(format!("plugin '{}' does not declare a DataSource manifest", plugin_file.display()))));
+    }
+    if let Err(error) = host.check_database_readiness() {
+        let cleanup = host.unload_plugin(plugin_id);
+        return Err(Box::new(cli_error(match cleanup {
+            Ok(()) => format!("live database plugin failed SELECT 1 readiness check: {error}"),
+            Err(cleanup_error) => format!("live database plugin failed readiness check: {error}; unload also failed: {cleanup_error}"),
+        })));
+    }
+    let state = LiveDatabaseState {
+        host,
+        plugin_id,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        next_call: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut slot = live_database_state().lock().unwrap_or_else(|p| p.into_inner());
+    if slot.is_some() {
+        let _ = state.host.unload_plugin(state.plugin_id);
+        return Err(Box::new(cli_error("a live database plugin was configured concurrently")));
+    }
+    *slot = Some(state);
+    Ok(())
+}
+
+fn stop_live_database_plugin() -> Value {
+    let state = live_database_state().lock().unwrap_or_else(|p| p.into_inner()).take();
+    let Some(state) = state else { return json!({"success": true, "skipped": true}); };
+    match state.host.unload_plugin(state.plugin_id) {
+        Ok(()) => json!({"success": true, "plugin_id": state.plugin_id}),
+        Err(error) => json!({"success": false, "plugin_id": state.plugin_id, "error": error.to_string()}),
+    }
+}
+
+fn add_database_lifecycle_result(report: &mut Value, cleanup: Value) {
+    let success = cleanup["success"].as_bool().unwrap_or(false);
+    let test = json!({
+        "name": "database.lifecycle.unload",
+        "phase": "lifecycle",
+        "passed": success,
+        "duration_ms": 0,
+        "outcome": cleanup,
+        "checks": [check_json("database_unload_success", success, if success { "live DataSource plugin unloaded".to_owned() } else { "live DataSource plugin failed to unload".to_owned() })],
+    });
+    if let Some(tests) = report["tests"].as_array_mut() { tests.push(test); }
+    if let Some(summary) = report["summary"].as_object_mut() {
+        let total = summary.get("total").and_then(Value::as_u64).unwrap_or(0);
+        let passed = summary.get("passed").and_then(Value::as_u64).unwrap_or(0);
+        let failed = summary.get("failed").and_then(Value::as_u64).unwrap_or(0);
+        summary.insert("total".to_owned(), Value::from(total + 1));
+        if success {
+            summary.insert("passed".to_owned(), Value::from(passed + 1));
+        } else {
+            summary.insert("failed".to_owned(), Value::from(failed + 1));
+        }
+    }
+    report["database_source_cleanup"] = cleanup;
+}
+
+unsafe extern "C" fn live_database_execute(
+    request: AbiSlice,
+    cancellation: PluginCancellationV2,
+    response_out: *mut AbiBuffer,
+) -> i32 {
+    if response_out.is_null() { return PluginAbi::PLUGIN_STATUS_SERIALIZATION; }
+    unsafe { *response_out = AbiBuffer::EMPTY; }
+    if unsafe { cancellation.is_cancelled() } { return PluginAbi::PLUGIN_STATUS_CANCELLED; }
+    let Some(request_bytes) = (unsafe { request.to_vec() }) else { return PluginAbi::PLUGIN_STATUS_SERIALIZATION; };
+    let database_request = match serde_json::from_slice::<DatabaseRequest>(&request_bytes) {
+        Ok(request) => request,
+        Err(error) => {
+            let result: Result<DatabaseResponse, DatabaseError> = Err(DatabaseError::new(
+                DatabaseErrorKind::InvalidRequest,
+                format!("live database bridge could not decode request: {error}"),
+            ));
+            return write_database_response(response_out, &result);
+        }
+    };
+    let (operation, statement) = request_operation_and_statement(&database_request);
+    let request_json = serde_json::to_value(&database_request).unwrap_or(Value::Null);
+    let (host, calls, call_number) = {
+        let slot = live_database_state().lock().unwrap_or_else(|p| p.into_inner());
+        let Some(state) = slot.as_ref() else {
+            let result: Result<DatabaseResponse, DatabaseError> = Err(DatabaseError::new(
+                DatabaseErrorKind::Connection,
+                "live database DataSource is not configured",
+            ));
+            return write_database_response(response_out, &result);
+        };
+        (Arc::clone(&state.host), Arc::clone(&state.calls), state.next_call.fetch_add(1, Ordering::Relaxed) + 1)
+    };
+
+    match host.execute_database_raw(request_bytes, cancellation) {
+        Ok(response_bytes) => {
+            calls.lock().unwrap_or_else(|p| p.into_inner()).push(json!({
+                "call_number": call_number,
+                "operation": operation,
+                "statement": statement,
+                "request": request_json,
+                "outcome": {"ok": true, "response_bytes": response_bytes.len()},
+            }));
+            unsafe { *response_out = AbiBuffer::from_vec(response_bytes); }
+            PluginAbi::PLUGIN_STATUS_OK
+        }
+        Err(error) => {
+            calls.lock().unwrap_or_else(|p| p.into_inner()).push(json!({
+                "call_number": call_number,
+                "operation": operation,
+                "statement": statement,
+                "request": request_json,
+                "outcome": {"ok": false, "error": {"kind": error.kind, "message": error.message}},
+            }));
+            let response: Result<DatabaseResponse, DatabaseError> = Err(error);
+            write_database_response(response_out, &response)
+        }
+    }
+}
+
 // ------------------------------ Scenario loading / output helpers ------------------------------
 
 fn read_database_fixtures(path: &Path) -> AppResult<DatabaseFixtures> {
@@ -962,6 +1192,7 @@ OPTIONS:
   --request, -r <file>           JSON request for 'call'
   --scenario, -s <file>          JSON integration-test scenario for 'test'
   --database-fixtures <file>     JSON database mock rules for inspect/call, or override scenario fixtures
+  --database-plugin <file>       Live DataSource library; requires scenario database.mode=live
   --timeout-ms <n>               Override plugin call timeout (1..600000 ms)
   --unload-timeout-ms <n>        Override runtime quiescing timeout
   --lifecycle-timeout-ms <n>     Override on_unload/destroy callback timeout
@@ -976,6 +1207,7 @@ Process mode:
   The test host never silently disables the process executor's sandbox checks.
 
 A test scenario contains 'tests', optional 'timeouts', 'executor', 'principal', and 'database'.
+  database.mode defaults to 'mock'; use 'live' with --database-plugin to forward to a real DataSource plugin.
 A case may include a 'request', 'session_closed': true, and an 'expect' object. Results are JSON;
 exit code 0 means all cases and lifecycle checks passed, 1 means a test failed, 2 means CLI/setup error.
 "#);
@@ -991,6 +1223,39 @@ mod tests {
         assert_eq!(parse_method("GET").unwrap(), PluginHttpMethod::Get);
         assert_eq!(parse_method("post").unwrap(), PluginHttpMethod::Post);
         assert!(parse_method("TRACE").is_err());
+    }
+
+    #[test]
+    fn live_variant_filter_scenario_uses_actual_endpoint_path_and_database_mode() {
+        let suite: TestSuite = serde_json::from_str(r#"{
+            "name":"VariantFilter live DB",
+            "executor":"process",
+            "database":{"mode":"live"},
+            "tests":[{"name":"load SNV","request":{"endpoint_id":"load-snv-data","method":"POST","path":"/loadSnvData","body":{"patient_ids":["00000000-0000-0000-0000-000000000001"]}},"expect":{"status":200,"database_call_count":1}}]
+        }"#).unwrap();
+        assert_eq!(suite.database.mode.as_deref(), Some("live"));
+        let request = suite.tests[0].request.clone().unwrap().into_endpoint_request().unwrap();
+        assert_eq!(request.endpoint_id, "load-snv-data");
+        assert_eq!(request.method, PluginHttpMethod::Post);
+        assert_eq!(request.raw_path, "/loadSnvData");
+    }
+
+    #[test]
+    fn json_body_path_equality_supports_nested_json() {
+        let body = json!({"status":"loaded","patients":[{"id":"p1"}]});
+        let loaded = json!("loaded");
+        let patient_id = json!("p1");
+        assert_eq!(json_path_value(&body, "status"), Some(&loaded));
+        assert_eq!(json_path_value(&body, "patients.0.id"), Some(&patient_id));
+        assert_eq!(json_path_value(&body, "patients.1.id"), None);
+    }
+
+    #[test]
+    fn validates_live_database_mode_without_mock_rules() {
+        let fixtures: DatabaseFixtures = serde_json::from_str(r#"{"mode":"live"}"#).unwrap();
+        assert!(fixtures.validate().is_ok());
+        let mixed: DatabaseFixtures = serde_json::from_str(r#"{"mode":"live","default_execute_rows_affected":2}"#).unwrap();
+        assert!(mixed.validate().is_err());
     }
 
     #[test]

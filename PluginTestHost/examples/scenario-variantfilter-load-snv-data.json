@@ -1,0 +1,72 @@
+{
+  "name": "VariantFilter: POST /loadSnvData against the live MolgenDB database",
+  "executor": "process",
+  "timeouts": {
+    "call_ms": 60000,
+    "unload_ms": 20000,
+    "lifecycle_ms": 10000
+  },
+  "principal": {
+    "user_id": "plugin-testhost-variantfilter",
+    "username": "variantfilter-test",
+    "given_name": "VariantFilter",
+    "family_name": "IntegrationTest",
+    "groups": [
+      "plugin-test",
+      "variantfilter-testers"
+    ],
+    "session_id": "variantfilter-live-db-session"
+  },
+  "database": {
+    "mode": "live"
+  },
+  "tests": [
+    {
+      "name": "POST /loadSnvData loads SNV data from MolgenDB",
+      "request": {
+        "endpoint_id": "load-snv-data",
+        "method": "POST",
+        "path": "/loadSnvData",
+        "content_type": "application/json",
+        "body": {
+          "patient_ids": [
+            "00000000-0000-0000-0000-000000000001"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body_json_path_equals": {
+          "path": "status",
+          "equals": "loaded"
+        },
+        "database_call_count": 1
+      }
+    },
+    {
+      "name": "GET /getSnvCache returns the loaded data for the same session",
+      "request": {
+        "endpoint_id": "get-snv-cache",
+        "method": "GET",
+        "path": "/getSnvCache"
+      },
+      "expect": {
+        "status": 200,
+        "body_json_path_equals": {
+          "path": "status",
+          "equals": "loaded"
+        },
+        "database_call_count": 0
+      }
+    },
+    {
+      "name": "close test session and clear VariantFilter cache",
+      "session_closed": true,
+      "session_id": "variantfilter-live-db-session",
+      "expect": {
+        "session_close_success": true
+      }
+    }
+  ],
+  "expect_unload_success": true
+}

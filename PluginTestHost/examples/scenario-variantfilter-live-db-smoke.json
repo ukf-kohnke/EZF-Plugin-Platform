@@ -1,0 +1,49 @@
+{
+  "name": "VariantFilter: live database connectivity smoke test",
+  "executor": "process",
+  "timeouts": {
+    "call_ms": 60000,
+    "unload_ms": 20000,
+    "lifecycle_ms": 10000
+  },
+  "principal": {
+    "user_id": "plugin-testhost-variantfilter",
+    "username": "variantfilter-test",
+    "given_name": "VariantFilter",
+    "family_name": "IntegrationTest",
+    "groups": ["plugin-test", "variantfilter-testers"],
+    "session_id": "variantfilter-live-db-smoke-session"
+  },
+  "database": {
+    "mode": "live"
+  },
+  "tests": [
+    {
+      "name": "POST /loadSnvData reaches MolgenDB and returns a valid response",
+      "request": {
+        "endpoint_id": "load-snv-data",
+        "method": "POST",
+        "path": "/loadSnvData",
+        "content_type": "application/json",
+        "body": {
+          "patient_ids": [
+            "00000000-0000-0000-0000-000000000001"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "database_call_count": 1
+      }
+    },
+    {
+      "name": "close smoke-test session",
+      "session_closed": true,
+      "session_id": "variantfilter-live-db-smoke-session",
+      "expect": {
+        "session_close_success": true
+      }
+    }
+  ],
+  "expect_unload_success": true
+}

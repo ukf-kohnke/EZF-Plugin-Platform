@@ -1,0 +1,26 @@
+{
+  "default_query": { "rows": [] },
+  "default_execute_rows_affected": 1,
+  "rules": [
+    {
+      "operation": "query",
+      "statement_contains": "FROM patients",
+      "response": {
+        "result": "query",
+        "rows": [
+          {
+            "columns": [
+              { "name": "patient_id", "value": { "type": "i32", "value": 42 } },
+              { "name": "display_name", "value": { "type": "text", "value": "Fixture Patient" } }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "operation": "execute",
+      "statement_contains": "FORCE_TEST_DB_ERROR",
+      "error": { "kind": "query", "message": "intentional database fixture error" }
+    }
+  ]
+}

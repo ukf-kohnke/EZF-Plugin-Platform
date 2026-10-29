@@ -1,0 +1,62 @@
+{
+  "name": "Example domain plugin integration suite",
+  "executor": "in_process",
+  "timeouts": {
+    "call_ms": 3000,
+    "unload_ms": 5000,
+    "lifecycle_ms": 1500
+  },
+  "principal": {
+    "user_id": "test-user-42",
+    "username": "test-user",
+    "given_name": "Integration",
+    "family_name": "Tester",
+    "groups": ["plugin-test", "domain-testers"],
+    "session_id": "test-session-42"
+  },
+  "database": {
+    "default_query": { "rows": [] },
+    "default_execute_rows_affected": 1,
+    "rules": [
+      {
+        "operation": "query",
+        "statement_contains": "FROM example_items",
+        "response": {
+          "result": "query",
+          "rows": [
+            {
+              "columns": [
+                { "name": "id", "value": { "type": "i32", "value": 7 } },
+                { "name": "name", "value": { "type": "text", "value": "fixture-item" } }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "operation": "execute",
+        "statement_contains": "FORCE_TEST_DB_ERROR",
+        "error": { "kind": "query", "message": "forced database test error" }
+      }
+    ]
+  },
+  "tests": [
+    {
+      "name": "endpoint returns expected fixture row",
+      "request": {
+        "endpoint_id": "list_items",
+        "method": "GET",
+        "path": "/example/items",
+        "raw_query": "limit=10"
+      },
+      "expect": { "status": 200 }
+    },
+    {
+      "name": "session-close callback is acknowledged",
+      "session_closed": true,
+      "session_id": "test-session-42",
+      "expect": { "session_close_success": true }
+    }
+  ],
+  "expect_unload_success": true
+}

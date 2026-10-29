@@ -1,0 +1,35 @@
+{
+  "name": "Process worker timeout and cleanup example",
+  "executor": "process",
+  "timeouts": {
+    "call_ms": 150,
+    "unload_ms": 5000,
+    "lifecycle_ms": 1000
+  },
+  "database": {
+    "default_query": { "rows": [] },
+    "default_execute_rows_affected": 1
+  },
+  "tests": [
+    {
+      "name": "slow endpoint is cancelled at the configured deadline",
+      "request": {
+        "endpoint_id": "slow_test",
+        "method": "GET",
+        "path": "/test/slow"
+      },
+      "expect": {
+        "error_contains": "timeout"
+      }
+    },
+    {
+      "name": "session closure reaches the plugin",
+      "session_closed": true,
+      "session_id": "timeout-test-session",
+      "expect": {
+        "session_close_success": true
+      }
+    }
+  ],
+  "expect_unload_success": true
+}

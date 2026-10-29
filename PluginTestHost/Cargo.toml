@@ -3,7 +3,7 @@ name = "PluginTestHost"
 version = "3.5.4"
 edition = "2024"
 authors = ["EZF contributors"]
-description = "Minimal standalone CLI for loading and exercising a single EZF domain plugin"
+description = "Standalone ABI V2 integration test host for EZF domain plugins"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
@@ -15,5 +15,5 @@ DatabaseContracts = { path = "../Plugin-SDK/DatabaseContracts" }
 PluginAbi = { path = "../Plugin-SDK/PluginAbi" }
 PluginContracts = { path = "../Plugin-SDK/PluginContracts" }
 PluginHost = { path = "../PluginHost" }
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -27,7 +27,10 @@
             {
               "columns": [
                 { "name": "id", "value": { "type": "i32", "value": 7 } },
-                { "name": "name", "value": { "type": "text", "value": "fixture-item" } }
+                {
+                  "name": "name",
+                  "value": { "type": "text", "value": "fixture-item" }
+                }
               ]
             }
           ]

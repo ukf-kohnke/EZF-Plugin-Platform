@@ -11,10 +11,7 @@
     "username": "variantfilter-test",
     "given_name": "VariantFilter",
     "family_name": "IntegrationTest",
-    "groups": [
-      "plugin-test",
-      "variantfilter-testers"
-    ],
+    "groups": ["plugin-test", "variantfilter-testers"],
     "session_id": "variantfilter-live-db-session"
   },
   "database": {
@@ -29,9 +26,7 @@
         "path": "/loadSnvData",
         "content_type": "application/json",
         "body": {
-          "patient_ids": [
-            "00000000-0000-0000-0000-000000000001"
-          ]
+          "patient_ids": ["00000000-0000-0000-0000-000000000001"]
         }
       },
       "expect": {

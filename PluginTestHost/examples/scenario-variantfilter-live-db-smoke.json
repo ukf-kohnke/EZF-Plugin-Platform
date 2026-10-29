@@ -26,9 +26,7 @@
         "path": "/loadSnvData",
         "content_type": "application/json",
         "body": {
-          "patient_ids": [
-            "00000000-0000-0000-0000-000000000001"
-          ]
+          "patient_ids": ["00000000-0000-0000-0000-000000000001"]
         }
       },
       "expect": {

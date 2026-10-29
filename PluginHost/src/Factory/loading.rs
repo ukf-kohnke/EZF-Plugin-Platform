@@ -1,8 +1,20 @@
 //! Internal Factory loading operations.
+use crate::Factory::{ endpoints::loaded_plugin_names_for, readiness::plugin_health_by_name_for };
+
 use super::*;
 
 #[allow(unused)]
 pub fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
+    instance().unload_plugin(id)
+}
+
+impl PluginHost {
+    pub fn unload_plugin(&self, id: i64) -> Result<(), PluginManagerError> {
+        unload_plugin_for(self, id)
+    }
+}
+
+fn unload_plugin_for(host: &PluginHost, id: i64) -> Result<(), PluginManagerError> {
     // Keep the plugin registered for the complete unload operation. `PluginRuntime::unload`
     // transitions its health to `Stopping` before waiting for in-flight calls to drain.
     // Keeping the registry entry visible makes that transient state observable through the
@@ -10,21 +22,25 @@ pub fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
     // ready host. The operation guard still prevents a concurrent load/reload of the same
     // canonical library path.
     let canonical_path = {
-        let singleton = instance();
+        let singleton = host;
         let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         manager.plugins
             .get(&id)
             .map(|item| item.path.clone())
             .ok_or(PluginManagerError::PluginNotFound { id })?
     };
-    let _operation_guard = begin_plugin_operation(&canonical_path, PluginOperationKind::Unloading)?;
+    let _operation_guard = begin_plugin_operation(
+        host,
+        &canonical_path,
+        PluginOperationKind::Unloading
+    )?;
 
     // Re-check membership after acquiring the operation guard because another lifecycle
     // operation may have completed between the initial lookup and reservation. Only the
     // runtime Arc is borrowed here; the registry entry itself stays in place until unload
     // succeeds, so health snapshots can expose `Stopping`/failure states during the operation.
     let runtime = {
-        let singleton = instance();
+        let singleton = host;
         let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         manager.get_runtime(id).ok_or(PluginManagerError::PluginNotFound { id })?
     };
@@ -38,7 +54,7 @@ pub fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
 
     let elapsed = started.elapsed();
     let removed_item = {
-        let singleton = instance();
+        let singleton = host;
         let mut manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         manager.detach_plugin(id)?
     };
@@ -68,17 +84,29 @@ pub fn unload_plugin(id: i64) -> Result<(), PluginManagerError> {
 }
 
 pub fn is_plugin_loaded(plugin_name: &str, plugin_path: &str) -> Result<bool, PluginManagerError> {
-    if find_id_by_name(plugin_name).is_some() {
-        return Ok(true);
-    }
-
-    let report = load_plugins_with_policy(plugin_path, PluginLoadPolicy::optional_all())?;
-    Ok(report.loaded_count() > 0 && find_id_by_name(plugin_name).is_some())
+    instance().is_plugin_loaded(plugin_name, plugin_path)
 }
 
-pub(crate) fn find_id_by_name(plugin_name: &str) -> Option<i64> {
-    let singleton = instance();
-    let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+impl PluginHost {
+    pub fn is_plugin_loaded(
+        &self,
+        plugin_name: &str,
+        plugin_path: &str
+    ) -> Result<bool, PluginManagerError> {
+        if find_id_by_name_for(self, plugin_name).is_some() {
+            return Ok(true);
+        }
+        let report = load_plugins_with_policy_for(
+            self,
+            plugin_path,
+            PluginLoadPolicy::optional_all()
+        )?;
+        Ok(report.loaded_count() > 0 && find_id_by_name_for(self, plugin_name).is_some())
+    }
+}
+
+fn find_id_by_name_for(host: &PluginHost, plugin_name: &str) -> Option<i64> {
+    let manager = host.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     manager
         .plugin_ids()
@@ -90,52 +118,36 @@ pub(crate) fn find_id_by_name(plugin_name: &str) -> Option<i64> {
         )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PluginOperationKind {
-    Loading,
-    Unloading,
-}
-
-static PLUGIN_OPERATIONS_IN_PROGRESS: OnceLock<
-    Mutex<BTreeMap<PathBuf, PluginOperationKind>>
-> = OnceLock::new();
-
-fn plugin_operations_in_progress() -> &'static Mutex<BTreeMap<PathBuf, PluginOperationKind>> {
-    PLUGIN_OPERATIONS_IN_PROGRESS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-struct PluginOperationGuard {
+struct PluginOperationGuard<'a> {
+    host: &'a PluginHost,
     path: PathBuf,
 }
 
-impl Drop for PluginOperationGuard {
+impl Drop for PluginOperationGuard<'_> {
     fn drop(&mut self) {
-        let mut paths = plugin_operations_in_progress()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut paths = self.host.operations.lock().unwrap_or_else(|p| p.into_inner());
         paths.remove(&self.path);
     }
 }
 
-fn begin_plugin_operation(
+fn begin_plugin_operation<'a>(
+    host: &'a PluginHost,
     path: &Path,
     kind: PluginOperationKind
-) -> Result<PluginOperationGuard, PluginManagerError> {
+) -> Result<PluginOperationGuard<'a>, PluginManagerError> {
     let canonical_path = PluginManager::normalize_path(path);
-    let mut paths = plugin_operations_in_progress()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut paths = host.operations.lock().unwrap_or_else(|p| p.into_inner());
     if paths.contains_key(&canonical_path) {
         return Err(PluginManagerError::PluginLoadInProgress { path: canonical_path });
     }
     paths.insert(canonical_path.clone(), kind);
-    Ok(PluginOperationGuard { path: canonical_path })
+    Ok(PluginOperationGuard { host, path: canonical_path })
 }
 
 /// Emit the selected execution backend and current child PID after a plugin is registered.
 /// This log is independent of EZF_API_TIMING so executor selection is visible in normal startup logs.
-fn log_plugin_executor_snapshot(plugin_name: &str, path: &Path) {
-    match plugin_health_by_name(plugin_name) {
+fn log_plugin_executor_snapshot(host: &PluginHost, plugin_name: &str, path: &Path) {
+    match plugin_health_by_name_for(host, plugin_name) {
         Some(snapshot) => {
             let worker_pid = snapshot.worker_pid
                 .map(|pid| pid.to_string())
@@ -164,27 +176,45 @@ fn log_plugin_executor_snapshot(plugin_name: &str, path: &Path) {
     }
 }
 
-pub(super) fn plugin_operation_kind(path: &Path) -> Option<PluginOperationKind> {
+pub(super) fn plugin_operation_kind_for_host(
+    host: &PluginHost,
+    path: &Path
+) -> Option<PluginOperationKind> {
     let canonical_path = PluginManager::normalize_path(path);
-    plugin_operations_in_progress()
+    host.operations
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|p| p.into_inner())
         .get(&canonical_path)
         .copied()
 }
 
 pub fn load_plugin_file(path: &Path) -> Result<i64, PluginManagerError> {
-    load_plugin_file_with_config(path, PluginRuntimeConfig::from_environment())
+    instance().load_plugin_file_with_config(path, PluginRuntimeConfig::from_environment())
 }
 
 pub fn load_plugin_file_with_config(
     path: &Path,
     config: PluginRuntimeConfig
 ) -> Result<i64, PluginManagerError> {
-    load_plugin_file_inner(path, config)
+    instance().load_plugin_file_with_config(path, config)
+}
+
+impl PluginHost {
+    pub fn load_plugin_file(&self, path: &Path) -> Result<i64, PluginManagerError> {
+        self.load_plugin_file_with_config(path, self.config.runtime)
+    }
+
+    pub fn load_plugin_file_with_config(
+        &self,
+        path: &Path,
+        config: PluginRuntimeConfig
+    ) -> Result<i64, PluginManagerError> {
+        load_plugin_file_inner(self, path, config)
+    }
 }
 
 fn load_plugin_file_inner(
+    host: &PluginHost,
     path: &Path,
     config: PluginRuntimeConfig
 ) -> Result<i64, PluginManagerError> {
@@ -193,10 +223,14 @@ fn load_plugin_file_inner(
     // Reserve the canonical library path before inspecting the registry. This closes the
     // unload/load race where an unload could remove the registry entry between the initial
     // duplicate check and acquisition of the lifecycle operation guard.
-    let _operation_guard = begin_plugin_operation(&canonical_path, PluginOperationKind::Loading)?;
+    let _operation_guard = begin_plugin_operation(
+        host,
+        &canonical_path,
+        PluginOperationKind::Loading
+    )?;
 
     {
-        let singleton = instance();
+        let singleton = host;
         let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
             return Err(PluginManagerError::PluginAlreadyLoaded {
@@ -206,11 +240,22 @@ fn load_plugin_file_inner(
         }
     }
 
-    let loaded = PluginManager::load_plugin(&canonical_path, config)?;
+    let executor_selection = host
+        .executor_selection_for_load()
+        .map_err(|message| PluginManagerError::PluginAbiIncompatible {
+            path: canonical_path.clone(),
+            message,
+        })?;
+    let loaded = PluginManager::load_plugin(
+        &canonical_path,
+        config,
+        executor_selection,
+        host.database_capability()
+    )?;
     let plugin_manifest = loaded.manifest().clone();
 
     let result = {
-        let singleton = instance();
+        let singleton = host;
         let mut manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
@@ -236,25 +281,26 @@ fn load_plugin_file_inner(
                 canonical_path.display()
             )
         );
-        log_plugin_executor_snapshot(&plugin_manifest.name, &canonical_path);
+        log_plugin_executor_snapshot(host, &plugin_manifest.name, &canonical_path);
     }
     result
 }
 
 pub fn load_plugins(plugin_path: &str) -> Result<usize, PluginManagerError> {
-    let report = load_plugins_with_policy_and_config(
-        plugin_path,
-        PluginLoadPolicy::required_all(),
-        PluginRuntimeConfig::from_environment()
-    )?;
-    Ok(report.loaded_count())
+    instance()
+        .load_plugins_with_policy_and_config(
+            plugin_path,
+            PluginLoadPolicy::required_all(),
+            PluginRuntimeConfig::from_environment()
+        )
+        .map(|report| report.loaded_count())
 }
 
 pub fn load_plugins_with_policy(
     plugin_path: &str,
     policy: PluginLoadPolicy
 ) -> Result<PluginLoadReport, PluginManagerError> {
-    load_plugins_with_policy_and_config(
+    instance().load_plugins_with_policy_and_config(
         plugin_path,
         policy,
         PluginRuntimeConfig::from_environment()
@@ -262,6 +308,54 @@ pub fn load_plugins_with_policy(
 }
 
 pub fn load_plugins_with_policy_and_config(
+    plugin_path: &str,
+    policy: PluginLoadPolicy,
+    config: PluginRuntimeConfig
+) -> Result<PluginLoadReport, PluginManagerError> {
+    instance().load_plugins_with_policy_and_config(plugin_path, policy, config)
+}
+
+impl PluginHost {
+    pub fn load_plugins(&self, plugin_path: &str) -> Result<usize, PluginManagerError> {
+        Ok(
+            self
+                .load_plugins_with_policy_and_config(
+                    plugin_path,
+                    PluginLoadPolicy::required_all(),
+                    self.config.runtime
+                )?
+                .loaded_count()
+        )
+    }
+
+    pub fn load_plugins_with_policy(
+        &self,
+        plugin_path: &str,
+        policy: PluginLoadPolicy
+    ) -> Result<PluginLoadReport, PluginManagerError> {
+        self.load_plugins_with_policy_and_config(plugin_path, policy, self.config.runtime)
+    }
+
+    pub fn load_plugins_with_policy_and_config(
+        &self,
+        plugin_path: &str,
+        policy: PluginLoadPolicy,
+        config: PluginRuntimeConfig
+    ) -> Result<PluginLoadReport, PluginManagerError> {
+        load_plugins_with_policy_and_config_for(self, plugin_path, policy, config)
+    }
+}
+
+fn load_plugins_with_policy_for(
+    host: &PluginHost,
+    plugin_path: &str,
+    policy: PluginLoadPolicy
+) -> Result<PluginLoadReport, PluginManagerError> {
+    load_plugins_with_policy_and_config_for(host, plugin_path, policy, host.config.runtime)
+}
+
+fn load_plugins_with_policy_and_config_for(
+    host: &PluginHost,
     plugin_path: &str,
     policy: PluginLoadPolicy,
     config: PluginRuntimeConfig
@@ -291,7 +385,7 @@ pub fn load_plugins_with_policy_and_config(
         // Reserve the path before checking the registry for the same reason as the direct
         // file-load path: a concurrent unload must not be able to create a reload window.
         let _operation_guard = match
-            begin_plugin_operation(&canonical_path, PluginOperationKind::Loading)
+            begin_plugin_operation(host, &canonical_path, PluginOperationKind::Loading)
         {
             Ok(guard) => guard,
             Err(error) => {
@@ -306,7 +400,7 @@ pub fn load_plugins_with_policy_and_config(
         };
 
         {
-            let singleton = instance();
+            let singleton = host;
             let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if manager.paths.contains_key(&canonical_path) {
                 report.skipped_already_loaded.push(canonical_path);
@@ -314,7 +408,26 @@ pub fn load_plugins_with_policy_and_config(
             }
         }
 
-        let loaded = match PluginManager::load_plugin(&canonical_path, config) {
+        let executor_selection = match host.executor_selection_for_load() {
+            Ok(selection) => selection,
+            Err(message) => {
+                report.failures.push(PluginLoadFailure {
+                    path: canonical_path,
+                    plugin_name: None,
+                    requirement: path_requirement,
+                    error: message,
+                });
+                continue;
+            }
+        };
+        let loaded = match
+            PluginManager::load_plugin(
+                &canonical_path,
+                config,
+                executor_selection,
+                host.database_capability()
+            )
+        {
             Ok(loaded) => loaded,
             Err(error) => {
                 let error_text = error.to_string();
@@ -341,7 +454,7 @@ pub fn load_plugins_with_policy_and_config(
         let plugin_name = manifest.name.clone();
 
         let registration = {
-            let singleton = instance();
+            let singleton = host;
             let mut manager = singleton.inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -363,7 +476,7 @@ pub fn load_plugins_with_policy_and_config(
         match registration {
             Ok(_) => {
                 report.loaded.push(plugin_name.clone());
-                log_plugin_executor_snapshot(&plugin_name, &canonical_path);
+                log_plugin_executor_snapshot(host, &plugin_name, &canonical_path);
             }
             Err(error) =>
                 report.failures.push(PluginLoadFailure {
@@ -375,7 +488,7 @@ pub fn load_plugins_with_policy_and_config(
         }
     }
 
-    let loaded_names = loaded_plugin_names();
+    let loaded_names = loaded_plugin_names_for(host);
     for (configured_name, requirement) in &policy.overrides {
         if *requirement != PluginRequirement::Required {
             continue;
@@ -473,5 +586,5 @@ pub fn load_plugin_if_missing(
     plugin_name: &str,
     plugin_path: &str
 ) -> Result<bool, PluginManagerError> {
-    is_plugin_loaded(plugin_name, plugin_path)
+    instance().is_plugin_loaded(plugin_name, plugin_path)
 }

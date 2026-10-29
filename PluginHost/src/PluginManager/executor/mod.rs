@@ -118,35 +118,27 @@ pub(super) trait PluginExecutor: Send + Sync {
 /// is implemented. The IPC capability broker is implemented but does not itself provide isolation.
 pub(super) fn load_plugin(
     path: &std::path::Path,
-    config: PluginRuntimeConfig
+    config: PluginRuntimeConfig,
+    selection: crate::Factory::PluginExecutorSelection,
+    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
 ) -> Result<LoadedPlugin, PluginManagerError> {
-    match std::env::var("EZF_PLUGIN_EXECUTOR") {
-        Ok(mode) if mode == "process" => {
+    match selection {
+        crate::Factory::PluginExecutorSelection::Process => {
             #[cfg(unix)]
             {
-                process::load_plugin(path, config)
+                process::load_plugin(path, config, database)
             }
             #[cfg(not(unix))]
             {
+                let _ = database;
                 Err(PluginManagerError::PluginAbiIncompatible {
                     path: path.to_path_buf(),
                     message: "process execution currently supports Unix-domain sockets only".to_owned(),
                 })
             }
         }
-        Ok(mode) if mode == "in_process" => in_process::load_plugin(path, config),
-        Err(std::env::VarError::NotPresent) => in_process::load_plugin(path, config),
-        Ok(other) =>
-            Err(PluginManagerError::PluginAbiIncompatible {
-                path: path.to_path_buf(),
-                message: format!(
-                    "unknown EZF_PLUGIN_EXECUTOR mode {other:?}; expected 'in_process' or 'process'"
-                ),
-            }),
-        Err(error) =>
-            Err(PluginManagerError::PluginAbiIncompatible {
-                path: path.to_path_buf(),
-                message: format!("could not read EZF_PLUGIN_EXECUTOR: {error}"),
-            }),
+        crate::Factory::PluginExecutorSelection::InProcess => {
+            in_process::load_plugin(path, config, database)
+        }
     }
 }

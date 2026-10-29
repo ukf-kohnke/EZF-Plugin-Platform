@@ -20,9 +20,11 @@ const MAX_PLUGIN_QUEUE_CAPACITY: usize = 4_096;
 /// The current 16-worker default reflects the measured patient-list load profile; it is not a
 /// universal optimum and should be validated against the target database. Admission and queue
 /// limits remain bounded. Production deployments may
-/// override them globally through environment variables:
-/// `EZF_PLUGIN_CALL_TIMEOUT_MS`, `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`, `EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS`,
+/// construct one from `from_environment()` using `EZF_PLUGIN_CALL_TIMEOUT_MS`,
+/// `EZF_PLUGIN_UNLOAD_TIMEOUT_MS`, `EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS`,
 /// `EZF_PLUGIN_WORKER_THREADS`, `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, and `EZF_PLUGIN_QUEUE_CAPACITY`.
+/// Explicitly configured PluginHost instances retain the supplied values rather than re-reading
+/// the process environment during plugin loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginRuntimeConfig {
     pub call_timeout: Duration,

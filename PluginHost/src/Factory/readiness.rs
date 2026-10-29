@@ -1,57 +1,75 @@
 //! Internal Factory readiness operations.
 use super::*;
 
-/// Returns health/telemetry snapshots for all loaded plugins in deterministic plugin-id order.
 pub fn plugin_health() -> Vec<PluginHealthSnapshot> {
-    let singleton = instance();
-    let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    manager
-        .plugin_ids()
-        .into_iter()
-        .filter_map(|id| {
-            let item = manager.plugins.get(&id)?;
-            let mut health = item.health();
-            if plugin_operation_kind(&item.path) == Some(PluginOperationKind::Unloading) {
-                health.state = PluginHealthState::Stopping;
-            }
-            Some(health)
-        })
-        .collect()
+    instance().plugin_health()
 }
-
-/// Returns the health snapshot for a specific plugin using case-insensitive name matching.
 pub fn plugin_health_by_name(plugin_name: &str) -> Option<PluginHealthSnapshot> {
-    let singleton = instance();
-    let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    manager
-        .plugin_ids()
-        .into_iter()
-        .find_map(|id| {
-            let item = manager.plugins.get(&id)?;
-            if !item.manifest().name.eq_ignore_ascii_case(plugin_name) {
-                return None;
-            }
-
-            let mut health = item.health();
-            if plugin_operation_kind(&item.path) == Some(PluginOperationKind::Unloading) {
-                health.state = PluginHealthState::Stopping;
-            }
-            Some(health)
-        })
+    instance().plugin_health_by_name(plugin_name)
+}
+pub fn check_readiness() -> Result<(), String> {
+    instance().check_readiness()
 }
 
-/// Returns an error unless every loaded plugin is currently ready. This can be used as a
-/// startup/readiness gate after plugin discovery and before serving traffic.
-pub fn check_readiness() -> Result<(), String> {
-    let health = plugin_health();
-    let degraded = health
-        .iter()
-        .filter(|snapshot| snapshot.state != PluginHealthState::Ready)
-        .map(|snapshot| format!("{}={:?}", snapshot.name, snapshot.state))
-        .collect::<Vec<_>>();
-    if degraded.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("plugin readiness check failed: {}", degraded.join(", ")))
+pub(crate) fn plugin_health_by_name_for(
+    host: &PluginHost,
+    plugin_name: &str
+) -> Option<PluginHealthSnapshot> {
+    host.plugin_health_by_name(plugin_name)
+}
+
+impl PluginHost {
+    pub fn plugin_health(&self) -> Vec<PluginHealthSnapshot> {
+        let manager = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        manager
+            .plugin_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let item = manager.plugins.get(&id)?;
+                let mut health = item.health();
+                if
+                    super::loading::plugin_operation_kind_for_host(self, &item.path) ==
+                    Some(PluginOperationKind::Unloading)
+                {
+                    health.state = PluginHealthState::Stopping;
+                }
+                Some(health)
+            })
+            .collect()
+    }
+
+    pub fn plugin_health_by_name(&self, plugin_name: &str) -> Option<PluginHealthSnapshot> {
+        let manager = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        manager
+            .plugin_ids()
+            .into_iter()
+            .find_map(|id| {
+                let item = manager.plugins.get(&id)?;
+                if !item.manifest().name.eq_ignore_ascii_case(plugin_name) {
+                    return None;
+                }
+                let mut health = item.health();
+                if
+                    super::loading::plugin_operation_kind_for_host(self, &item.path) ==
+                    Some(PluginOperationKind::Unloading)
+                {
+                    health.state = PluginHealthState::Stopping;
+                }
+                Some(health)
+            })
+    }
+
+    pub fn check_readiness(&self) -> Result<(), String> {
+        let degraded = self
+            .plugin_health()
+            .into_iter()
+            .filter(|h| h.state != PluginHealthState::Ready)
+            .map(|h| format!("{}={:?}", h.name, h.state))
+            .collect::<Vec<_>>();
+        if degraded.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("plugin readiness check failed: {}", degraded.join(", ")))
+        }
     }
 }

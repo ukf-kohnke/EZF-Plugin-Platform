@@ -17,7 +17,12 @@ use super::Factory::PluginManagerError;
 use glob::{ glob, GlobError };
 use std::{ collections::HashMap, path::{ Path, PathBuf }, sync::Arc };
 
-pub use self::runtime::{ PluginExecutorKind, PluginHealthSnapshot, PluginHealthState, PluginRuntimeConfig };
+pub use self::runtime::{
+    PluginExecutorKind,
+    PluginHealthSnapshot,
+    PluginHealthState,
+    PluginRuntimeConfig,
+};
 pub(crate) use self::runtime::{ PluginRuntime, PluginUnloadOutcome };
 
 const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
@@ -361,9 +366,11 @@ impl PluginManager {
 
     pub(crate) fn load_plugin(
         path: &Path,
-        config: PluginRuntimeConfig
+        config: PluginRuntimeConfig,
+        executor_selection: crate::Factory::PluginExecutorSelection,
+        database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
     ) -> Result<LoadedPlugin, PluginManagerError> {
-        executor::load_plugin(path, config)
+        executor::load_plugin(path, config, executor_selection, database)
     }
 
     fn next_plugin_id(&self) -> i64 {

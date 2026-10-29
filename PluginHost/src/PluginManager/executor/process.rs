@@ -411,7 +411,11 @@ struct ProcessExecutor {
 }
 
 impl ProcessExecutor {
-    fn start(plugin_path: &Path, _config: &PluginRuntimeConfig) -> Result<Self, String> {
+    fn start(
+        plugin_path: &Path,
+        _config: &PluginRuntimeConfig,
+        database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
+    ) -> Result<Self, String> {
         let plugin_path = plugin_path
             .canonicalize()
             .map_err(|error| {
@@ -690,7 +694,8 @@ impl ProcessExecutor {
                     broker_plugin_name,
                     plugin_kind,
                     capability_active_request_id,
-                    limits
+                    limits,
+                    database
                 )
             )
             .map_err(|error| format!("could not start capability broker dispatcher: {error}"))?;
@@ -1410,9 +1415,10 @@ impl Drop for ProcessExecutor {
 
 pub(super) fn load_plugin(
     path: &Path,
-    config: PluginRuntimeConfig
+    config: PluginRuntimeConfig,
+    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
 ) -> Result<LoadedPlugin, PluginManagerError> {
-    let executor = ProcessExecutor::start(path, &config).map_err(|message| {
+    let executor = ProcessExecutor::start(path, &config, database).map_err(|message| {
         PluginManagerError::PluginAbiCall { path: path.to_path_buf(), message }
     })?;
     let executor: Arc<dyn PluginExecutor> = Arc::new(executor);
@@ -2032,7 +2038,8 @@ fn capability_broker_loop(
     plugin_name: String,
     plugin_kind: PluginKind,
     active_request_id: Arc<AtomicU64>,
-    limits: FrameLimits
+    limits: FrameLimits,
+    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
 ) {
     while let Ok(job) = receiver.recv() {
         let (control, payload) = match job.capability {
@@ -2043,7 +2050,8 @@ fn capability_broker_loop(
                         &plugin_name,
                         job.invocation_operation,
                         &job.payload,
-                        &job.context
+                        &job.context,
+                        database
                     )
                 {
                     Ok(payload) if payload.len() <= limits.max_payload_bytes =>
@@ -2164,7 +2172,8 @@ fn execute_database_capability(
     plugin_name: &str,
     invocation_operation: InvokeOperation,
     payload: &[u8],
-    context: &PluginCallContext
+    context: &PluginCallContext,
+    capability: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
 ) -> Result<Vec<u8>, (IpcErrorCode, String)> {
     // A DataSource is the terminal database provider. Letting it recurse through the same
     // generic database broker can deadlock the datasource route or create an execution loop.
@@ -2209,12 +2218,10 @@ fn execute_database_capability(
             "database capability was cancelled or expired before execution".to_owned(),
         ));
     }
-    let capability = crate::Factory
-        ::database_capability()
-        .ok_or_else(|| (
-            IpcErrorCode::CapabilityDenied,
-            "host database executor has not been registered".to_owned(),
-        ))?;
+    let capability = capability.ok_or_else(|| (
+        IpcErrorCode::CapabilityDenied,
+        "host database executor has not been registered for this plugin host".to_owned(),
+    ))?;
 
     // Extend the upstream cancellation check with the parent call's deadline. This matters when
     // the DB provider is itself another ProcessExecutor: its ABI cancellation callback must see

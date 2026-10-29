@@ -1,12 +1,12 @@
-//! Factory and singleton access layer for runtime plugin management.
+//! Runtime plugin management with explicit `PluginHostInstance` ownership.
 //!
-//! This module provides a thread-safe, process-wide entry point to load, query,
-//! execute, and unload plugins through an internal `PluginManager` guarded by
-//! `Mutex` + `OnceLock`.
+//! Each explicit instance owns its plugin catalog, runtime configuration, database capability,
+//! and lifecycle-operation reservations. The `Factory` module preserves the historical
+//! process-wide API as a compatibility facade over one lazily created instance.
 //!
 //! # Responsibilities
 //!
-//! - Lazily initialize a single `PluginManager` instance.
+//! - Own a `PluginManager` instance per explicitly constructed plugin host.
 //! - Load one plugin file or scan/load many plugin files from a directory pattern.
 //! - Check whether a plugin is already loaded (by plugin runtime name).
 //! - Resolve plugin IDs by name.
@@ -35,8 +35,8 @@
 //!
 //! # Concurrency notes
 //!
-//! The global mutex protects only plugin-manager state (registration, lookup, catalog and lifecycle
-//! bookkeeping). Each loaded plugin has its own read/write runtime gate: normal ABI calls take a
+//! Each host mutex protects only that host's plugin-manager state (registration, lookup, catalog
+//! and lifecycle bookkeeping). Each loaded plugin has its own read/write runtime gate: normal ABI calls take a
 //! shared read lock and can execute concurrently, while unload marks the runtime as quiescing,
 //! rejects new calls, and takes the exclusive write lock to drain all in-flight calls before
 //! lifecycle callbacks and instance destruction. A per-library lifecycle-operation guard also
@@ -49,10 +49,9 @@
 //!   not by a concrete plugin implementation name.
 //! - `with_plugin_by_name` and `with_all_plugins` are deprecated compatibility APIs; prefer the
 //!   catalog/endpoint APIs. `with_database_plugin` remains the explicit capability boundary.
-//! - Plugin call limits default to 30s call timeout, 10s unload timeout, 8 worker threads,
-//!   32 admitted calls, and 24 queued jobs. The three capacity limits can be overridden with
-//!   `EZF_PLUGIN_WORKER_THREADS`, `EZF_PLUGIN_MAX_CONCURRENT_CALLS`, and
-//!   `EZF_PLUGIN_QUEUE_CAPACITY`, or supplied explicitly to the `*_with_config` load APIs.
+//! - Plugin call limits default to 30s call timeout, 10s unload timeout, 16 worker threads,
+//!   32 admitted calls, and 24 queued jobs. Explicitly constructed hosts take these limits from
+//!   `PluginHostConfig`; the legacy `Factory` façade retains environment-based defaults.
 //! - ABI V2 uses cooperative cancellation for plugin calls. A caller-side timeout sets the
 //!   per-operation cancellation signal; plugin code must observe it at safe interruption points
 //!   and return. The host never terminates a plugin thread or invalidates plugin memory.
@@ -70,6 +69,8 @@
 //! - bulk loading returns a [`Factory::PluginLoadReport`] from the policy-aware API.
 #![allow(non_snake_case)]
 mod PluginManager;
+pub mod PluginHostInstance;
+#[path = "Factory.rs"]
 pub mod Factory;
 
 #[cfg(target_os = "linux")]

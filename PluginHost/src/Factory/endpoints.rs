@@ -1,112 +1,126 @@
-//! Internal Factory endpoints operations.
+//! Internal Factory endpoint and registry operations.
 use super::*;
 
 pub fn loaded_plugin_names() -> Vec<String> {
-    let singleton = instance();
-    let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    manager
-        .plugin_ids()
-        .into_iter()
-        .filter_map(|id| manager.get_manifest(id).map(|manifest| manifest.name.to_string()))
-        .collect()
+    instance().loaded_plugin_names()
 }
-
 pub fn loaded_plugin_ids() -> Vec<i64> {
-    let singleton = instance();
-    let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    manager.plugin_ids()
+    instance().loaded_plugin_ids()
 }
-
 pub fn plugin_count() -> usize {
-    let singleton = instance();
-    let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    manager.plugin_count()
+    instance().plugin_count()
 }
-
 pub fn has_plugins() -> bool {
-    plugin_count() > 0
+    instance().has_plugins()
 }
-
-/// Executes a plugin REST endpoint without requiring the caller to know the concrete plugin name.
-///
-/// Endpoint ownership is resolved from a precomputed runtime index keyed by HTTP method and
-/// normalized path. This prevents application code from coupling itself to implementation-specific plugin
-/// names such as `ProcessTracker` and also avoids fragile name-derivation heuristics from REST
-/// function names.
 pub fn handle_endpoint(
     request: PluginEndpointRequest
 ) -> Result<PluginEndpointResponse, PluginEndpointError> {
-    let endpoint_path = request_endpoint_path(&request.base_path, &request.raw_path);
-    let route = match resolve_endpoint_route(request.method, &endpoint_path, &request.endpoint_id)? {
-        Some(route) => route,
-        None => {
-            // Preserve lazy discovery for callers that reach the dispatcher before plugins
-            // have been explicitly loaded. The second lookup uses the same prebuilt index.
-            load_plugins_with_policy(&plugin_root_dir(), PluginLoadPolicy::optional_all()).map_err(
-                |error|
-                    PluginEndpointError::internal(
-                        "plugin_discovery_failed",
-                        "Plugin discovery failed while resolving the endpoint",
-                        error.to_string()
+    instance().handle_endpoint(request)
+}
+
+pub(crate) fn loaded_plugin_names_for(host: &PluginHost) -> Vec<String> {
+    host.loaded_plugin_names()
+}
+
+impl PluginHost {
+    pub fn loaded_plugin_names(&self) -> Vec<String> {
+        let manager = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        manager
+            .plugin_ids()
+            .into_iter()
+            .filter_map(|id| manager.get_manifest(id).map(|manifest| manifest.name.clone()))
+            .collect()
+    }
+
+    pub fn loaded_plugin_ids(&self) -> Vec<i64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .plugin_ids()
+    }
+
+    pub fn plugin_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .plugin_count()
+    }
+
+    pub fn has_plugins(&self) -> bool {
+        self.plugin_count() > 0
+    }
+
+    /// Dispatches against this host's catalog and runtime registry only.
+    pub fn handle_endpoint(
+        &self,
+        request: PluginEndpointRequest
+    ) -> Result<PluginEndpointResponse, PluginEndpointError> {
+        let endpoint_path = request_endpoint_path(&request.base_path, &request.raw_path);
+        let route = match
+            resolve_endpoint_route_for(self, request.method, &endpoint_path, &request.endpoint_id)?
+        {
+            Some(route) => route,
+            None => {
+                self
+                    .load_plugins_with_policy(
+                        &self.config.plugin_root.to_string_lossy(),
+                        PluginLoadPolicy::optional_all()
                     )
-            )?;
-
-            resolve_endpoint_route(
-                request.method,
-                &endpoint_path,
-                &request.endpoint_id
-            )?.ok_or_else(||
-                PluginEndpointError::not_found(
-                    "plugin_endpoint_not_found",
-                    "No loaded plugin implements the requested endpoint",
-                    &format!("No plugin implements {} {}", request.method, endpoint_path)
-                )
-            )?
-        }
-    };
-
-    // The route lookup clones the runtime Arc while holding the manager mutex. Actual plugin
-    // code always runs after that mutex has been released.
-    route.runtime.handle_endpoint(request)
+                    .map_err(|error|
+                        PluginEndpointError::internal(
+                            "plugin_discovery_failed",
+                            "Plugin discovery failed while resolving the endpoint",
+                            error.to_string()
+                        )
+                    )?;
+                resolve_endpoint_route_for(
+                    self,
+                    request.method,
+                    &endpoint_path,
+                    &request.endpoint_id
+                )?.ok_or_else(||
+                    PluginEndpointError::not_found(
+                        "plugin_endpoint_not_found",
+                        "No loaded plugin implements the requested endpoint",
+                        &format!("No plugin implements {} {}", request.method, endpoint_path)
+                    )
+                )?
+            }
+        };
+        route.runtime.handle_endpoint(request)
+    }
 }
 
 fn request_endpoint_path(base_path: &str, raw_path: &str) -> String {
     let base = base_path.trim();
     let raw = if raw_path.trim().is_empty() { "/" } else { raw_path.trim() };
-
     if base.is_empty() || base == "/" {
         return raw.to_owned();
     }
-
     let base = format!("/{}", base.trim_matches('/'));
     if raw == base {
         return "/".to_owned();
     }
-
     raw.strip_prefix(&format!("{base}/"))
         .map(|path| format!("/{path}"))
         .unwrap_or_else(|| raw.to_owned())
 }
 
-fn resolve_endpoint_route(
+fn resolve_endpoint_route_for(
+    host: &PluginHost,
     method: PluginContracts::ApiContract::PluginHttpMethod,
     path: &str,
     endpoint_id: &str
 ) -> Result<Option<PluginEndpointRoute>, PluginEndpointError> {
-    // Normalize outside the manager lock so even the remaining per-request string work does
-    // not lengthen the critical section shared by concurrent dispatches and lifecycle changes.
     let normalized_path = normalize_plugin_path(path).ok();
     let route = normalized_path.and_then(|normalized_path| {
-        let singleton = instance();
-        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let manager = host.inner.lock().unwrap_or_else(|p| p.into_inner());
         manager.endpoint_route_normalized(method, normalized_path)
     });
-
     let Some(route) = route else {
         return Ok(None);
     };
-
     if !route.endpoint_id.as_ref().eq_ignore_ascii_case(endpoint_id) {
         return Err(
             PluginEndpointError::internal(
@@ -122,6 +136,5 @@ fn resolve_endpoint_route(
             )
         );
     }
-
     Ok(Some(route))
 }

@@ -8,7 +8,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/hoppmann/EZF-Backend.git"
 
 [dependencies]
-ApplicationConfig = { path = "../ApplicationConfig" }
 DatabaseContracts = { path = "../Plugin-SDK/DatabaseContracts" }
 PluginExecutionCore = { path = "../PluginExecutionCore" }
 PluginAbi = { path = "../Plugin-SDK/PluginAbi" }

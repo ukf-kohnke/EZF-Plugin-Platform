@@ -12,6 +12,11 @@ use PluginHost::Factory::{
     PluginRequirement,
     PluginRuntimeConfig,
 };
+use PluginHost::PluginHostInstance::{
+    PluginExecutorSelection,
+    PluginHostConfig,
+    PluginHostInstance,
+};
 use std::{
     collections::BTreeSet,
     fs,
@@ -87,6 +92,60 @@ fn ping_request() -> PluginEndpointRequest {
             session_id: "integration-session".to_owned(),
         },
     }
+}
+
+#[test]
+fn independently_created_host_instances_keep_catalogs_and_lifecycle_separate() {
+    let _test_guard = lock_test();
+    let library = build_fixture();
+    let root = library.parent().expect("fixture library must have a parent").to_path_buf();
+    let make_host = ||
+        PluginHostInstance::new(PluginHostConfig {
+            plugin_root: root.clone(),
+            runtime: PluginRuntimeConfig::default(),
+            executor: PluginExecutorSelection::InProcess,
+        });
+    let first = make_host();
+    let second = make_host();
+
+    let first_id = first
+        .load_plugin_file(&library)
+        .expect("first host must load the plugin by file path");
+    let second_id = second
+        .load_plugin_file(&library)
+        .expect("second host must load the same plugin independently");
+    assert_eq!(first.plugin_count(), 1);
+    assert_eq!(second.plugin_count(), 1);
+    assert_eq!(first.plugin_manifests().len(), 1);
+    assert_eq!(second.plugin_manifests().len(), 1);
+    assert!(
+        first.register_database_executor(test_database_execute, test_database_free).is_err(),
+        "first-time DB capability registration must be rejected after a plugin is loaded"
+    );
+    assert!(
+        second.register_database_executor(test_database_execute, test_database_free).is_err(),
+        "second host must enforce its own capability registration lifecycle"
+    );
+
+    let response = first
+        .handle_endpoint(ping_request())
+        .expect("first host must dispatch the endpoint");
+    assert_eq!(response.status, 200);
+    first.unload_plugin(first_id).expect("first host must unload independently");
+    assert_eq!(first.plugin_count(), 0);
+    assert_eq!(
+        second.plugin_count(),
+        1,
+        "unloading one host must not remove the other host's registry entry"
+    );
+
+    let response = second
+        .handle_endpoint(ping_request())
+        .expect("second host must remain callable");
+    assert_eq!(response.status, 200);
+    second.unload_plugin(second_id).expect("second host must unload independently");
+    assert_eq!(second.plugin_count(), 0);
+    let _ = fs::remove_dir_all(library.parent().unwrap());
 }
 
 fn held_slow_request() -> PluginEndpointRequest {

@@ -184,12 +184,12 @@ impl PluginExecutor for InProcessExecutor {
 
 pub fn load_plugin(
     path: &Path,
-    config: PluginRuntimeConfig
+    config: PluginRuntimeConfig,
+    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
 ) -> Result<LoadedPlugin, PluginManagerError> {
     let plugin_directory = path.parent().unwrap_or_else(|| Path::new("."));
     let plugin_directory_bytes = plugin_directory.to_string_lossy().into_owned().into_bytes();
     let plugin_directory_slice = AbiSlice::from_bytes(&plugin_directory_bytes);
-    let database = crate::Factory::database_capability();
     let host_services = PluginHostServicesV2::new(
         host_log,
         database.map(|capability| capability.execute),

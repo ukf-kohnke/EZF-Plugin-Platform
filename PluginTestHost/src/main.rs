@@ -1,3 +1,5 @@
+mod process_config;
+
 use DatabaseContracts::{
     DatabaseError,
     DatabaseErrorKind,
@@ -524,10 +526,14 @@ fn run_single_plugin<F>(
 {
     configure_database_mock(fixtures);
     let parent = plugin_file.parent().unwrap_or_else(|| Path::new("."));
+    let process_executor = process_config
+        ::from_environment(executor == ExecutorArg::Process)
+        .map_err(cli_error)?;
     let host = PluginHostInstance::new(PluginHostConfig {
         plugin_root: parent.to_path_buf(),
         runtime,
         executor: executor.host_selection(),
+        process_executor,
     });
     host
         .register_database_executor(mock_database_execute, mock_database_free)
@@ -781,6 +787,9 @@ fn run_test_suite(
         configure_database_mock(fixtures);
     }
     let runtime = runtime_config(&suite.timeouts, options);
+    let process_executor = process_config
+        ::from_environment(executor == ExecutorArg::Process)
+        .map_err(cli_error)?;
     let host = PluginHostInstance::new(PluginHostConfig {
         plugin_root: plugin_file
             .parent()
@@ -788,6 +797,7 @@ fn run_test_suite(
             .to_path_buf(),
         runtime,
         executor: executor.host_selection(),
+        process_executor,
     });
     let registration = if live_database {
         host.register_database_executor(live_database_execute, mock_database_free)
@@ -1570,6 +1580,9 @@ fn start_live_database_plugin(
             )
         );
     }
+    let process_executor = process_config
+        ::from_environment(executor == ExecutorArg::Process)
+        .map_err(cli_error)?;
     let host = Arc::new(
         PluginHostInstance::new(PluginHostConfig {
             plugin_root: plugin_file
@@ -1578,6 +1591,7 @@ fn start_live_database_plugin(
                 .to_path_buf(),
             runtime,
             executor: executor.host_selection(),
+            process_executor,
         })
     );
     let plugin_id = host

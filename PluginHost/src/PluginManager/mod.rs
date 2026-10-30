@@ -13,7 +13,7 @@ use PluginContracts::{
     },
     IPlugin::IPlugin,
 };
-use super::Factory::PluginManagerError;
+use super::PluginHostInstance::PluginManagerError;
 use glob::{ glob, GlobError };
 use std::{ collections::HashMap, path::{ Path, PathBuf }, sync::Arc };
 
@@ -367,10 +367,19 @@ impl PluginManager {
     pub(crate) fn load_plugin(
         path: &Path,
         config: PluginRuntimeConfig,
-        executor_selection: crate::Factory::PluginExecutorSelection,
-        database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
+        executor_selection: crate::PluginHostInstance::PluginExecutorSelection,
+        process_executor: crate::PluginHostInstance::ProcessExecutorConfig,
+        database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>,
+        database_dispatcher: crate::PluginHostInstance::DatabaseDispatcher
     ) -> Result<LoadedPlugin, PluginManagerError> {
-        executor::load_plugin(path, config, executor_selection, database)
+        executor::load_plugin(
+            path,
+            config,
+            executor_selection,
+            process_executor,
+            database,
+            database_dispatcher
+        )
     }
 
     fn next_plugin_id(&self) -> i64 {

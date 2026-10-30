@@ -6,7 +6,7 @@
 use super::{ PluginCallContext, PluginCancellationToken, PluginExecutor, PluginLifecycleStatus };
 use super::super::runtime::PluginExecutorKind;
 use super::super::{ LoadedPlugin, PluginRuntime, PluginRuntimeConfig };
-use crate::Factory::PluginManagerError;
+use crate::PluginHostInstance::{ with_database_dispatcher, DatabaseDispatcher, PluginManagerError };
 use log::LevelFilter;
 use PluginAbi::{ AbiSlice, PluginCancellationV2, PluginHostServicesV2, PLUGIN_STATUS_OK };
 use PluginContracts::ApiContract::{
@@ -19,11 +19,15 @@ use std::{ ffi::c_void, path::Path, sync::Arc };
 
 struct InProcessExecutor {
     core: PluginExecutionCore::PluginExecutionCore,
+    database_dispatcher: DatabaseDispatcher,
 }
 
 impl InProcessExecutor {
-    fn new(core: PluginExecutionCore::PluginExecutionCore) -> Self {
-        Self { core }
+    fn new(
+        core: PluginExecutionCore::PluginExecutionCore,
+        database_dispatcher: DatabaseDispatcher
+    ) -> Self {
+        Self { core, database_dispatcher }
     }
 
     /// Maps the host-neutral cancellation token to the ABI descriptor only for the synchronous
@@ -110,8 +114,10 @@ impl PluginExecutor for InProcessExecutor {
         request_bytes: &[u8],
         context: &PluginCallContext
     ) -> Result<Result<PluginEndpointResponse, PluginEndpointError>, String> {
-        let output = self.with_abi_cancellation(context, |cancellation| {
-            self.core.handle_endpoint(request_bytes, cancellation)
+        let output = with_database_dispatcher(self.database_dispatcher.clone(), || {
+            self.with_abi_cancellation(context, |cancellation| {
+                self.core.handle_endpoint(request_bytes, cancellation)
+            })
         })?;
         Self::decode_endpoint_output(output)
     }
@@ -121,8 +127,10 @@ impl PluginExecutor for InProcessExecutor {
         request_bytes: &[u8],
         context: &PluginCallContext
     ) -> Result<Result<(), PluginLifecycleError>, String> {
-        let bytes = self.with_abi_cancellation(context, |cancellation| {
-            self.core.on_session_closed_bytes(request_bytes, cancellation)
+        let bytes = with_database_dispatcher(self.database_dispatcher.clone(), || {
+            self.with_abi_cancellation(context, |cancellation| {
+                self.core.on_session_closed_bytes(request_bytes, cancellation)
+            })
         })?;
         Self::decode_response(&bytes)
     }
@@ -185,7 +193,8 @@ impl PluginExecutor for InProcessExecutor {
 pub fn load_plugin(
     path: &Path,
     config: PluginRuntimeConfig,
-    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
+    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>,
+    database_dispatcher: DatabaseDispatcher
 ) -> Result<LoadedPlugin, PluginManagerError> {
     let plugin_directory = path.parent().unwrap_or_else(|| Path::new("."));
     let plugin_directory_bytes = plugin_directory.to_string_lossy().into_owned().into_bytes();
@@ -215,7 +224,9 @@ pub fn load_plugin(
         }
     )?;
 
-    let executor: Arc<dyn PluginExecutor> = Arc::new(InProcessExecutor::new(core));
+    let executor: Arc<dyn PluginExecutor> = Arc::new(
+        InProcessExecutor::new(core, database_dispatcher)
+    );
     let runtime = PluginRuntime::new(executor, config).map_err(|message| {
         PluginManagerError::PluginAbiIncompatible { path: path.to_path_buf(), message }
     })?;

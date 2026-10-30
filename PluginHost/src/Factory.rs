@@ -6,8 +6,12 @@
 //! database capability.
 #![allow(non_snake_case)]
 
-use std::sync::OnceLock;
-use std::path::Path;
+use std::{
+    collections::BTreeMap,
+    path::{ Path, PathBuf },
+    sync::{ Arc, OnceLock },
+    time::Duration,
+};
 use PluginContracts::ApiContract::{
     PluginDatabaseExecuteFn,
     PluginEndpointRequest,
@@ -28,6 +32,10 @@ pub use crate::PluginHostInstance::{
     PluginManagerError,
     PluginRequirement,
     PluginRuntimeConfig,
+    ProcessExecutorConfig,
+    SandboxConfig,
+    SandboxProfile,
+    WorkerEnvironment,
     PluginSessionNotificationFailure,
     PluginSessionNotificationReport,
     PluginExecutorKind,
@@ -38,14 +46,241 @@ pub use crate::PluginHostInstance::{
 /// Compatibility alias for applications that named the former instance type `Factory::PluginHost`.
 pub type PluginHost = PluginHostInstance;
 
+fn shared_instance_cell() -> &'static Arc<PluginHostInstance> {
+    static INSTANCE: OnceLock<Arc<PluginHostInstance>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Arc::new(PluginHostInstance::new(legacy_host_config())))
+}
+
 pub(crate) fn instance() -> &'static PluginHostInstance {
-    static INSTANCE: OnceLock<PluginHostInstance> = OnceLock::new();
-    INSTANCE.get_or_init(|| PluginHostInstance::_new_legacy(PluginHostConfig::from_environment()))
+    shared_instance_cell().as_ref()
+}
+
+/// Returns the process-wide compatibility host as a shared handle.
+/// New application integrations should create and own an explicit PluginHostInstance instead.
+#[deprecated(
+    note = "construct and inject Arc<PluginHostInstance> at the application composition root"
+)]
+pub fn shared_instance() -> Arc<PluginHostInstance> {
+    Arc::clone(shared_instance_cell())
+}
+
+/// Backward-compatible backend/deployment adapter. New integrations should construct
+/// PluginHostConfig explicitly and translate environment values at their own composition root.
+pub(crate) fn legacy_host_config() -> PluginHostConfig {
+    let executor = match std::env::var("EZF_PLUGIN_EXECUTOR") {
+        Ok(value) if value.eq_ignore_ascii_case("process") => PluginExecutorSelection::Process,
+        _ => PluginExecutorSelection::InProcess,
+    };
+    let plugin_root = std::env
+        ::var_os("EZF_PLUGIN_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut root = PathBuf::from(std::env::var_os("EZFBACKEND_HOME").unwrap_or_default());
+            root.push("deployment");
+            #[cfg(debug_assertions)]
+            root.push("debug");
+            #[cfg(not(debug_assertions))]
+            root.push("release");
+            root.push("plugins");
+            root
+        });
+    PluginHostConfig {
+        plugin_root,
+        runtime: legacy_runtime_config(),
+        executor,
+        process_executor: legacy_process_executor_config(),
+    }
+}
+
+fn legacy_runtime_config() -> PluginRuntimeConfig {
+    const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
+    const MAX_WORKER_THREADS: usize = 128;
+    const MAX_CONCURRENT_CALLS: usize = 4_096;
+    const MAX_QUEUE_CAPACITY: usize = 4_096;
+
+    let defaults = PluginRuntimeConfig::default();
+    PluginRuntimeConfig {
+        call_timeout: env_runtime_duration(
+            "EZF_PLUGIN_CALL_TIMEOUT_MS",
+            defaults.call_timeout,
+            MAX_TIMEOUT_MS
+        ),
+        unload_timeout: env_runtime_duration(
+            "EZF_PLUGIN_UNLOAD_TIMEOUT_MS",
+            defaults.unload_timeout,
+            MAX_TIMEOUT_MS
+        ),
+        lifecycle_timeout: env_runtime_duration(
+            "EZF_PLUGIN_LIFECYCLE_TIMEOUT_MS",
+            defaults.lifecycle_timeout,
+            MAX_TIMEOUT_MS
+        ),
+        worker_threads: env_bounded_usize(
+            "EZF_PLUGIN_WORKER_THREADS",
+            defaults.worker_threads,
+            MAX_WORKER_THREADS
+        ),
+        max_concurrent_calls: env_bounded_usize(
+            "EZF_PLUGIN_MAX_CONCURRENT_CALLS",
+            defaults.max_concurrent_calls,
+            MAX_CONCURRENT_CALLS
+        ),
+        queue_capacity: env_bounded_usize(
+            "EZF_PLUGIN_QUEUE_CAPACITY",
+            defaults.queue_capacity,
+            MAX_QUEUE_CAPACITY
+        ),
+    }
+}
+
+fn env_runtime_duration(name: &str, default: Duration, maximum_ms: u64) -> Duration {
+    std::env
+        ::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|millis| Duration::from_millis(millis.clamp(1, maximum_ms)))
+        .unwrap_or(default)
+}
+
+fn env_bounded_usize(name: &str, default: usize, maximum: usize) -> usize {
+    std::env
+        ::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, maximum))
+        .unwrap_or(default)
+}
+
+fn legacy_process_executor_config() -> ProcessExecutorConfig {
+    let mut config = ProcessExecutorConfig::default();
+    config.worker_binary = std::env::var_os("EZF_PLUGIN_WORKER_PATH").map(PathBuf::from);
+    config.cancellation_grace = env_duration(
+        "EZF_PLUGIN_PROCESS_CANCEL_GRACE_MS",
+        Duration::from_millis(500),
+        Duration::from_millis(10),
+        Duration::from_secs(30)
+    );
+    config.shutdown_timeout = env_duration(
+        "EZF_PLUGIN_PROCESS_SHUTDOWN_TIMEOUT_MS",
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+        Duration::from_secs(15)
+    );
+
+    let mut invalid_default_profile = false;
+
+    // The per-plugin mapping takes precedence over the default profile, matching the previous
+    // ProcessExecutor behavior. Malformed mappings are encoded as an invalid absolute-path key;
+    // ProcessExecutorConfig::validate() rejects that configuration before a worker can start.
+    if let Ok(raw) = std::env::var("EZF_PLUGIN_SANDBOX_PROFILES") {
+        config.sandbox.require_per_plugin_profile = true;
+        match serde_json::from_str::<BTreeMap<String, String>>(&raw) {
+            Ok(profiles) => {
+                for (path, value) in profiles {
+                    match parse_sandbox_profile(&value) {
+                        Some(profile) => {
+                            config.sandbox.profiles_by_plugin.insert(PathBuf::from(path), profile);
+                        }
+                        None => {
+                            config.sandbox.profiles_by_plugin.insert(
+                                PathBuf::new(),
+                                SandboxProfile::DevelopmentUnconfined
+                            );
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                config.sandbox.profiles_by_plugin.insert(
+                    PathBuf::new(),
+                    SandboxProfile::DevelopmentUnconfined
+                );
+            }
+        }
+    } else if let Ok(value) = std::env::var("EZF_PLUGIN_SANDBOX_PROFILE") {
+        match parse_sandbox_profile(&value) {
+            Some(profile) => {
+                config.sandbox.default_profile = Some(profile);
+            }
+            None => {
+                // Do not let an invalid profile silently fall back to DevelopmentUnconfined.
+                config.sandbox.default_profile = Some(SandboxProfile::DevelopmentUnconfined);
+                invalid_default_profile = true;
+            }
+        }
+    }
+
+    config.sandbox.extra_read_paths = env_paths("EZF_PLUGIN_SANDBOX_READ_PATHS");
+    config.sandbox.library_paths = env_paths("EZF_PLUGIN_SANDBOX_LIBRARY_PATHS");
+    config.sandbox.datasource_egress_policy_acknowledged = std::env
+        ::var("EZF_PLUGIN_DATASOURCE_EGRESS_POLICY")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("externally-enforced"));
+    config.sandbox.datasource_tcp_ports = std::env
+        ::var("EZF_PLUGIN_DATASOURCE_ALLOWED_TCP_PORTS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|item| item.trim().parse::<u16>().unwrap_or(0))
+                .collect()
+        })
+        .unwrap_or_default();
+    let explicitly_allow_unconfined = std::env
+        ::var("EZF_PLUGIN_ALLOW_UNCONFINED")
+        .ok()
+        .is_some_and(|value|
+            matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+        );
+    config.sandbox.allow_unconfined = explicitly_allow_unconfined && !invalid_default_profile;
+
+    if let Ok(names) = std::env::var("EZF_PLUGIN_WORKER_ENV_ALLOWLIST") {
+        for name in names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty()) {
+            if let Some(value) = std::env::var_os(name) {
+                config.worker_environment.variables.insert(name.to_owned(), value);
+            }
+        }
+    }
+    config
+}
+
+fn env_duration(name: &str, default: Duration, minimum: Duration, maximum: Duration) -> Duration {
+    std::env
+        ::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+        .clamp(minimum, maximum)
+}
+
+fn env_paths(name: &str) -> Vec<PathBuf> {
+    std::env
+        ::var_os(name)
+        .map(|value|
+            std::env
+                ::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+        )
+        .unwrap_or_default()
+}
+
+fn parse_sandbox_profile(value: &str) -> Option<SandboxProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "domain_plugin" | "domain" => Some(SandboxProfile::DomainPlugin),
+        "data_source_plugin" | "datasource" | "data_source" =>
+            Some(SandboxProfile::DataSourcePlugin),
+        "development_unconfined" | "unconfined" => Some(SandboxProfile::DevelopmentUnconfined),
+        _ => None,
+    }
 }
 
 // Loading and lifecycle
 pub fn load_plugin_file(path: &Path) -> Result<i64, PluginManagerError> {
-    instance().load_plugin_file_with_config(path, PluginRuntimeConfig::from_environment())
+    instance().load_plugin_file_with_config(path, legacy_runtime_config())
 }
 pub fn load_plugin_file_with_config(
     path: &Path,
@@ -64,7 +299,7 @@ pub fn load_plugins(plugin_path: &str) -> Result<usize, PluginManagerError> {
         .load_plugins_with_policy_and_config(
             plugin_path,
             PluginLoadPolicy::required_all(),
-            PluginRuntimeConfig::from_environment()
+            legacy_runtime_config()
         )
         .map(|report| report.loaded_count())
 }
@@ -72,11 +307,7 @@ pub fn load_plugins_with_policy(
     plugin_path: &str,
     policy: PluginLoadPolicy
 ) -> Result<PluginLoadReport, PluginManagerError> {
-    instance().load_plugins_with_policy_and_config(
-        plugin_path,
-        policy,
-        PluginRuntimeConfig::from_environment()
-    )
+    instance().load_plugins_with_policy_and_config(plugin_path, policy, legacy_runtime_config())
 }
 pub fn load_plugins_with_policy_and_config(
     plugin_path: &str,
@@ -128,7 +359,7 @@ pub fn execute_database_raw(
     instance().execute_database_raw(request_bytes, cancellation)
 }
 pub fn load_database_plugins() -> Result<usize, String> {
-    instance().load_database_plugins_with_config(PluginRuntimeConfig::from_environment())
+    instance().load_database_plugins_with_config(legacy_runtime_config())
 }
 pub fn load_database_plugins_with_config(config: PluginRuntimeConfig) -> Result<usize, String> {
     instance().load_database_plugins_with_config(config)

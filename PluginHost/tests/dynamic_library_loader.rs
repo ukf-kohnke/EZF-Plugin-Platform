@@ -16,6 +16,7 @@ use PluginHost::PluginHostInstance::{
     PluginExecutorSelection,
     PluginHostConfig,
     PluginHostInstance,
+    ProcessExecutorConfig,
 };
 use std::{
     collections::BTreeSet,
@@ -104,6 +105,7 @@ fn independently_created_host_instances_keep_catalogs_and_lifecycle_separate() {
             plugin_root: root.clone(),
             runtime: PluginRuntimeConfig::default(),
             executor: PluginExecutorSelection::InProcess,
+            process_executor: ProcessExecutorConfig::default(),
         });
     let first = make_host();
     let second = make_host();

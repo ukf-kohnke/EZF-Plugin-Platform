@@ -1,5 +1,6 @@
 //! Explicitly configured, independently owned plugin-host runtime instance.
 mod types;
+mod process_config;
 mod loading;
 mod readiness;
 mod database;
@@ -16,6 +17,8 @@ use super::PluginManager::{
     PluginProxy,
     PluginUnloadOutcome,
 };
+pub use self::process_config::{ ProcessExecutorConfig, SandboxConfig, WorkerEnvironment };
+pub use PluginIpc::SandboxProfile;
 pub use super::PluginManager::{
     PluginExecutorKind,
     PluginHealthSnapshot,
@@ -41,11 +44,12 @@ use PluginContracts::{
 };
 use glob::PatternError;
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fs,
     panic::{ AssertUnwindSafe, catch_unwind },
     path::{ Path, PathBuf },
-    sync::Mutex,
+    sync::{ Arc, Mutex, Weak },
 };
 pub use self::types::{
     PluginLoadFailure,
@@ -69,33 +73,24 @@ pub enum PluginExecutorSelection {
 /// Explicit configuration for one plugin-host instance.
 ///
 /// A host created with this configuration does not consult `ApplicationConfig`, the process-wide
-/// plugin registry, or a process-global database callback. Plugin root, runtime limits, and
-/// executor selection are captured here. The process executor's OS-sandbox launch policy remains
-/// deployment configuration read from its documented `EZF_PLUGIN_SANDBOX_*` environment values.
+/// plugin registry, or a process-global database callback. Plugin root, runtime limits, executor
+/// selection, and all worker/sandbox launch settings are captured here.
 #[derive(Debug, Clone)]
 pub struct PluginHostConfig {
     pub plugin_root: PathBuf,
     pub runtime: PluginRuntimeConfig,
     pub executor: PluginExecutorSelection,
-}
-
-impl PluginHostConfig {
-    pub fn from_environment() -> Self {
-        let executor = match std::env::var("EZF_PLUGIN_EXECUTOR").as_deref() {
-            Ok("process") => PluginExecutorSelection::Process,
-            _ => PluginExecutorSelection::InProcess,
-        };
-        Self {
-            plugin_root: default_plugin_root(),
-            runtime: PluginRuntimeConfig::from_environment(),
-            executor,
-        }
-    }
+    pub process_executor: ProcessExecutorConfig,
 }
 
 impl Default for PluginHostConfig {
     fn default() -> Self {
-        Self::from_environment()
+        Self {
+            plugin_root: PathBuf::new(),
+            runtime: PluginRuntimeConfig::default(),
+            executor: PluginExecutorSelection::InProcess,
+            process_executor: ProcessExecutorConfig::default(),
+        }
     }
 }
 
@@ -112,48 +107,128 @@ pub(super) enum PluginOperationKind {
 }
 
 pub struct PluginHostInstance {
-    pub(super) inner: Mutex<PluginManager>,
+    pub(super) inner: Arc<Mutex<PluginManager>>,
     pub(super) config: PluginHostConfig,
     database_executor: Mutex<Option<PluginDatabaseCapability>>,
     operations: Mutex<BTreeMap<PathBuf, PluginOperationKind>>,
-    /// Only the deprecated module-level facade retains legacy environment-per-load semantics.
-    /// Explicitly constructed hosts never re-read process environment at execution time.
-    legacy_environment: bool,
+}
+
+/// Per-host database dispatch handle used by ABI callback trampolines.
+///
+/// The ABI V2 database callback has no user-data pointer. A thread-local scope therefore carries
+/// this weak manager handle while plugin code is running (or while the process-mode capability
+/// broker is serving a request). It avoids routing callbacks through the compatibility Factory
+/// singleton while preserving the existing ABI V2 function-pointer contract.
+#[derive(Clone)]
+pub(crate) struct DatabaseDispatcher {
+    manager: Weak<Mutex<PluginManager>>,
+}
+
+impl DatabaseDispatcher {
+    fn new(manager: &Arc<Mutex<PluginManager>>) -> Self {
+        Self { manager: Arc::downgrade(manager) }
+    }
+
+    fn execute_database_raw(
+        &self,
+        request_bytes: Vec<u8>,
+        cancellation: PluginAbi::PluginCancellationV2
+    ) -> Result<Vec<u8>, DatabaseContracts::DatabaseError> {
+        let manager = self.manager
+            .upgrade()
+            .ok_or_else(||
+                DatabaseContracts::DatabaseError::new(
+                    DatabaseContracts::DatabaseErrorKind::Query,
+                    "plugin host is no longer available for database dispatch"
+                )
+            )?;
+        let selection = manager
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .database_plugin_selection();
+        match selection {
+            DatabasePluginSelection::None =>
+                Err(
+                    DatabaseContracts::DatabaseError::new(
+                        DatabaseContracts::DatabaseErrorKind::Query,
+                        "no database data-source plugin is loaded"
+                    )
+                ),
+            DatabasePluginSelection::Unique { runtime } =>
+                runtime.execute_database_bytes_with_parent(request_bytes, cancellation),
+            DatabasePluginSelection::Multiple { names } =>
+                Err(
+                    DatabaseContracts::DatabaseError::new(
+                        DatabaseContracts::DatabaseErrorKind::Query,
+                        format!(
+                            "multiple database data-source plugins are loaded: {}",
+                            names.join(", ")
+                        )
+                    )
+                ),
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_DATABASE_DISPATCHER: RefCell<Option<DatabaseDispatcher>> = const {
+        RefCell::new(None)
+    };
+}
+
+/// Install the host-specific database dispatcher for the synchronous duration of a plugin call.
+pub(crate) fn with_database_dispatcher<T>(
+    dispatcher: DatabaseDispatcher,
+    operation: impl FnOnce() -> T
+) -> T {
+    let previous = ACTIVE_DATABASE_DISPATCHER.with(|slot| slot.replace(Some(dispatcher)));
+    struct Scope(Option<DatabaseDispatcher>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE_DATABASE_DISPATCHER.with(|slot| {
+                let _ = slot.replace(self.0.take());
+            });
+        }
+    }
+    let _scope = Scope(previous);
+    operation()
+}
+
+/// Database callback entry point for ABI V2 host-service trampolines.
+/// It must be called only from inside an active host plugin invocation/capability broker scope.
+pub fn execute_database_raw_current(
+    request_bytes: Vec<u8>,
+    cancellation: PluginAbi::PluginCancellationV2
+) -> Result<Vec<u8>, DatabaseContracts::DatabaseError> {
+    ACTIVE_DATABASE_DISPATCHER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .ok_or_else(||
+                DatabaseContracts::DatabaseError::new(
+                    DatabaseContracts::DatabaseErrorKind::Query,
+                    "no active plugin-host database dispatch context"
+                )
+            )?
+            .execute_database_raw(request_bytes, cancellation)
+    })
 }
 
 impl PluginHostInstance {
+    pub(crate) fn database_dispatcher(&self) -> DatabaseDispatcher {
+        DatabaseDispatcher::new(&self.inner)
+    }
+
     pub fn new(config: PluginHostConfig) -> Self {
         Self {
-            inner: Mutex::new(PluginManager::new()),
+            inner: Arc::new(Mutex::new(PluginManager::new())),
             config,
             database_executor: Mutex::new(None),
             operations: Mutex::new(BTreeMap::new()),
-            legacy_environment: false,
         }
-    }
-
-    pub(crate) fn _new_legacy(config: PluginHostConfig) -> Self {
-        let mut host = Self::new(config);
-        host.legacy_environment = true;
-        host
     }
 
     pub(super) fn executor_selection_for_load(&self) -> Result<PluginExecutorSelection, String> {
-        if !self.legacy_environment {
-            return Ok(self.config.executor);
-        }
-        match std::env::var("EZF_PLUGIN_EXECUTOR") {
-            Ok(mode) if mode == "process" => Ok(PluginExecutorSelection::Process),
-            Ok(mode) if mode == "in_process" => Ok(PluginExecutorSelection::InProcess),
-            Err(std::env::VarError::NotPresent) => Ok(PluginExecutorSelection::InProcess),
-            Ok(other) =>
-                Err(
-                    format!(
-                        "unknown EZF_PLUGIN_EXECUTOR mode {other:?}; expected 'in_process' or 'process'"
-                    )
-                ),
-            Err(error) => Err(format!("could not read EZF_PLUGIN_EXECUTOR: {error}")),
-        }
+        Ok(self.config.executor)
     }
 
     pub fn config(&self) -> &PluginHostConfig {
@@ -200,20 +275,6 @@ impl PluginHostInstance {
     }
 }
 
-fn default_plugin_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("EZF_PLUGIN_ROOT") {
-        return PathBuf::from(root);
-    }
-    let mut path = PathBuf::from(std::env::var_os("EZFBACKEND_HOME").unwrap_or_default());
-    path.push("deployment");
-    #[cfg(debug_assertions)]
-    path.push("debug");
-    #[cfg(not(debug_assertions))]
-    path.push("release");
-    path.push("plugins");
-    path
-}
-
 #[cfg(test)]
 mod host_isolation_tests {
     use super::{
@@ -221,6 +282,7 @@ mod host_isolation_tests {
         PluginHostInstance,
         PluginHostConfig,
         PluginRuntimeConfig,
+        ProcessExecutorConfig,
     };
     use std::path::PathBuf;
 
@@ -229,6 +291,7 @@ mod host_isolation_tests {
             plugin_root: PathBuf::from(root),
             runtime: PluginRuntimeConfig::default(),
             executor,
+            process_executor: ProcessExecutorConfig::default(),
         }
     }
 

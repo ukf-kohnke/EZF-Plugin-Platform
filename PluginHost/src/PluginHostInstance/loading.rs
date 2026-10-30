@@ -233,7 +233,9 @@ fn load_plugin_file_inner(
         &canonical_path,
         config,
         executor_selection,
-        host.database_capability()
+        host.config.process_executor.clone(),
+        host.database_capability(),
+        host.database_dispatcher()
     )?;
     let plugin_manifest = loaded.manifest().clone();
 
@@ -379,7 +381,9 @@ fn load_plugins_with_policy_and_config_for(
                 &canonical_path,
                 config,
                 executor_selection,
-                host.database_capability()
+                host.config.process_executor.clone(),
+                host.database_capability(),
+                host.database_dispatcher()
             )
         {
             Ok(loaded) => loaded,

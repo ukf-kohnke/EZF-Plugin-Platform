@@ -66,7 +66,7 @@
 //!
 //! - `is_plugin_loaded`: `Ok(true)` when a plugin is available.
 //! - `with_*` helpers: `None` when no matching plugin (or no plugins) is present.
-//! - bulk loading returns a [`Factory::PluginLoadReport`] from the policy-aware API.
+//! - bulk loading returns a [`PluginHostInstance::PluginLoadReport`] from the policy-aware API.
 #![allow(non_snake_case)]
 mod PluginManager;
 pub mod PluginHostInstance;
@@ -93,7 +93,7 @@ fn emit_log(level: log::LevelFilter, message: &str) {
 
 #[cfg(test)]
 mod load_policy_tests {
-    use super::Factory::{ PluginLoadPolicy, PluginRequirement };
+    use super::PluginHostInstance::{ PluginLoadPolicy, PluginRequirement };
     use std::path::Path;
 
     #[test]
@@ -113,7 +113,7 @@ mod load_policy_tests {
 
 #[cfg(test)]
 mod load_report_tests {
-    use super::Factory::{ PluginLoadFailure, PluginLoadReport, PluginRequirement };
+    use super::PluginHostInstance::{ PluginLoadFailure, PluginLoadReport, PluginRequirement };
     use std::path::PathBuf;
 
     #[test]

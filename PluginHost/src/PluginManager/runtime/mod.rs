@@ -350,7 +350,7 @@ impl Drop for PluginRuntime {
 
 #[cfg(test)]
 mod tests {
-    use crate::Factory::PluginExecutorKind;
+    use crate::PluginHostInstance::PluginExecutorKind;
     use crate::PluginManager::runtime::config::{
         DEFAULT_PLUGIN_MAX_CONCURRENT_CALLS,
         DEFAULT_PLUGIN_QUEUE_CAPACITY,

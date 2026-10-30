@@ -23,16 +23,12 @@ impl PluginExecutorKind {
     pub const fn max_parallel_plugin_calls(
         self,
         worker_threads: usize,
-        max_concurrent_calls: usize,
+        max_concurrent_calls: usize
     ) -> usize {
         match self {
             Self::InProcess => {
                 let workers = if worker_threads == 0 { 1 } else { worker_threads };
-                let admitted = if max_concurrent_calls == 0 {
-                    1
-                } else {
-                    max_concurrent_calls
-                };
+                let admitted = if max_concurrent_calls == 0 { 1 } else { max_concurrent_calls };
                 if workers < admitted {
                     workers
                 } else {

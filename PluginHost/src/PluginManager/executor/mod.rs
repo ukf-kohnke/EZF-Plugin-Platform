@@ -17,7 +17,7 @@ pub(super) use self::call_context::{
 pub(crate) use self::call_context::PluginCancellationLocalState;
 use super::{ LoadedPlugin, PluginRuntimeConfig };
 use super::runtime::PluginExecutorKind;
-use crate::Factory::PluginManagerError;
+use crate::PluginHostInstance::{ DatabaseDispatcher, PluginManagerError };
 use PluginContracts::ApiContract::{
     PluginEndpointError,
     PluginEndpointResponse,
@@ -35,12 +35,6 @@ pub(super) enum PluginLifecycleStatus {
     ForcedTermination,
 }
 
-/// Operations understood by the runtime, independent of how plugin code is executed.
-///
-/// Plugin instance/function pointers, library handles, ABI cancellation pointers, ABI buffer
-/// ownership, and ABI status constants deliberately do not appear in this interface. The context
-/// is safe to inspect locally; process-backed executors must send only the operation id, remaining
-/// budget, and cancellation messages across IPC.
 pub(super) trait PluginExecutor: Send + Sync {
     /// Identifies the concrete executor without leaking executor internals into the runtime.
     fn kind(&self) -> PluginExecutorKind;
@@ -119,26 +113,29 @@ pub(super) trait PluginExecutor: Send + Sync {
 pub(super) fn load_plugin(
     path: &std::path::Path,
     config: PluginRuntimeConfig,
-    selection: crate::Factory::PluginExecutorSelection,
-    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>
+    selection: crate::PluginHostInstance::PluginExecutorSelection,
+    process_config: crate::PluginHostInstance::ProcessExecutorConfig,
+    database: Option<PluginContracts::ApiContract::PluginDatabaseCapability>,
+    database_dispatcher: DatabaseDispatcher
 ) -> Result<LoadedPlugin, PluginManagerError> {
     match selection {
-        crate::Factory::PluginExecutorSelection::Process => {
+        crate::PluginHostInstance::PluginExecutorSelection::Process => {
             #[cfg(unix)]
             {
-                process::load_plugin(path, config, database)
+                process::load_plugin(path, config, process_config, database, database_dispatcher)
             }
             #[cfg(not(unix))]
             {
-                let _ = database;
+                let _ = (database, process_config, database_dispatcher);
                 Err(PluginManagerError::PluginAbiIncompatible {
                     path: path.to_path_buf(),
                     message: "process execution currently supports Unix-domain sockets only".to_owned(),
                 })
             }
         }
-        crate::Factory::PluginExecutorSelection::InProcess => {
-            in_process::load_plugin(path, config, database)
+        crate::PluginHostInstance::PluginExecutorSelection::InProcess => {
+            let _ = process_config;
+            in_process::load_plugin(path, config, database, database_dispatcher)
         }
     }
 }

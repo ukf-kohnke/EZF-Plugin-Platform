@@ -1,0 +1,3 @@
+[submodule "Plugin-SDK"]
+	path = Plugin-SDK
+	url = https://github.com/ukf-kohnke/EZF-Plugin-SDK.git

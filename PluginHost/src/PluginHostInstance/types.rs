@@ -1,4 +1,4 @@
-//! Public load, health-report, and error types for the PluginHostInstance factory.
+//! Public load, health-report, and error types for the PluginHostInstance runtime.
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

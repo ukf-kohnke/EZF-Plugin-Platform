@@ -107,7 +107,7 @@ pub(super) trait PluginExecutor: Send + Sync {
     fn emergency_shutdown(&self);
 }
 
-/// Selects the implementation behind the unchanged factory API. In-process execution remains the
+/// Selects the implementation behind the PluginHostInstance runtime API. In-process execution remains the
 /// default; process execution is an explicit local/integration opt-in until an enforced OS sandbox
 /// is implemented. The IPC capability broker is implemented but does not itself provide isolation.
 pub(super) fn load_plugin(

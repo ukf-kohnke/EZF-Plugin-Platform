@@ -1,4 +1,4 @@
-//! Plugin registry, endpoint catalog, routing index, and compatibility proxy.
+//! Plugin registry, endpoint catalog, routing index, and internal capability proxy.
 //! Runtime mechanics and concrete DLL loading are isolated in child modules.
 mod runtime;
 mod executor;
@@ -27,7 +27,7 @@ pub(crate) use self::runtime::{ PluginRuntime, PluginUnloadOutcome };
 
 const PLUGIN_AREA_ID: i64 = 0x00ff_ffff;
 
-/// Public trait adapter preserving the existing `IPlugin`-based Factory API while the actual
+/// Internal trait adapter presenting the ABI-backed runtime through the host capability contract while the actual
 /// dynamic-library boundary is represented only by `PluginRuntime` and the stable ABI.
 #[derive(Clone)]
 pub struct PluginProxy {

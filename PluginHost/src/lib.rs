@@ -1,8 +1,7 @@
 //! Runtime plugin management with explicit `PluginHostInstance` ownership.
 //!
 //! Each explicit instance owns its plugin catalog, runtime configuration, database capability,
-//! and lifecycle-operation reservations. The `Factory` module preserves the historical
-//! process-wide API as a compatibility facade over one lazily created instance.
+//! and lifecycle-operation reservations. No process-global plugin-host instance exists.
 //!
 //! # Responsibilities
 //!
@@ -44,14 +43,12 @@
 //!
 //! # Behavior notes
 //!
-//! - `load_plugin_if_missing` is a deprecated compatibility API; prefer explicit catalog/health lookup.
 //! - REST endpoint lookup is catalog-based: callers identify an endpoint by its HTTP contract,
 //!   not by a concrete plugin implementation name.
-//! - `with_plugin_by_name` and `with_all_plugins` are deprecated compatibility APIs; prefer the
-//!   catalog/endpoint APIs. `with_database_plugin` remains the explicit capability boundary.
+//! - `with_database_plugin` is the explicit data-source capability boundary.
 //! - Plugin call limits default to 30s call timeout, 10s unload timeout, 16 worker threads,
-//!   32 admitted calls, and 24 queued jobs. Explicitly constructed hosts take these limits from
-//!   `PluginHostConfig`; the legacy `Factory` façade retains environment-based defaults.
+//!   32 admitted calls, and 24 queued jobs. Every host receives these limits explicitly through
+//!   `PluginHostConfig`.
 //! - ABI V2 uses cooperative cancellation for plugin calls. A caller-side timeout sets the
 //!   per-operation cancellation signal; plugin code must observe it at safe interruption points
 //!   and return. The host never terminates a plugin thread or invalidates plugin memory.
@@ -70,8 +67,6 @@
 #![allow(non_snake_case)]
 mod PluginManager;
 pub mod PluginHostInstance;
-#[path = "Factory.rs"]
-pub mod Factory;
 
 #[cfg(target_os = "linux")]
 const LOGGERDEF: &str = "unix";

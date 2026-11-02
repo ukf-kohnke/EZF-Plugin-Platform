@@ -1,4 +1,6 @@
-//! Internal Factory database capability operations.
+//! Database capability operations for one explicit host instance.
+use PluginContracts::IPlugin::IPlugin;
+
 use super::*;
 
 impl PluginHostInstance {

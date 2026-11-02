@@ -1,4 +1,4 @@
-//! Internal Factory readiness operations.
+//! Readiness operations for one explicit host instance.
 use super::*;
 
 pub(crate) fn plugin_health_by_name_for(

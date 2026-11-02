@@ -4,7 +4,6 @@ mod process_config;
 mod loading;
 mod readiness;
 mod database;
-mod compatibility;
 mod catalog;
 mod sessions;
 mod endpoints;
@@ -26,7 +25,6 @@ pub use super::PluginManager::{
     PluginRuntimeConfig,
 };
 use PluginContracts::{
-    IPlugin::IPlugin,
     ApiContract::{
         normalize_plugin_path,
         PluginCancellation,
@@ -99,7 +97,7 @@ impl Default for PluginHostConfig {
 /// Registry/catalog state, database capability, and per-library lifecycle-operation guards are
 /// all owned by this object. Independent instances can therefore use different plugin roots,
 /// runtime limits, executor backends, and database callbacks without overwriting each other's
-/// state. The separate `Factory` module retains a compatibility facade over one default host.
+/// state. Every consumer receives its own explicitly constructed host instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PluginOperationKind {
     Loading,
@@ -117,8 +115,8 @@ pub struct PluginHostInstance {
 ///
 /// The ABI V2 database callback has no user-data pointer. A thread-local scope therefore carries
 /// this weak manager handle while plugin code is running (or while the process-mode capability
-/// broker is serving a request). It avoids routing callbacks through the compatibility Factory
-/// singleton while preserving the existing ABI V2 function-pointer contract.
+/// broker is serving a request). It routes callbacks to the host instance that admitted the call,
+/// without relying on process-global state, while preserving the ABI V2 function-pointer contract.
 #[derive(Clone)]
 pub(crate) struct DatabaseDispatcher {
     manager: Weak<Mutex<PluginManager>>,
@@ -240,8 +238,7 @@ impl PluginHostInstance {
         executor: PluginContracts::ApiContract::PluginDatabaseExecuteFn,
         free: PluginFreeBufferFn
     ) -> Result<(), String> {
-        // Repeated legacy registration is a no-op once a callback is installed. This preserves
-        // existing Factory callers and cannot replace the capability captured by loaded plugins.
+        // Repeated registration is harmless and cannot replace the capability captured by loaded plugins.
         {
             let slot = self.database_executor.lock().unwrap_or_else(|p| p.into_inner());
             if slot.is_some() {

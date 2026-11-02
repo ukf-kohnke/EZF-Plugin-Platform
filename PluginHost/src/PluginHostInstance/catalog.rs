@@ -1,4 +1,4 @@
-//! Internal Factory catalog operations.
+//! Plugin catalog operations for one explicit host instance.
 use super::*;
 
 impl PluginHostInstance {

@@ -1,4 +1,4 @@
-//! Internal Factory endpoint and registry operations.
+//! Endpoint dispatch and registry operations for one explicit host instance.
 use super::*;
 
 pub(crate) fn loaded_plugin_names_for(host: &PluginHostInstance) -> Vec<String> {

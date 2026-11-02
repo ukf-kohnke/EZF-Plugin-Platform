@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-//! End-to-end integration for Factory -> ProcessExecutor -> real worker process -> ABI V2 fixture.
+//! End-to-end integration for PluginHostInstance -> ProcessExecutor -> worker -> ABI V2 fixture.
 //! This test is intentionally unconfined and must never be used as a sandbox acceptance test.
 
 use DatabaseContracts::{ DatabaseError, DatabaseErrorKind, DatabaseRequest, DatabaseResponse };
@@ -13,12 +13,20 @@ use PluginContracts::PluginAbi::{
     PLUGIN_STATUS_CANCELLED,
     PLUGIN_STATUS_OK,
 };
-use PluginHost::Factory::{ self, PluginExecutorKind, PluginRuntimeConfig };
+use PluginHost::PluginHostInstance::{
+    PluginExecutorKind,
+    PluginExecutorSelection,
+    PluginHostConfig,
+    PluginHostInstance,
+    PluginRuntimeConfig,
+    ProcessExecutorConfig,
+    execute_database_raw_current,
+};
 use std::fs;
 use std::path::{ Path, PathBuf };
 use std::process::Command;
-use std::sync::atomic::{ AtomicUsize, Ordering };
-use std::sync::Mutex;
+use std::sync::{ atomic::{ AtomicUsize, Ordering }, Arc, Mutex };
+use std::time::Duration;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static DB_EXECUTOR_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -100,6 +108,22 @@ impl Drop for EnvGuard {
     }
 }
 
+fn process_host() -> Arc<PluginHostInstance> {
+    let worker = PathBuf::from(env!("CARGO_BIN_EXE_ezf-plugin-worker"));
+    let mut process_executor = ProcessExecutorConfig::default();
+    process_executor.worker_binary = Some(worker);
+    process_executor.sandbox.allow_unconfined = true;
+    process_executor.cancellation_grace = Duration::from_millis(100);
+
+    let config = PluginHostConfig {
+        plugin_root: PathBuf::new(),
+        runtime: PluginRuntimeConfig::default(),
+        executor: PluginExecutorSelection::Process,
+        process_executor,
+    };
+    Arc::new(PluginHostInstance::new(config))
+}
+
 fn ping_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
         endpoint_id: "ping".to_owned(),
@@ -141,14 +165,12 @@ fn slow_request() -> PluginEndpointRequest {
 }
 
 #[test]
-fn factory_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
+fn explicit_host_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let worker = Path::new(env!("CARGO_BIN_EXE_ezf-plugin-worker"));
     assert!(worker.is_file(), "Cargo-built worker binary must exist: {}", worker.display());
-    let _mode = EnvGuard::set("EZF_PLUGIN_EXECUTOR", "process");
-    let _unconfined = EnvGuard::set("EZF_PLUGIN_ALLOW_UNCONFINED", "1");
-    let _worker_path = EnvGuard::set("EZF_PLUGIN_WORKER_PATH", worker.as_os_str());
     let _fixture_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "normal");
+    let host = process_host();
 
     let plugin = build_real_plugin();
     assert!(plugin.is_file(), "fixture library must exist: {}", plugin.display());
@@ -157,13 +179,13 @@ fn factory_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
     config.worker_threads = 4;
     config.max_concurrent_calls = 4;
     config.queue_capacity = 4;
-    let id = Factory::load_plugin_file_with_config(&plugin, config).expect(
-        "Factory must load the fixture through ProcessExecutor"
-    );
-    assert_eq!(Factory::loaded_plugin_names(), vec!["PluginHostIntegration"]);
-    let diagnostics = Factory::plugin_health_by_name("PluginHostIntegration").expect(
-        "loaded process plugin must have a health snapshot"
-    );
+    let id = host
+        .load_plugin_file_with_config(&plugin, config)
+        .expect("explicit PluginHostInstance must load the fixture through ProcessExecutor");
+    assert_eq!(host.loaded_plugin_names(), vec!["PluginHostIntegration"]);
+    let diagnostics = host
+        .plugin_health_by_name("PluginHostIntegration")
+        .expect("loaded process plugin must have a health snapshot");
     assert_eq!(diagnostics.executor, PluginExecutorKind::Process);
     assert_eq!(diagnostics.worker_threads, 4);
     assert_eq!(diagnostics.max_concurrent_calls, 4);
@@ -175,9 +197,9 @@ fn factory_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
     let worker_pid = diagnostics.worker_pid.expect("live process executor must report worker PID");
     assert!(worker_pid > 0, "worker PID must be a valid non-zero process id");
 
-    let response = Factory::handle_endpoint(ping_request()).expect(
-        "the endpoint operation must cross the IPC/process boundary"
-    );
+    let response = host
+        .handle_endpoint(ping_request())
+        .expect("the endpoint operation must cross the IPC/process boundary");
     assert_eq!(response.status, 200);
     let body: serde_json::Value = serde_json
         ::from_slice(&response.body)
@@ -189,13 +211,14 @@ fn factory_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
     // Despite four host-side runtime workers and four admitted-call slots, the current process
     // executor must run only one top-level plugin callback inside its single worker process.
     let callers = (0..2)
-        .map(|_|
-            std::thread::spawn(||
-                Factory::handle_endpoint(slow_request()).expect(
-                    "serialized slow endpoint call must succeed"
-                )
+        .map(|_| {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move ||
+                host
+                    .handle_endpoint(slow_request())
+                    .expect("serialized slow endpoint call must succeed")
             )
-        )
+        })
         .collect::<Vec<_>>();
     for caller in callers {
         let response = caller.join().expect("concurrent caller thread must not panic");
@@ -210,8 +233,8 @@ fn factory_uses_process_executor_for_all_runtime_calls_and_unloads_worker() {
         );
     }
 
-    Factory::unload_plugin(id).expect("ProcessExecutor must unload and reap the worker");
-    assert!(Factory::loaded_plugin_names().is_empty());
+    host.unload_plugin(id).expect("ProcessExecutor must unload and reap the worker");
+    assert!(host.loaded_plugin_names().is_empty());
     let _ = fs::remove_dir_all(
         plugin
             .parent()
@@ -257,9 +280,9 @@ unsafe extern "C" fn test_database_execute(
     }
 
     DB_EXECUTOR_CALLS.fetch_add(1, Ordering::AcqRel);
-    // Use the real Factory database route, which dispatches to a separately running DataSource
-    // ProcessExecutor. This exercises both processes and the host broker rather than a local stub.
-    let output = match Factory::execute_database_raw(bytes, cancellation) {
+    // Route through the dispatcher installed for this host's capability-broker scope. The
+    // DataSource plugin is another worker owned by the same explicit host instance.
+    let output = match execute_database_raw_current(bytes, cancellation) {
         Ok(response) => response,
         Err(error) =>
             serde_json
@@ -283,14 +306,12 @@ fn database_and_logging_capabilities_cross_ipc_without_deadlocking() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let worker = Path::new(env!("CARGO_BIN_EXE_ezf-plugin-worker"));
     assert!(worker.is_file(), "Cargo-built worker binary must exist: {}", worker.display());
-    let _mode = EnvGuard::set("EZF_PLUGIN_EXECUTOR", "process");
-    let _unconfined = EnvGuard::set("EZF_PLUGIN_ALLOW_UNCONFINED", "1");
-    let _worker_path = EnvGuard::set("EZF_PLUGIN_WORKER_PATH", worker.as_os_str());
     let _fixture_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "database_provider");
-
-    Factory::register_database_executor(test_database_execute, test_database_free).expect(
+    let host = process_host();
+    host.register_database_executor(test_database_execute, test_database_free).expect(
         "host database test capability must register before process plugin load"
     );
+
     let plugin = build_real_plugin();
     let domain_plugin = plugin.with_file_name(
         format!(
@@ -299,27 +320,24 @@ fn database_and_logging_capabilities_cross_ipc_without_deadlocking() {
         )
     );
     fs::copy(&plugin, &domain_plugin).expect("Domain fixture library copy must succeed");
-    let provider_id = Factory::load_plugin_file_with_config(
-        &plugin,
-        PluginRuntimeConfig::default()
-    ).expect("DataSource fixture must load through ProcessExecutor");
-    assert_eq!(Factory::loaded_plugin_names(), vec!["PluginHostDatabaseProvider"]);
+    let provider_id = host
+        .load_plugin_file_with_config(&plugin, PluginRuntimeConfig::default())
+        .expect("DataSource fixture must load through ProcessExecutor");
 
-    unsafe {
-        std::env::set_var("EZF_PLUGIN_FIXTURE_MODE", "database_broker");
-    }
-    let id = Factory::load_plugin_file_with_config(
-        &domain_plugin,
-        PluginRuntimeConfig::default()
-    ).expect("Domain fixture must load with the host database capability broker");
-    assert!(Factory::loaded_plugin_names().contains(&"PluginHostDatabaseBroker".to_owned()));
+    assert_eq!(host.loaded_plugin_names(), vec!["PluginHostDatabaseProvider"]);
+
+    let _broker_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "database_broker");
+    let id = host
+        .load_plugin_file_with_config(&domain_plugin, PluginRuntimeConfig::default())
+        .expect("Domain fixture must load with the host database capability broker");
+    assert!(host.loaded_plugin_names().contains(&"PluginHostDatabaseBroker".to_owned()));
 
     let mut request = ping_request();
     request.endpoint_id = "database".to_owned();
     request.raw_path = "/pluginhost-integration/database".to_owned();
-    let response = Factory::handle_endpoint(request).expect(
-        "database capability must complete through the IPC broker without deadlock"
-    );
+    let response = host
+        .handle_endpoint(request)
+        .expect("database capability must complete through the IPC broker without deadlock");
     assert_eq!(response.status, 200);
     let body: serde_json::Value = serde_json
         ::from_slice(&response.body)
@@ -333,36 +351,29 @@ fn database_and_logging_capabilities_cross_ipc_without_deadlocking() {
         1,
         "Domain plugin must cross the host DB callback once"
     );
-    Factory::unload_plugin(id).expect("broker fixture worker must unload and be reaped");
-    assert!(Factory::loaded_plugin_names().contains(&"PluginHostDatabaseProvider".to_owned()));
-    Factory::unload_plugin(provider_id).expect(
-        "DataSource provider worker must unload and be reaped"
-    );
-    assert!(Factory::loaded_plugin_names().is_empty());
+    host.unload_plugin(id).expect("broker fixture worker must unload and be reaped");
+    assert!(host.loaded_plugin_names().contains(&"PluginHostDatabaseProvider".to_owned()));
+    host.unload_plugin(provider_id).expect("DataSource provider worker must unload and be reaped");
+    assert!(host.loaded_plugin_names().is_empty());
 
     // The broker must fail closed for a DataSource plugin, otherwise it could recursively route
     // its own database request back to itself. The registered executor call count must not change.
-    unsafe {
-        std::env::set_var("EZF_PLUGIN_FIXTURE_MODE", "database_broker_datasource");
-    }
-    let datasource_id = Factory::load_plugin_file_with_config(
-        &plugin,
-        PluginRuntimeConfig::default()
-    ).expect("DataSource fixture itself must load, while generic DB capability remains denied");
-    assert_eq!(Factory::loaded_plugin_names(), vec!["PluginHostDatabaseBrokerDataSource"]);
+    let _datasource_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "database_broker_datasource");
+    let datasource_id = host
+        .load_plugin_file_with_config(&plugin, PluginRuntimeConfig::default())
+        .expect("DataSource fixture itself must load, while generic DB capability remains denied");
+    assert_eq!(host.loaded_plugin_names(), vec!["PluginHostDatabaseBrokerDataSource"]);
     let mut denied_request = ping_request();
     denied_request.endpoint_id = "database".to_owned();
     denied_request.raw_path = "/pluginhost-integration/database".to_owned();
     // A plugin endpoint error is transported as a typed PluginEndpointError, so the
-    // Factory returns Err rather than a successful PluginEndpointResponse. Capture the
+    // A typed endpoint failure is returned as Err rather than a successful response. Capture the
     // result first and unload the worker before asserting: even if the expected policy
     // shape changes in a later revision, this test must not leave a process or catalog
     // entry behind and cascade failures into the next integration test.
-    let denied_result = Factory::handle_endpoint(denied_request);
-    Factory::unload_plugin(datasource_id).expect(
-        "DataSource fixture worker must unload and be reaped"
-    );
-    assert!(Factory::loaded_plugin_names().is_empty());
+    let denied_result = host.handle_endpoint(denied_request);
+    host.unload_plugin(datasource_id).expect("DataSource fixture worker must unload and be reaped");
+    assert!(host.loaded_plugin_names().is_empty());
 
     let denied = denied_result.expect_err(
         "DataSource capability denial must be reported as a typed plugin endpoint error, not an IPC transport failure"

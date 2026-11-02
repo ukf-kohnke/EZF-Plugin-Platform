@@ -1,4 +1,4 @@
-//! Internal Factory loading operations.
+//! Plugin loading operations for one explicit host instance.
 use crate::PluginHostInstance::{
     endpoints::loaded_plugin_names_for,
     readiness::plugin_health_by_name_for,
@@ -20,8 +20,8 @@ fn unload_plugin_for(host: &PluginHostInstance, id: i64) -> Result<(), PluginMan
     // ready host. The operation guard still prevents a concurrent load/reload of the same
     // canonical library path.
     let canonical_path = {
-        let singleton = host;
-        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = host;
+        let manager = instance.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         manager.plugins
             .get(&id)
             .map(|item| item.path.clone())
@@ -38,8 +38,8 @@ fn unload_plugin_for(host: &PluginHostInstance, id: i64) -> Result<(), PluginMan
     // runtime Arc is borrowed here; the registry entry itself stays in place until unload
     // succeeds, so health snapshots can expose `Stopping`/failure states during the operation.
     let runtime = {
-        let singleton = host;
-        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = host;
+        let manager = instance.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         manager.get_runtime(id).ok_or(PluginManagerError::PluginNotFound { id })?
     };
 
@@ -52,8 +52,8 @@ fn unload_plugin_for(host: &PluginHostInstance, id: i64) -> Result<(), PluginMan
 
     let elapsed = started.elapsed();
     let removed_item = {
-        let singleton = host;
-        let mut manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = host;
+        let mut manager = instance.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         manager.detach_plugin(id)?
     };
     drop(removed_item);
@@ -213,8 +213,8 @@ fn load_plugin_file_inner(
     )?;
 
     {
-        let singleton = host;
-        let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = host;
+        let manager = instance.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
             return Err(PluginManagerError::PluginAlreadyLoaded {
                 path: canonical_path,
@@ -240,8 +240,8 @@ fn load_plugin_file_inner(
     let plugin_manifest = loaded.manifest().clone();
 
     let result = {
-        let singleton = host;
-        let mut manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let instance = host;
+        let mut manager = instance.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(existing_id) = manager.paths.get(&canonical_path).copied() {
             Err(PluginManagerError::PluginAlreadyLoaded {
@@ -356,8 +356,8 @@ fn load_plugins_with_policy_and_config_for(
         };
 
         {
-            let singleton = host;
-            let manager = singleton.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let instance = host;
+            let manager = instance.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if manager.paths.contains_key(&canonical_path) {
                 report.skipped_already_loaded.push(canonical_path);
                 continue;
@@ -412,8 +412,8 @@ fn load_plugins_with_policy_and_config_for(
         let plugin_name = manifest.name.clone();
 
         let registration = {
-            let singleton = host;
-            let mut manager = singleton.inner
+            let instance = host;
+            let mut manager = instance.inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 

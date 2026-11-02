@@ -4,12 +4,19 @@
 //! This is a development integration test, not a production-sandbox test.
 
 use PluginContracts::ApiContract::{ PluginEndpointRequest, PluginHttpMethod, PluginPrincipal };
-use PluginHost::Factory::{ self, PluginHealthState, PluginRuntimeConfig };
+use PluginHost::PluginHostInstance::{
+    PluginExecutorSelection,
+    PluginHealthState,
+    PluginHostConfig,
+    PluginHostInstance,
+    PluginRuntimeConfig,
+    ProcessExecutorConfig,
+};
 use std::fs;
 use std::path::{ Path, PathBuf };
 use std::process::Command;
 use std::sync::atomic::{ AtomicUsize, Ordering };
-use std::sync::Mutex;
+use std::sync::{ Arc, Mutex };
 use std::time::{ Duration, Instant };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -77,6 +84,22 @@ impl Drop for EnvGuard {
     }
 }
 
+
+fn process_host() -> Arc<PluginHostInstance> {
+    let worker = PathBuf::from(env!("CARGO_BIN_EXE_ezf-plugin-worker"));
+    let mut process_executor = ProcessExecutorConfig::default();
+    process_executor.worker_binary = Some(worker);
+    process_executor.sandbox.allow_unconfined = true;
+    process_executor.cancellation_grace = Duration::from_millis(100);
+    let config = PluginHostConfig {
+        plugin_root: PathBuf::new(),
+        runtime: PluginRuntimeConfig::default(),
+        executor: PluginExecutorSelection::Process,
+        process_executor,
+    };
+    Arc::new(PluginHostInstance::new(config))
+}
+
 fn slow_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
         endpoint_id: "slow".to_owned(),
@@ -102,19 +125,16 @@ fn uncooperative_plugin_timeout_kills_and_reaps_worker_without_replay() {
     let _test_guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let worker = Path::new(env!("CARGO_BIN_EXE_ezf-plugin-worker"));
     assert!(worker.is_file(), "worker binary must exist: {}", worker.display());
-    let _mode = EnvGuard::set("EZF_PLUGIN_EXECUTOR", "process");
-    let _unconfined = EnvGuard::set("EZF_PLUGIN_ALLOW_UNCONFINED", "1");
-    let _worker_path = EnvGuard::set("EZF_PLUGIN_WORKER_PATH", worker.as_os_str());
     let _fixture_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "slow_ignore_cancel");
-    let _grace = EnvGuard::set("EZF_PLUGIN_PROCESS_CANCEL_GRACE_MS", "100");
+    let host = process_host();
 
     let plugin = build_real_plugin();
     let mut config = PluginRuntimeConfig::default();
     config.call_timeout = Duration::from_millis(80);
     config.lifecycle_timeout = Duration::from_secs(2);
     config.unload_timeout = Duration::from_secs(2);
-    let id = Factory::load_plugin_file_with_config(&plugin, config).expect(
-        "fixture plugin must load through ProcessExecutor"
+    let id = host.load_plugin_file_with_config(&plugin, config).expect(
+        "fixture plugin must load through the explicitly configured ProcessExecutor"
     );
 
     let started = Instant::now();
@@ -122,7 +142,10 @@ fn uncooperative_plugin_timeout_kills_and_reaps_worker_without_replay() {
     // causes process-level escalation. Calls waiting behind the single-flight IPC gate must not
     // hang forever or be replayed against a replacement worker.
     let callers = (0..4)
-        .map(|_| std::thread::spawn(|| Factory::handle_endpoint(slow_request()).is_err()))
+        .map(|_| {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || host.handle_endpoint(slow_request()).is_err())
+        })
         .collect::<Vec<_>>();
     for caller in callers {
         assert!(
@@ -143,7 +166,7 @@ fn uncooperative_plugin_timeout_kills_and_reaps_worker_without_replay() {
         !exited_marker.exists(),
         "the worker must be killed before the uncooperative callback completes"
     );
-    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+    let health = host.plugin_health_by_name("PluginHostIntegration").expect(
         "dead worker health snapshot must remain available"
     );
     assert_eq!(
@@ -159,13 +182,13 @@ fn uncooperative_plugin_timeout_kills_and_reaps_worker_without_replay() {
 
     // The worker is gone and requests are never replayed or transparently restarted.
     assert!(
-        Factory::handle_endpoint(slow_request()).is_err(),
+        host.handle_endpoint(slow_request()).is_err(),
         "a dead worker must fail subsequent operations"
     );
     // Explicit unload cannot run plugin callbacks after the worker has exited. The supervisor has
     // already killed and reaped it; do not pretend this is a graceful plugin cleanup.
     assert!(
-        Factory::unload_plugin(id).is_err(),
+        host.unload_plugin(id).is_err(),
         "dead-worker cleanup must not be reported as graceful"
     );
     let _ = fs::remove_dir_all(
@@ -180,12 +203,8 @@ fn uncooperative_plugin_timeout_kills_and_reaps_worker_without_replay() {
 #[test]
 fn lifecycle_timeouts_kill_and_reap_worker_during_on_unload_and_destroy() {
     let _test_guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let worker = Path::new(env!("CARGO_BIN_EXE_ezf-plugin-worker"));
-    let _mode = EnvGuard::set("EZF_PLUGIN_EXECUTOR", "process");
-    let _unconfined = EnvGuard::set("EZF_PLUGIN_ALLOW_UNCONFINED", "1");
-    let _worker_path = EnvGuard::set("EZF_PLUGIN_WORKER_PATH", worker.as_os_str());
-    let _grace = EnvGuard::set("EZF_PLUGIN_PROCESS_CANCEL_GRACE_MS", "100");
     let _fixture_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "slow_on_unload_ignore_cancel");
+    let host = process_host();
 
     // Exercise both lifecycle phases with one built fixture so the test doesn't rebuild the
     // same cdylib for each scenario. The worker captures the mode when the plugin is loaded.
@@ -195,12 +214,12 @@ fn lifecycle_timeouts_kill_and_reap_worker_during_on_unload_and_destroy() {
     config.call_timeout = Duration::from_secs(2);
     config.lifecycle_timeout = Duration::from_millis(80);
     config.unload_timeout = Duration::from_secs(2);
-    let id = Factory::load_plugin_file_with_config(&plugin, config).expect(
+    let id = host.load_plugin_file_with_config(&plugin, config).expect(
         "fixture plugin must load through ProcessExecutor"
     );
 
     let started = Instant::now();
-    let error = Factory::unload_plugin(id).expect_err(
+    let error = host.unload_plugin(id).expect_err(
         "forced on_unload termination is not a graceful unload"
     );
     assert!(
@@ -208,7 +227,7 @@ fn lifecycle_timeouts_kill_and_reap_worker_during_on_unload_and_destroy() {
         "forced termination must remain an unload error: {error}"
     );
     assert!(started.elapsed() < Duration::from_secs(2), "on_unload escalation must be bounded");
-    let retry_error = Factory::unload_plugin(id).expect_err(
+    let retry_error = host.unload_plugin(id).expect_err(
         "forced unload must detach the dead worker"
     );
     assert!(
@@ -232,17 +251,18 @@ fn lifecycle_timeouts_kill_and_reap_worker_during_on_unload_and_destroy() {
         let _ = fs::remove_file(directory.join(marker));
     }
     drop(_fixture_mode);
-    let _fixture_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "slow_destroy_ignore_cancel");
+    let _destroy_mode = EnvGuard::set("EZF_PLUGIN_FIXTURE_MODE", "slow_destroy_ignore_cancel");
+    let destroy_host = process_host();
     let mut config = PluginRuntimeConfig::default();
     config.call_timeout = Duration::from_secs(2);
     config.lifecycle_timeout = Duration::from_millis(80);
     config.unload_timeout = Duration::from_secs(2);
-    let id = Factory::load_plugin_file_with_config(&plugin, config).expect(
-        "fixture plugin must reload through ProcessExecutor after the old worker was reaped"
+    let id = destroy_host.load_plugin_file_with_config(&plugin, config).expect(
+        "fixture plugin must load through a fresh ProcessExecutor host after the old worker was reaped"
     );
 
     let started = Instant::now();
-    let error = Factory::unload_plugin(id).expect_err(
+    let error = destroy_host.unload_plugin(id).expect_err(
         "forced destroy termination is not a graceful unload"
     );
     assert!(
@@ -250,7 +270,7 @@ fn lifecycle_timeouts_kill_and_reap_worker_during_on_unload_and_destroy() {
         "forced termination must remain an unload error: {error}"
     );
     assert!(started.elapsed() < Duration::from_secs(2), "destroy escalation must be bounded");
-    let retry_error = Factory::unload_plugin(id).expect_err(
+    let retry_error = destroy_host.unload_plugin(id).expect_err(
         "forced unload must detach the dead worker"
     );
     assert!(

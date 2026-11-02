@@ -1,4 +1,6 @@
-//! Internal Factory sessions operations.
+//! Session lifecycle operations for one explicit host instance.
+use PluginContracts::IPlugin::IPlugin;
+
 use super::*;
 
 impl PluginHostInstance {

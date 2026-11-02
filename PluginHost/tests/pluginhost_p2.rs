@@ -1,5 +1,10 @@
 use PluginContracts::ApiContract::{ PluginEndpointRequest, PluginHttpMethod, PluginPrincipal };
-use PluginHost::Factory::{ self, PluginHealthState, PluginRuntimeConfig };
+use PluginHost::PluginHostInstance::{
+    PluginHealthState,
+    PluginHostConfig,
+    PluginHostInstance,
+    PluginRuntimeConfig,
+};
 use std::{
     fs,
     path::{ Path, PathBuf },
@@ -166,39 +171,45 @@ fn p2_duration_secs(name: &str, default: u64) -> Duration {
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct TestGuard {
+    host: std::sync::Arc<PluginHostInstance>,
     _lock: MutexGuard<'static, ()>,
+}
+
+impl TestGuard {
+    fn host(&self) -> std::sync::Arc<PluginHostInstance> {
+        std::sync::Arc::clone(&self.host)
+    }
+}
+
+impl std::ops::Deref for TestGuard {
+    type Target = PluginHostInstance;
+    fn deref(&self) -> &Self::Target { self.host.as_ref() }
 }
 
 impl Drop for TestGuard {
     fn drop(&mut self) {
         for _ in 0..5 {
-            let ids = Factory::loaded_plugin_ids();
-            if ids.is_empty() {
-                break;
-            }
+            let ids = self.host.loaded_plugin_ids();
+            if ids.is_empty() { break; }
             let mut remaining = false;
             for id in ids {
-                if Factory::unload_plugin(id).is_err() {
-                    remaining = true;
-                }
+                if self.host.unload_plugin(id).is_err() { remaining = true; }
             }
-            if !remaining {
-                break;
-            }
+            if !remaining { break; }
             thread::sleep(Duration::from_millis(10));
         }
     }
 }
 
 fn lock_test() -> TestGuard {
-    TestGuard {
-        _lock: TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-    }
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let host = std::sync::Arc::new(PluginHostInstance::new(PluginHostConfig::default()));
+    TestGuard { host, _lock }
 }
 
-fn unload_and_assert_empty(id: i64) {
-    Factory::unload_plugin(id).expect("P2 fixture plugin must unload cleanly");
-    assert_eq!(Factory::plugin_count(), 0, "no plugin may remain after unload");
+fn unload_and_assert_empty(host: &PluginHostInstance, id: i64) {
+    host.unload_plugin(id).expect("P2 fixture plugin must unload cleanly");
+    assert_eq!(host.plugin_count(), 0, "no plugin may remain after unload");
 }
 
 #[test]
@@ -215,7 +226,7 @@ fn p2_long_running_plugin_stress() {
         max_concurrent_calls: workers.max(1),
         queue_capacity: workers.max(1),
     };
-    let id = Factory::load_plugin_file_with_config(&library, config).expect(
+    let id = _test_guard.load_plugin_file_with_config(&library, config).expect(
         "P2 stress fixture must load"
     );
     let duration = p2_duration_secs("EZF_P2_STRESS_SECS", 10);
@@ -227,9 +238,10 @@ fn p2_long_running_plugin_stress() {
         .map(|_| {
             let successes = std::sync::Arc::clone(&total_successes);
             let failures = std::sync::Arc::clone(&total_failures);
+            let host = _test_guard.host();
             thread::spawn(move || {
                 while Instant::now() < deadline {
-                    match Factory::handle_endpoint(ping_request()) {
+                    match host.handle_endpoint(ping_request()) {
                         Ok(response) if response.status == 200 => {
                             successes.fetch_add(1, Ordering::Relaxed);
                         }
@@ -252,7 +264,7 @@ fn p2_long_running_plugin_stress() {
     assert!(successes > 0, "long-running stress must execute at least one successful call");
     assert_eq!(failures, 0, "long-running stress must not produce endpoint failures");
 
-    let health = Factory::plugin_health_by_name("PluginHostIntegration").expect(
+    let health = _test_guard.plugin_health_by_name("PluginHostIntegration").expect(
         "stress plugin health must remain available"
     );
     assert_eq!(health.state, PluginHealthState::Ready);
@@ -261,7 +273,7 @@ fn p2_long_running_plugin_stress() {
     assert_eq!(health.active_calls, 0);
     assert!((health.total_calls as usize) >= successes);
 
-    unload_and_assert_empty(id);
+    unload_and_assert_empty(&_test_guard, id);
     cleanup_fixture(&library);
 }
 
@@ -272,24 +284,24 @@ fn p2_repeated_load_unload_soak() {
     let library = build_fixture();
     let cycles = p2_usize("EZF_P2_SOAK_CYCLES", 100);
     for cycle in 0..cycles {
-        let id = Factory::load_plugin_file(&library).unwrap_or_else(|error|
+        let id = _test_guard.load_plugin_file(&library).unwrap_or_else(|error|
             panic!("cycle {cycle}: plugin must load: {error}")
         );
         assert!(id > 0, "cycle {cycle}: plugin id must be valid");
-        assert_eq!(Factory::plugin_count(), 1, "cycle {cycle}: exactly one plugin must be loaded");
+        assert_eq!(_test_guard.plugin_count(), 1, "cycle {cycle}: exactly one plugin must be loaded");
 
-        let response = Factory::handle_endpoint(ping_request()).unwrap_or_else(|error|
+        let response = _test_guard.handle_endpoint(ping_request()).unwrap_or_else(|error|
             panic!("cycle {cycle}: endpoint call failed: {error}")
         );
         assert_eq!(response.status, 200, "cycle {cycle}: endpoint must return HTTP 200");
 
-        Factory::unload_plugin(id).unwrap_or_else(|error|
+        _test_guard.unload_plugin(id).unwrap_or_else(|error|
             panic!("cycle {cycle}: plugin unload failed: {error}")
         );
-        assert_eq!(Factory::plugin_count(), 0, "cycle {cycle}: registry must be empty");
+        assert_eq!(_test_guard.plugin_count(), 0, "cycle {cycle}: registry must be empty");
     }
 
-    assert_eq!(Factory::loaded_plugin_ids(), Vec::<i64>::new());
+    assert_eq!(_test_guard.loaded_plugin_ids(), Vec::<i64>::new());
     cleanup_fixture(&library);
 }
 
@@ -299,24 +311,24 @@ fn p2_repeated_load_unload_soak() {
 fn p2_resource_handle_and_thread_leak_check() {
     let _test_guard = lock_test();
     let library = build_fixture();
-    let warmup_id = Factory::load_plugin_file(&library).expect("leak-check warmup load must work");
-    Factory::handle_endpoint(ping_request()).expect("leak-check warmup call must work");
-    Factory::unload_plugin(warmup_id).expect("leak-check warmup unload must work");
+    let warmup_id = _test_guard.load_plugin_file(&library).expect("leak-check warmup load must work");
+    _test_guard.handle_endpoint(ping_request()).expect("leak-check warmup call must work");
+    _test_guard.unload_plugin(warmup_id).expect("leak-check warmup unload must work");
 
     let baseline = resource_snapshot(&library);
     let cycles = p2_usize("EZF_P2_LEAK_CYCLES", 75);
 
     for cycle in 0..cycles {
-        let id = Factory::load_plugin_file(&library).unwrap_or_else(|error|
+        let id = _test_guard.load_plugin_file(&library).unwrap_or_else(|error|
             panic!("cycle {cycle}: plugin load failed: {error}")
         );
-        Factory::handle_endpoint(ping_request()).unwrap_or_else(|error|
+        _test_guard.handle_endpoint(ping_request()).unwrap_or_else(|error|
             panic!("cycle {cycle}: endpoint call failed: {error}")
         );
-        Factory::unload_plugin(id).unwrap_or_else(|error|
+        _test_guard.unload_plugin(id).unwrap_or_else(|error|
             panic!("cycle {cycle}: plugin unload failed: {error}")
         );
-        assert_eq!(Factory::plugin_count(), 0, "cycle {cycle}: plugin registry must be empty");
+        assert_eq!(_test_guard.plugin_count(), 0, "cycle {cycle}: plugin registry must be empty");
 
         thread::sleep(Duration::from_millis(2));
         let current = resource_snapshot(&library);
@@ -379,7 +391,10 @@ fn p2_multi_plugin_load_and_call_stress() {
         .cloned()
         .map(|library| {
             let config = config;
-            thread::spawn(move || Factory::load_plugin_file_with_config(&library, config))
+            {
+                let host = _test_guard.host();
+                thread::spawn(move || host.load_plugin_file_with_config(&library, config))
+            }
         })
         .collect::<Vec<_>>();
     let mut ids = Vec::with_capacity(requested_plugins);
@@ -391,8 +406,8 @@ fn p2_multi_plugin_load_and_call_stress() {
         ids.push(id);
     }
 
-    assert_eq!(Factory::plugin_count(), requested_plugins);
-    let loaded_names = Factory::loaded_plugin_names();
+    assert_eq!(_test_guard.plugin_count(), requested_plugins);
+    let loaded_names = _test_guard.loaded_plugin_names();
     for name in &names {
         assert!(
             loaded_names.iter().any(|loaded| loaded == name),
@@ -404,10 +419,11 @@ fn p2_multi_plugin_load_and_call_stress() {
     let integration_workers = workers_per_plugin.max(1);
     let handles = (0..integration_workers)
         .map(|_| {
+            let host = _test_guard.host();
             thread::spawn(move || {
                 let mut successes = 0usize;
                 while start.elapsed() < duration {
-                    let response = Factory::handle_endpoint(ping_request()).unwrap_or_else(|error|
+                    let response = host.handle_endpoint(ping_request()).unwrap_or_else(|error|
                         panic!("endpoint call for PluginHostIntegration failed: {error}")
                     );
                     assert_eq!(response.status, 200);
@@ -426,7 +442,7 @@ fn p2_multi_plugin_load_and_call_stress() {
     assert!(total_successes > 0, "multi-plugin stress must execute endpoint traffic");
 
     for name in &names {
-        let health = Factory::plugin_health_by_name(name).unwrap_or_else(||
+        let health = _test_guard.plugin_health_by_name(name).unwrap_or_else(||
             panic!("health snapshot for {name} must be available")
         );
         assert_eq!(health.state, PluginHealthState::Ready, "{name} must remain ready");
@@ -441,7 +457,10 @@ fn p2_multi_plugin_load_and_call_stress() {
     let unload_handles = ids
         .iter()
         .copied()
-        .map(|id| thread::spawn(move || Factory::unload_plugin(id)))
+        .map(|id| {
+            let host = _test_guard.host();
+            thread::spawn(move || host.unload_plugin(id))
+        })
         .collect::<Vec<_>>();
     for handle in unload_handles {
         handle
@@ -449,7 +468,7 @@ fn p2_multi_plugin_load_and_call_stress() {
             .expect("unload worker must finish without panic")
             .expect("all multi-plugin unloads must succeed");
     }
-    assert_eq!(Factory::plugin_count(), 0);
+    assert_eq!(_test_guard.plugin_count(), 0);
 
     for library in libraries {
         cleanup_fixture(&library);

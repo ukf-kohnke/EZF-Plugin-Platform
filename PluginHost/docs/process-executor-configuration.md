@@ -1,6 +1,6 @@
 # ProcessExecutor-Konfiguration
 
-Der `ProcessExecutor` liest keine EZF-Deployment-Umgebungsvariablen mehr. Sämtliche Launch-Parameter
+Der `ProcessExecutor` liest keine EZF-Deployment-Umgebungsvariablen. Sämtliche Launch-Parameter
 werden über `PluginHostConfig::process_executor` an die Runtime übergeben.
 
 ```rust
@@ -8,7 +8,7 @@ use PluginHost::PluginHostInstance::{
     PluginExecutorSelection, PluginHostConfig, PluginHostInstance,
     PluginRuntimeConfig, ProcessExecutorConfig, SandboxConfig, SandboxProfile,
 };
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 let mut process = ProcessExecutorConfig::default();
 process.worker_binary = Some(PathBuf::from("/absolute/path/to/ezf-plugin-worker"));
@@ -36,8 +36,7 @@ let host = PluginHostInstance::new(PluginHostConfig {
 - `sandbox.profiles_by_plugin`: optionale Profile pro kanonischem absolutem Plugin-Pfad. Ist die Map
   nicht leer, muss jeder Prozessmodus-Pluginpfad darin vorhanden sein.
 - `sandbox.require_per_plugin_profile`: erzwingt die per-Plugin-Zuordnung auch dann, wenn die Map
-  leer ist. Damit wird eine explizit konfigurierte, aber leere Alt-Konfiguration nicht wie eine
-  fehlende Konfiguration behandelt.
+  leer ist.
 - `sandbox.extra_read_paths`: zusätzliche, eng begrenzte Dateisystem-Lesepfade.
 - `sandbox.library_paths`: vertrauenswürdige dynamische Library-Suchpfade; sie werden ebenfalls als
   Lesepfade freigegeben und müssen sichere Verzeichnisrechte besitzen.
@@ -53,14 +52,10 @@ let host = PluginHostInstance::new(PluginHostConfig {
 Die Zeitbudgets werden auf 10 ms bis 30 s bzw. 100 ms bis 15 s begrenzt. DataSource-Worker benötigen
 zusätzlich eine nichtleere TCP-Portliste (1 bis 32 Ports) und die externe Egress-Policy-Bestätigung.
 
-## Übergang für bestehende Deployments
+## Environment-Übersetzung
 
-Die bestehende `Factory::*`-Kompatibilitätsfassade übersetzt die bisherigen Umgebungsvariablen
-(`EZF_PLUGIN_WORKER_PATH`, `EZF_PLUGIN_SANDBOX_*`, `EZF_PLUGIN_DATASOURCE_*`,
-`EZF_PLUGIN_WORKER_ENV_ALLOWLIST`, `EZF_PLUGIN_PROCESS_CANCEL_GRACE_MS` und
-`EZF_PLUGIN_PROCESS_SHUTDOWN_TIMEOUT_MS`) einmalig in `ProcessExecutorConfig`.
-
-Der `PluginTestHost` besitzt eine eigene CLI-seitige Übersetzung derselben Variablen. Bei neuen
-Integrationen sollte die Anwendung die Werte selbst einlesen und `ProcessExecutorConfig` explizit
-setzen. Änderungen an der Prozessumgebung nach Erzeugung einer Host-Instanz beeinflussen deren
-Konfiguration nicht mehr.
+Die Anwendung darf weiterhin Umgebungsvariablen als Deployment-Konfiguration verwenden. Sie liest
+und validiert diese aber an ihrer Composition Root (im EZF-Backend beispielsweise
+`BackendSrv::plugin_host_config`) und übergibt danach `ProcessExecutorConfig` explizit an den Host.
+`PluginTestHost` besitzt eine eigene CLI-seitige Konfigurationsübersetzung. Änderungen an der
+Prozessumgebung nach Erzeugung einer Host-Instanz beeinflussen deren Konfiguration nicht.

@@ -7,7 +7,7 @@
 //! InstantiateV2; the endpoint implementation itself is Python code.
 
 use PluginContracts::ApiContract::{ PluginEndpointRequest, PluginHttpMethod, PluginPrincipal };
-use PluginHost::Factory;
+use PluginHost::PluginHostInstance::{PluginHostConfig, PluginHostInstance};
 use std::{ env, fs, path::{ Path, PathBuf }, process::Command };
 
 fn find_library_recursive(dir: &Path, expected_name: &str) -> Option<PathBuf> {
@@ -107,11 +107,12 @@ fn python_handler_crosses_the_real_rust_plugin_abi() {
     }
 
     let (library, build_dir) = build_python_plugin();
-    let plugin_id = Factory::load_plugin_file(&library).expect(
+    let host = PluginHostInstance::new(PluginHostConfig::default());
+    let plugin_id = host.load_plugin_file(&library).expect(
         "Rust PluginHost must load the Python adapter through InstantiateV2"
     );
 
-    let response = Factory::handle_endpoint(ping_request()).expect(
+    let response = host.handle_endpoint(ping_request()).expect(
         "Rust PluginHost must invoke the Python handler over ABI V2"
     );
     assert_eq!(response.status, 200, "Python endpoint must return HTTP 200");
@@ -132,6 +133,6 @@ fn python_handler_crosses_the_real_rust_plugin_abi() {
     assert_eq!(body["loaded"], true);
     assert!(body["python_version"].as_str().is_some(), "Python runtime version must be included");
 
-    Factory::unload_plugin(plugin_id).expect("Python plugin must unload cleanly through ABI V2");
+    host.unload_plugin(plugin_id).expect("Python plugin must unload cleanly through ABI V2");
     let _ = fs::remove_dir_all(build_dir);
 }

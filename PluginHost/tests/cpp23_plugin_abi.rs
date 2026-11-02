@@ -6,7 +6,7 @@
 //! The test is opt-in so the regular Rust test suite does not require CMake or a C++23 compiler.
 
 use PluginContracts::ApiContract::{ PluginEndpointRequest, PluginHttpMethod, PluginPrincipal };
-use PluginHost::Factory;
+use PluginHost::PluginHostInstance::{PluginHostConfig, PluginHostInstance};
 use std::{ env, fs, path::{ Path, PathBuf }, process::Command };
 
 fn find_library_recursive(dir: &Path, expected_name: &str) -> Option<PathBuf> {
@@ -101,11 +101,12 @@ fn cpp23_shared_library_crosses_the_real_rust_plugin_abi() {
     }
 
     let (library, build_dir) = build_cpp_plugin();
-    let plugin_id = Factory::load_plugin_file(&library).expect(
+    let host = PluginHostInstance::new(PluginHostConfig::default());
+    let plugin_id = host.load_plugin_file(&library).expect(
         "Rust PluginHost must load the C++23 library through InstantiateV2"
     );
 
-    let response = Factory::handle_endpoint(ping_request()).expect(
+    let response = host.handle_endpoint(ping_request()).expect(
         "Rust PluginHost must invoke the C++ endpoint over ABI V2"
     );
     assert_eq!(response.status, 200, "C++ endpoint must return HTTP 200");
@@ -123,6 +124,6 @@ fn cpp23_shared_library_crosses_the_real_rust_plugin_abi() {
     assert_eq!(body["endpoint"], "ping");
     assert_eq!(body["loaded"], true);
 
-    Factory::unload_plugin(plugin_id).expect("C++ plugin must unload cleanly through ABI V2");
+    host.unload_plugin(plugin_id).expect("C++ plugin must unload cleanly through ABI V2");
     let _ = fs::remove_dir_all(build_dir);
 }

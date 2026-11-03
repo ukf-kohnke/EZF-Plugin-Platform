@@ -1,11 +1,10 @@
 [package]
 name = "PluginHost"
-version = "3.5.4"
-edition = "2024"
-authors = ["Anselm Hoppmann <anselm.hoppmann@uniklinik-freiburg.de>", "Georg Kohnke <georg.kohnke@uniklinik-freiburg.de>", "Frederik Voigt <frederik.voigt@uniklinik-freiburg.de>", "Jonas Gassenschmidt <jonas.gassenschmidt@uniklinik-freiburg.de>"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Dynamic plugin host and lifecycle runtime for EZF-Backend"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/hoppmann/EZF-Backend.git"
+repository = "https://github.com/ukf-kohnke/EZF-Plugin-Platform.git"
 
 [dependencies]
 DatabaseContracts = { path = "../Plugin-SDK/DatabaseContracts" }

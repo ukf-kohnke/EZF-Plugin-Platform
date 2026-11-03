@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Versioned and bounded IPC protocol framing for EZF plugin workers"
+repository = "https://github.com/ukf-kohnke/EZF-Plugin-Platform.git"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

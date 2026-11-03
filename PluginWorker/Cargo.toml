@@ -4,11 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Process-isolated EZF plugin worker with Linux enforced sandbox profiles"
+repository = "https://github.com/ukf-kohnke/EZF-Plugin-Platform.git"
 publish = false
-
-[[bin]]
-name = "ezf-plugin-worker"
-path = "src/main.rs"
 
 [dependencies]
 PluginIpc = { path = "../PluginIpc" }
@@ -22,3 +19,7 @@ libc = "0.2"
 
 [dev-dependencies]
 PluginHost = { path = "../PluginHost" }
+
+[[bin]]
+name = "ezf-plugin-worker"
+path = "src/main.rs"

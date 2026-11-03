@@ -1,9 +1,10 @@
 [package]
 name = "FilterContracts"
-version = "3.5.4"
-edition = "2024"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Database-independent filter, sorting, and pagination contracts shared by backend components"
+repository = "https://github.com/ukf-kohnke/EZF-Plugin-Platform.git"
 
 [dependencies]
 serde = { version = "1.0.217", features = ["derive"] }

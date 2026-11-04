@@ -1,15 +1,10 @@
 [package]
 name = "pluginhost-integration-fixture"
-version = "3.5.4"
+version = "1.0.0"
 edition = "2024"
 publish = false
 
-# This fixture is deliberately standalone and is not a workspace member. It is built explicitly by
-# PluginHost's dynamic-library integration tests and must never become part of product discovery.
 [workspace]
-
-[lib]
-crate-type = ["cdylib"]
 
 [dependencies]
 PluginContracts = { path = "../../../Plugin-SDK/PluginContracts" }
@@ -17,3 +12,6 @@ DatabaseContracts = { path = "../../../Plugin-SDK/DatabaseContracts" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
+
+[lib]
+crate-type = ["cdylib"]

@@ -8,4 +8,4 @@ repository = "https://github.com/ukf-kohnke/EZF-Plugin-Platform.git"
 
 [dependencies]
 PluginAbi = { path = "../Plugin-SDK/PluginAbi" }
-libloading = "0.8.3"
+libloading = "0.9"

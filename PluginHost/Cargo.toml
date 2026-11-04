@@ -13,7 +13,7 @@ PluginAbi = { path = "../Plugin-SDK/PluginAbi" }
 PluginIpc = { path = "../PluginIpc" }
 PluginContracts = { path = "../Plugin-SDK/PluginContracts" }
 glob = "0.3.1"
-libloading = "0.8.3"
+libloading = "0.9"
 log = "0.4.20"
 serde = "1.0"
 serde_json = "1.0"

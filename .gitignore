@@ -1,4 +1,4 @@
 .git
-*.lock
+/Cargo.lock
 *.bak
 target

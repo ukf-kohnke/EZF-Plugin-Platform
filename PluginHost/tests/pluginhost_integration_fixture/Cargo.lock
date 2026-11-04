@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "DatabaseContracts"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "serde",
@@ -13,11 +13,11 @@ dependencies = [
 
 [[package]]
 name = "PluginAbi"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "PluginContracts"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "DatabaseContracts",
  "PluginAbi",

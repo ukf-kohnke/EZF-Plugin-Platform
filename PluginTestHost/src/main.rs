@@ -581,7 +581,7 @@ fn manifest_json(plugin_id: i64, manifest: &PluginManifest, executor: ExecutorAr
 }
 
 fn plugin_identity(plugin_id: i64, manifest: &PluginManifest, executor: ExecutorArg) -> Value {
-    json!({
+    let mut identity = json!({
         "id": plugin_id,
         "name": manifest.name,
         "version": manifest.version,
@@ -589,7 +589,11 @@ fn plugin_identity(plugin_id: i64, manifest: &PluginManifest, executor: Executor
         "kind": manifest.kind,
         "abi": "V2",
         "executor": executor.as_str(),
-    })
+    });
+    if let Some(description) = manifest.description.as_deref() {
+        identity["description"] = Value::String(description.to_owned());
+    }
+    identity
 }
 
 fn endpoints_json(manifest: &PluginManifest) -> Vec<Value> {

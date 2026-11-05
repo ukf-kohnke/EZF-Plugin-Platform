@@ -200,7 +200,8 @@ pub(crate) fn activate(
     }
 }
 
-fn _canonical_existing(
+#[allow(unused)]
+fn canonical_existing(
     path: &Path,
     want_directory: bool,
     description: &str
@@ -348,8 +349,14 @@ fn apply_resource_limits() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "uclibc")))]
+type RLimitResource = libc::__rlimit_resource_t;
+
+#[cfg(all(target_os = "linux", not(any(target_env = "gnu", target_env = "uclibc"))))]
+type RLimitResource = libc::c_int;
+
 #[cfg(target_os = "linux")]
-fn set_limit(resource: libc::c_int, requested: u64, name: &str) -> Result<(), String> {
+fn set_limit(resource: RLimitResource, requested: u64, name: &str) -> Result<(), String> {
     let mut current = unsafe { std::mem::zeroed::<libc::rlimit>() };
     if (unsafe { libc::getrlimit(resource, &mut current) }) != 0 {
         return Err(format!("getrlimit({name}) failed: {}", std::io::Error::last_os_error()));
@@ -428,7 +435,7 @@ fn apply_landlock(
     extra_read_paths: &[PathBuf],
     extra_library_paths: &[PathBuf],
     datasource_tcp_ports: &[u16]
-) -> Result<i32, String> {
+) -> Result<libc::c_long, String> {
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
     const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;

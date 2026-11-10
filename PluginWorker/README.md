@@ -1,4 +1,6 @@
-# ezf-plugin-worker (Phase 8 Linux sandbox)
+# ezf-plugin-worker
+
+[Deutsche Dokumentation](README_DE.md) · [Platform overview](../README.md)
 
 `ezf-plugin-worker` is the process-isolated runtime for one plugin shared library. It uses ABI V2
 and `PluginExecutionCore`, speaks the bounded `PluginIpc` protocol, and forwards database/logging
@@ -95,7 +97,7 @@ firewall, cgroup, UID/user-namespace and temp-quota controls are active.
 
 ## Integration tests
 
-From the backend workspace root:
+From the `EZF-Plugin-Platform` workspace root:
 
 ```bash
 cargo test -p PluginWorker --test process_integration -- --test-threads=1

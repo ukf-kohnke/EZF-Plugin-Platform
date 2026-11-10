@@ -1,4 +1,6 @@
-# EZF Plugin Test Host — Phase 2
+# EZF Plugin Test Host
+
+[Deutsche Dokumentation](README_DE.md) · [Platform overview](../README.md)
 
 `ezf-plugin-test-host` tests one ABI V2 domain plugin without starting `BackendSrv`. It uses the same
 `PluginHostInstance`, `PluginExecutionCore`, and (in process mode) `PluginWorker`/`PluginIpc`

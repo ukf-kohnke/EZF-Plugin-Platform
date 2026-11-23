@@ -109,7 +109,7 @@ Der Testhost führt einen Readiness-Probeaufruf (`SELECT 1`) aus und leitet die 
 Zwei Szenarien sind vorbereitet:
 
 - `examples/scenario-variantfilter-live-db-smoke.json` prüft einen echten SQL-Request und HTTP 200. Wenn für die Beispiel-UUID keine Analyse vorhanden ist, kann die Antwort `status: "not_loaded"` enthalten. Es ist daher ein Verbindungs-/Query-Smoke-Test ohne bekannte Patienten-ID.
-- `examples/scenario-variantfilter-load-snv-data.json` verlangt `status: "loaded"`, ruft danach `GET /getSnvCache` in derselben Session auf und prüft den Cache. Ersetze die Beispiel-UUID durch eine reale Patienten-ID aus der Testdatenbank, deren ausgewählte Analyse SNV-Varianten enthält.
+- `examples/scenario-variantfilter-load-snv-data.json` prüft den Live-Datenpfad: Es lädt den Patienten, führt anschließend `POST /filterSnvData` mit diesem Patienten als `index_uuid` aus und ruft danach `GET /getSnvTable` in derselben Session auf. Damit wird geprüft, dass eine Tabellenseite geliefert wird. Ersetze die Beispiel-UUID in beiden Request-Bodies durch eine reale Patienten-ID aus der Testdatenbank, deren ausgewählte Analyse SNV-Varianten enthält; andernfalls kann das Filterergebnis leer sein.
 
 Mögliche IDs lassen sich über `examples/variantfilter-find-patient-with-snvs.sql` ermitteln. Die SQL-Abfrage spiegelt die aktuelle Analyseauswahl von VariantFilter (`TOP (1) ... ORDER BY a.id`). Nur mit einer geeigneten Testdatenbank ausführen. Obwohl der Endpoint eine Read-Abfrage sendet, legt er das geladene Ergebnis bis zum Session-Close/Unload im In-Memory-Session-Cache des Plugins ab.
 

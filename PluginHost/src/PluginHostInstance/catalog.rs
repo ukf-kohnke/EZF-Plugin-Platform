@@ -9,6 +9,15 @@ impl PluginHostInstance {
             .catalog()
     }
 
+    /// Returns a cheap Arc clone of the cached API snapshot for loaded Domain plugins.
+    /// A new immutable snapshot is published atomically with the route index on load/unload.
+    pub fn active_domain_api_snapshot(&self) -> std::sync::Arc<ActiveDomainApiSnapshot> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_domain_api_snapshot()
+    }
+
     pub fn plugin_manifests(&self) -> Vec<PluginManifest> {
         self.inner
             .lock()

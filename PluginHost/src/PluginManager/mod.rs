@@ -13,7 +13,7 @@ use PluginContracts::{
     },
     IPlugin::IPlugin,
 };
-use super::PluginHostInstance::PluginManagerError;
+use super::PluginHostInstance::{ActiveDomainApiSnapshot, PluginManagerError};
 use glob::{ glob, GlobError };
 use std::{ collections::HashMap, path::{ Path, PathBuf }, sync::Arc };
 
@@ -156,6 +156,9 @@ pub(crate) struct PluginManager {
     /// `(method, normalized path) -> plugin runtime + endpoint id`.
     /// Rebuilt only when the catalog changes, never as part of an HTTP request.
     endpoint_routes: HashMap<(PluginHttpMethod, String), PluginEndpointRoute>,
+    /// Immutable API snapshot for currently loaded Domain plugins. Rebuilt under the same lock
+    /// as the catalog and route index, so consumers never observe a mixed registry generation.
+    active_domain_api_snapshot: Arc<ActiveDomainApiSnapshot>,
     /// Cached DataSource cardinality and unique runtime. Updated atomically with registry changes.
     /// Database requests therefore avoid scanning every loaded plugin under the manager mutex.
     database_plugin: DatabasePluginSelection,
@@ -180,6 +183,10 @@ impl PluginManager {
 
     pub(crate) fn catalog(&self) -> PluginCatalog {
         self.catalog.clone()
+    }
+
+    pub(crate) fn active_domain_api_snapshot(&self) -> Arc<ActiveDomainApiSnapshot> {
+        Arc::clone(&self.active_domain_api_snapshot)
     }
 
     /// Returns only plugin manifests, avoiding the duplicate endpoint-binding list in the
@@ -332,6 +339,15 @@ impl PluginManager {
             "a validated catalog must have a runtime route for every endpoint"
         );
         self.endpoint_routes = routes;
+        let registered_routes = self
+            .endpoint_routes
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        self.active_domain_api_snapshot = Arc::new(ActiveDomainApiSnapshot::from_catalog(
+            &self.catalog,
+            &registered_routes
+        ));
 
         // This selection is rebuilt under the same manager lock as the plugin registry and
         // endpoint index, so a request sees one consistent registry generation.

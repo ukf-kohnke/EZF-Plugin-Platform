@@ -1,5 +1,90 @@
 //! Public load, health-report, and error types for the PluginHostInstance runtime.
 use super::*;
+use PluginContracts::ApiContract::{PluginHttpMethod, PluginKind};
+
+/// Immutable view of the API endpoints currently exposed by successfully loaded Domain plugins.
+///
+/// The snapshot is rebuilt together with the PluginHost route index whenever the plugin
+/// registry changes. It deliberately excludes DataSource plugins and Domain plugins without
+/// API endpoints.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActiveDomainApiSnapshot {
+    endpoints: Vec<ActiveDomainApiEndpoint>,
+    plugin_names: Vec<String>,
+    missing_registrations: Vec<ActiveDomainApiEndpoint>,
+}
+
+/// One endpoint declared by an active Domain plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveDomainApiEndpoint {
+    pub plugin_name: String,
+    pub endpoint_id: String,
+    pub method: PluginHttpMethod,
+    pub path: String,
+}
+
+impl ActiveDomainApiEndpoint {
+    /// Stable human-readable representation used in readiness diagnostics.
+    pub fn display_route(&self) -> String {
+        format!("{} {}", self.method, self.path)
+    }
+}
+
+impl ActiveDomainApiSnapshot {
+    pub fn endpoints(&self) -> &[ActiveDomainApiEndpoint] {
+        &self.endpoints
+    }
+
+    pub fn plugin_names(&self) -> &[String] {
+        &self.plugin_names
+    }
+
+    /// Manifest endpoints for which the runtime route index has no matching entry.
+    /// This should be empty for every successfully validated registry generation.
+    pub fn missing_registrations(&self) -> &[ActiveDomainApiEndpoint] {
+        &self.missing_registrations
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.endpoints.is_empty()
+    }
+
+    pub(crate) fn from_catalog(
+        catalog: &PluginCatalog,
+        registered_routes: &std::collections::HashSet<(PluginHttpMethod, String)>
+    ) -> Self {
+        let mut snapshot = Self::default();
+        let mut plugin_names = std::collections::BTreeSet::new();
+
+        for binding in &catalog.endpoints {
+            let Some(manifest) = catalog.plugins.get(&binding.plugin_name) else {
+                continue;
+            };
+            if manifest.kind != PluginKind::Domain {
+                continue;
+            }
+
+            let endpoint = ActiveDomainApiEndpoint {
+                plugin_name: binding.plugin_name.clone(),
+                endpoint_id: binding.endpoint.id.clone(),
+                method: binding.endpoint.method,
+                path: binding.endpoint.path.clone(),
+            };
+            plugin_names.insert(binding.plugin_name.clone());
+
+            let route_is_registered = normalize_plugin_path(&binding.endpoint.path)
+                .ok()
+                .is_some_and(|path| registered_routes.contains(&(binding.endpoint.method, path)));
+            if !route_is_registered {
+                snapshot.missing_registrations.push(endpoint.clone());
+            }
+            snapshot.endpoints.push(endpoint);
+        }
+
+        snapshot.plugin_names = plugin_names.into_iter().collect();
+        snapshot
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSessionNotificationFailure {
@@ -237,5 +322,52 @@ impl std::error::Error for PluginManagerError {
             PluginManagerError::ConstructorLoad { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod active_domain_api_snapshot_tests {
+    use super::*;
+    use PluginContracts::ApiContract::{PluginCatalog, PluginEndpointDescriptor, PluginManifest};
+    use std::collections::HashSet;
+
+    #[test]
+    fn snapshot_contains_only_active_domain_api_endpoints_and_reports_route_gaps() {
+        let mut domain = PluginManifest::new("PatientDomain", "1.0.0", PluginKind::Domain);
+        domain.endpoints.push(PluginEndpointDescriptor::get("list", "/patients"));
+        domain.endpoints.push(PluginEndpointDescriptor::post("persist", "/patients"));
+
+        let mut data_source = PluginManifest::new("Database", "1.0.0", PluginKind::DataSource);
+        data_source.endpoints.push(PluginEndpointDescriptor::get("query", "/database/query"));
+
+        let domain_library = PluginManifest::new("DomainLibrary", "1.0.0", PluginKind::Domain);
+        let catalog = PluginCatalog::from_manifests([domain, data_source, domain_library])
+            .expect("fixture catalog should be valid");
+
+        let registered_routes = HashSet::from([
+            (PluginHttpMethod::Get, "/patients".to_owned()),
+        ]);
+        let snapshot = ActiveDomainApiSnapshot::from_catalog(&catalog, &registered_routes);
+
+        assert_eq!(snapshot.endpoints().len(), 2);
+        assert_eq!(snapshot.plugin_names(), &["PatientDomain".to_owned()]);
+        assert_eq!(snapshot.missing_registrations().len(), 1);
+        assert_eq!(snapshot.missing_registrations()[0].display_route(), "POST /patients");
+        assert!(snapshot.endpoints().iter().all(|endpoint|
+            endpoint.plugin_name == "PatientDomain"
+        ));
+    }
+
+    #[test]
+    fn snapshot_is_empty_when_no_domain_plugin_exposes_api_endpoints() {
+        let domain_library = PluginManifest::new("DomainLibrary", "1.0.0", PluginKind::Domain);
+        let data_source = PluginManifest::new("Database", "1.0.0", PluginKind::DataSource);
+        let catalog = PluginCatalog::from_manifests([domain_library, data_source])
+            .expect("fixture catalog should be valid");
+        let snapshot = ActiveDomainApiSnapshot::from_catalog(&catalog, &HashSet::new());
+
+        assert!(snapshot.is_empty());
+        assert!(snapshot.plugin_names().is_empty());
+        assert!(snapshot.missing_registrations().is_empty());
     }
 }

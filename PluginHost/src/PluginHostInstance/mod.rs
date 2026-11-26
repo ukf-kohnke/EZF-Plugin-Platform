@@ -57,6 +57,8 @@ pub use self::types::{
     PluginRequirement,
     PluginSessionNotificationFailure,
     PluginSessionNotificationReport,
+    ActiveDomainApiEndpoint,
+    ActiveDomainApiSnapshot,
 };
 use self::types::normalize_plugin_name;
 

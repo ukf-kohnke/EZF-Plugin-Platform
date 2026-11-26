@@ -6,7 +6,9 @@
 //! The native shim embeds CPython because the current runtime loads shared libraries through
 //! InstantiateV2; the endpoint implementation itself is Python code.
 
-use PluginContracts::ApiContract::{ PluginEndpointRequest, PluginHttpMethod, PluginPrincipal };
+use PluginContracts::ApiContract::{
+    PluginEndpointAuthorization, PluginEndpointRequest, PluginHttpMethod, PluginPrincipal,
+};
 use PluginHost::PluginHostInstance::{PluginHostConfig, PluginHostInstance};
 use std::{ env, fs, path::{ Path, PathBuf }, process::Command };
 
@@ -111,6 +113,19 @@ fn python_handler_crosses_the_real_rust_plugin_abi() {
     let plugin_id = host.load_plugin_file(&library).expect(
         "Rust PluginHost must load the Python adapter through InstantiateV2"
     );
+
+    let manifest = host
+        .plugin_manifests()
+        .into_iter()
+        .find(|manifest| manifest.name == "PythonAbiSmokeTest")
+        .expect("smoke-test manifest must be registered");
+    assert_eq!(manifest.contract_version, 11, "smoke-test manifest must use contract v11");
+    let ping = manifest
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == "python-abi-ping")
+        .expect("ping endpoint must be present in the manifest");
+    assert_eq!(ping.authorization, PluginEndpointAuthorization::AuthenticatedOnly);
 
     let response = host.handle_endpoint(ping_request()).expect(
         "Rust PluginHost must invoke the Python handler over ABI V2"

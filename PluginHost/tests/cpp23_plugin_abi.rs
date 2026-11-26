@@ -5,7 +5,9 @@
 //!
 //! The test is opt-in so the regular Rust test suite does not require CMake or a C++23 compiler.
 
-use PluginContracts::ApiContract::{ PluginEndpointRequest, PluginHttpMethod, PluginPrincipal };
+use PluginContracts::ApiContract::{
+    PluginEndpointAuthorization, PluginEndpointRequest, PluginHttpMethod, PluginPrincipal,
+};
 use PluginHost::PluginHostInstance::{PluginHostConfig, PluginHostInstance};
 use std::{ env, fs, path::{ Path, PathBuf }, process::Command };
 
@@ -105,6 +107,19 @@ fn cpp23_shared_library_crosses_the_real_rust_plugin_abi() {
     let plugin_id = host.load_plugin_file(&library).expect(
         "Rust PluginHost must load the C++23 library through InstantiateV2"
     );
+
+    let manifest = host
+        .plugin_manifests()
+        .into_iter()
+        .find(|manifest| manifest.name == "Cpp23AbiSmokeTest")
+        .expect("smoke-test manifest must be registered");
+    assert_eq!(manifest.contract_version, 11, "smoke-test manifest must use contract v11");
+    let ping = manifest
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == "cpp23-abi-ping")
+        .expect("ping endpoint must be present in the manifest");
+    assert_eq!(ping.authorization, PluginEndpointAuthorization::AuthenticatedOnly);
 
     let response = host.handle_endpoint(ping_request()).expect(
         "Rust PluginHost must invoke the C++ endpoint over ABI V2"

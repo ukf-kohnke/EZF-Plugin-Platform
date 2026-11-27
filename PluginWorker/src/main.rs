@@ -1010,7 +1010,30 @@ mod unix_worker {
             channel.begin_call(request_id, control.operation_id, &cancelled);
             ActiveCallGuard { channel, request_id }
         });
-        match control.operation {
+        let external_request_id = match control.operation {
+            InvokeOperation::HandleEndpoint | InvokeOperation::ExecuteDatabase =>
+                serde_json::from_slice::<serde_json::Value>(payload)
+                    .ok()
+                    .and_then(|value| {
+                        let request_id = value.get("request_id")?.as_str()?;
+                        uuid::Uuid::parse_str(request_id).ok()
+                    }),
+            _ => None,
+        };
+        let operation_name = format!("{:?}", control.operation);
+        let started = std::time::Instant::now();
+        if let (Some(channel), Some(external_request_id)) = (WORKER_CHANNEL.get(), external_request_id) {
+            channel.send_log(
+                LogLevel::Debug,
+                format!(
+                    "PLUGIN_WORKER_INVOKE request_id={} operation={} outcome=started ipc_request_id={}",
+                    external_request_id,
+                    operation_name,
+                    request_id
+                )
+            );
+        }
+        let result = match control.operation {
             InvokeOperation::Name => core.name_bytes(cancellation).map_err(plugin_error),
             InvokeOperation::Manifest => core.manifest_bytes(cancellation).map_err(plugin_error),
             InvokeOperation::IsLoaded =>
@@ -1019,11 +1042,12 @@ mod unix_worker {
                     .map(|loaded| serde_json::to_vec(&loaded).unwrap_or_else(|_| b"false".to_vec()))
                     .map_err(plugin_error),
             InvokeOperation::HandleEndpoint =>
-                match core.handle_endpoint(payload, cancellation).map_err(plugin_error)? {
-                    EndpointCallOutput::Serialized(bytes) => Ok(bytes),
-                    EndpointCallOutput::Raw { metadata, body } =>
+                match core.handle_endpoint(payload, cancellation).map_err(plugin_error) {
+                    Ok(EndpointCallOutput::Serialized(bytes)) => Ok(bytes),
+                    Ok(EndpointCallOutput::Raw { metadata, body }) =>
                         reassemble_raw_endpoint(metadata, body).map_err(plugin_error),
-                }
+                    Err(error) => Err(error),
+                },
             InvokeOperation::ExecuteDatabase =>
                 core.execute_database_bytes(payload, cancellation).map_err(plugin_error),
             InvokeOperation::SessionClosed =>
@@ -1043,19 +1067,31 @@ mod unix_worker {
                             ))
                         }
                     }),
-            InvokeOperation::Destroy => {
-                let status = core.destroy(cancellation).map_err(plugin_error)?;
-                if status == PLUGIN_STATUS_OK {
-                    Ok(serde_json::to_vec(&status).unwrap_or_default())
-                } else {
-                    Err((
-                        IpcErrorCode::PluginError,
-                        format!("plugin destroy failed with status {status}"),
-                        serde_json::to_vec(&status).unwrap_or_default(),
-                    ))
-                }
+            InvokeOperation::Destroy => match core.destroy(cancellation).map_err(plugin_error) {
+                Ok(status) if status == PLUGIN_STATUS_OK =>
+                    Ok(serde_json::to_vec(&status).unwrap_or_default()),
+                Ok(status) => Err((
+                    IpcErrorCode::PluginError,
+                    format!("plugin destroy failed with status {status}"),
+                    serde_json::to_vec(&status).unwrap_or_default(),
+                )),
+                Err(error) => Err(error),
             }
+        };
+        if let (Some(channel), Some(external_request_id)) = (WORKER_CHANNEL.get(), external_request_id) {
+            channel.send_log(
+                if result.is_ok() { LogLevel::Debug } else { LogLevel::Warn },
+                format!(
+                    "PLUGIN_WORKER_INVOKE request_id={} operation={} outcome={} duration_us={} ipc_request_id={}",
+                    external_request_id,
+                    operation_name,
+                    if result.is_ok() { "success" } else { "failed" },
+                    started.elapsed().as_micros(),
+                    request_id
+                )
+            );
         }
+        result
     }
 
     fn reassemble_raw_endpoint(metadata: Vec<u8>, body: Vec<u8>) -> Result<Vec<u8>, String> {

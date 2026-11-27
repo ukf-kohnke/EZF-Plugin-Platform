@@ -126,6 +126,7 @@ fn process_host() -> Arc<PluginHostInstance> {
 
 fn ping_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
+        request_id: None,
         endpoint_id: "ping".to_owned(),
         method: PluginHttpMethod::Get,
         raw_path: "/pluginhost-integration/ping".to_owned(),
@@ -146,6 +147,7 @@ fn ping_request() -> PluginEndpointRequest {
 
 fn slow_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
+        request_id: None,
         endpoint_id: "slow".to_owned(),
         method: PluginHttpMethod::Get,
         raw_path: "/pluginhost-integration/slow".to_owned(),

@@ -130,6 +130,7 @@ fn build_existing_plugin(package: &str) -> PathBuf {
 
 fn ping_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
+        request_id: None,
         endpoint_id: "ping".to_owned(),
         method: PluginHttpMethod::Get,
         raw_path: "/pluginhost-integration/ping".to_owned(),

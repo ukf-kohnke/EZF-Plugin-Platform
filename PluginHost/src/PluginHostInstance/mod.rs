@@ -31,6 +31,7 @@ use PluginContracts::{
         PluginCatalog,
         PluginCatalogError,
         PluginDatabaseCapability,
+        PluginDatabaseCapabilityRequest,
         PluginEndpointError,
         PluginEndpointRequest,
         PluginManifest,
@@ -134,6 +135,17 @@ impl DatabaseDispatcher {
         request_bytes: Vec<u8>,
         cancellation: PluginAbi::PluginCancellationV2
     ) -> Result<Vec<u8>, DatabaseContracts::DatabaseError> {
+        let request_id = serde_json::from_slice::<PluginDatabaseCapabilityRequest>(&request_bytes)
+            .ok()
+            .and_then(|request| request.request_id)
+            .map(|request_id| request_id.to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        let started = std::time::Instant::now();
+        log::debug!(
+            target: "PluginHost",
+            "PLUGIN_DATABASE_DISPATCH request_id={} outcome=started",
+            request_id
+        );
         let manager = self.manager
             .upgrade()
             .ok_or_else(||
@@ -146,27 +158,31 @@ impl DatabaseDispatcher {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .database_plugin_selection();
-        match selection {
+        let result = match selection {
             DatabasePluginSelection::None =>
-                Err(
-                    DatabaseContracts::DatabaseError::new(
-                        DatabaseContracts::DatabaseErrorKind::Query,
-                        "no database data-source plugin is loaded"
-                    )
-                ),
+                Err(DatabaseContracts::DatabaseError::new(
+                    DatabaseContracts::DatabaseErrorKind::Query,
+                    "no database data-source plugin is loaded"
+                )),
             DatabasePluginSelection::Unique { runtime } =>
                 runtime.execute_database_bytes_with_parent(request_bytes, cancellation),
             DatabasePluginSelection::Multiple { names } =>
-                Err(
-                    DatabaseContracts::DatabaseError::new(
-                        DatabaseContracts::DatabaseErrorKind::Query,
-                        format!(
-                            "multiple database data-source plugins are loaded: {}",
-                            names.join(", ")
-                        )
+                Err(DatabaseContracts::DatabaseError::new(
+                    DatabaseContracts::DatabaseErrorKind::Query,
+                    format!(
+                        "multiple database data-source plugins are loaded: {}",
+                        names.join(", ")
                     )
-                ),
-        }
+                )),
+        };
+        log::info!(
+            target: "PluginHost",
+            "PLUGIN_DATABASE_DISPATCH request_id={} outcome={} duration_us={}",
+            request_id,
+            if result.is_ok() { "success" } else { "failed" },
+            started.elapsed().as_micros()
+        );
+        result
     }
 }
 

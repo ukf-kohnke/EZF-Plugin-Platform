@@ -83,6 +83,7 @@ fn build_python_plugin() -> (PathBuf, PathBuf) {
 
 fn ping_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
+        request_id: None,
         endpoint_id: "python-abi-ping".to_owned(),
         method: PluginHttpMethod::Get,
         raw_path: "/python-abi-smoke/ping".to_owned(),

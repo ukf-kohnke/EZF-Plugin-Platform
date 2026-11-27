@@ -77,6 +77,7 @@ fn build_cpp_plugin() -> (PathBuf, PathBuf) {
 
 fn ping_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
+        request_id: None,
         endpoint_id: "cpp23-abi-ping".to_owned(),
         method: PluginHttpMethod::Get,
         raw_path: "/cpp23-abi-smoke/ping".to_owned(),

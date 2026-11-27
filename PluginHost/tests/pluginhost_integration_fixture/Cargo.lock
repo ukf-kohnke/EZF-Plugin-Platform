@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "DatabaseContracts"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "chrono",
  "serde",
@@ -13,17 +13,19 @@ dependencies = [
 
 [[package]]
 name = "PluginAbi"
-version = "1.0.4"
+version = "1.0.5"
 
 [[package]]
 name = "PluginContracts"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "DatabaseContracts",
  "PluginAbi",
  "log",
  "serde",
  "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -111,6 +113,17 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
 ]
 
 [[package]]
@@ -217,6 +230,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -300,6 +319,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio"
+version = "1.54.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
+dependencies = [
+ "pin-project-lite",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -311,6 +339,7 @@ version = "1.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
+ "getrandom",
  "js-sys",
  "serde_core",
  "wasm-bindgen",

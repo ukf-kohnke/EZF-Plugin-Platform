@@ -395,6 +395,7 @@ impl JsonRequest {
             if body.is_empty() { None } else { Some("application/json".to_owned()) }
         });
         Ok(PluginEndpointRequest {
+            request_id: None,
             endpoint_id: self.endpoint_id,
             method,
             raw_path: self.path,

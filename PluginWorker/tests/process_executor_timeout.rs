@@ -102,6 +102,7 @@ fn process_host() -> Arc<PluginHostInstance> {
 
 fn slow_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
+        request_id: None,
         endpoint_id: "slow".to_owned(),
         method: PluginHttpMethod::Get,
         raw_path: "/pluginhost-integration/slow".to_owned(),

@@ -74,6 +74,7 @@ fn build_fixture() -> PathBuf {
 
 fn ping_request() -> PluginEndpointRequest {
     PluginEndpointRequest {
+        request_id: None,
         endpoint_id: "ping".to_owned(),
         method: PluginHttpMethod::Get,
         raw_path: "/pluginhost-integration/ping".to_owned(),
@@ -507,6 +508,7 @@ fn plugin_calls_execute_in_parallel_without_serializing_on_runtime_lock() {
 
     fn slow_request() -> PluginEndpointRequest {
         PluginEndpointRequest {
+            request_id: None,
             endpoint_id: "slow".to_owned(),
             method: PluginHttpMethod::Get,
             raw_path: "/pluginhost-integration/slow".to_owned(),
@@ -650,6 +652,7 @@ fn timed_plugin_calls_return_without_detaching_the_running_library() {
     );
 
     let response = _test_guard.handle_endpoint({ PluginEndpointRequest {
+        request_id: None,
             endpoint_id: "slow".to_owned(),
             method: PluginHttpMethod::Get,
             raw_path: "/pluginhost-integration/slow".to_owned(),
@@ -721,6 +724,7 @@ fn unload_timeout_keeps_the_plugin_registered_until_quiescing_succeeds() {
     restore_fixture_mode(previous);
 
     let request = PluginEndpointRequest {
+        request_id: None,
         endpoint_id: "slow".to_owned(),
         method: PluginHttpMethod::Get,
         raw_path: "/pluginhost-integration/slow".to_owned(),
@@ -777,6 +781,7 @@ fn unload_requests_cooperative_cancellation_before_destroying_the_instance() {
 
     fn slow_request() -> PluginEndpointRequest {
         PluginEndpointRequest {
+            request_id: None,
             endpoint_id: "slow".to_owned(),
             method: PluginHttpMethod::Get,
             raw_path: "/pluginhost-integration/slow".to_owned(),

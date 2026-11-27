@@ -6,6 +6,7 @@ use PluginContracts::ApiContract::{
     PLUGIN_OVERLOADED_CODE,
     PLUGIN_OVERLOADED_USER_MESSAGE,
     PluginManifest,
+    PluginDatabaseCapabilityRequest,
 };
 
 impl PluginRuntime {
@@ -57,6 +58,17 @@ impl PluginRuntime {
         PluginContracts::ApiContract::PluginEndpointResponse,
         PluginContracts::ApiContract::PluginEndpointError
     > {
+        let request_id = request.request_id
+            .map(|request_id| request_id.to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        let endpoint_id = request.endpoint_id.clone();
+        let started = std::time::Instant::now();
+        log::debug!(
+            target: "PluginHost",
+            "PLUGIN_ENDPOINT_DISPATCH request_id={} endpoint_id={} outcome=started",
+            request_id,
+            endpoint_id
+        );
         let call = move |runtime: &PluginRuntime, context: PluginCallContext| {
             let request_bytes = serde_json
                 ::to_vec(&request)
@@ -69,6 +81,14 @@ impl PluginRuntime {
             None => self.call_with_timeout("handle_endpoint", call),
         };
 
+        log::info!(
+            target: "PluginHost",
+            "PLUGIN_ENDPOINT_DISPATCH request_id={} endpoint_id={} outcome={} duration_us={}",
+            request_id,
+            endpoint_id,
+            if result.is_ok() { "success" } else { "failed" },
+            started.elapsed().as_micros()
+        );
         result.map_err(|error| {
             match error {
                 PluginCallFailure::Timeout(timeout) =>
@@ -183,7 +203,10 @@ impl PluginRuntime {
     ) -> Result<DatabaseContracts::DatabaseResponse, DatabaseContracts::DatabaseError> {
         let call = move |runtime: &PluginRuntime, context: PluginCallContext| {
             let request_bytes = serde_json
-                ::to_vec(&request)
+                ::to_vec(&PluginDatabaseCapabilityRequest {
+                    request_id: PluginContracts::ApiContract::current_request_correlation_id(),
+                    request,
+                })
                 .map_err(|error| format!("failed to encode database request: {error}"))?;
             let response: Result<
                 DatabaseContracts::DatabaseResponse,

@@ -25,6 +25,7 @@ use PluginContracts::ApiContract::{
     PluginLifecycleError,
     PluginManifest,
     PluginKind,
+    PluginDatabaseCapabilityRequest,
 };
 use PluginIpc::{
     CancelControl,
@@ -2131,14 +2132,30 @@ fn execute_database_capability(
             format!("database capability payload exceeded {MAX_DATABASE_CAPABILITY_BYTES} bytes"),
         ));
     }
-    let request: DatabaseContracts::DatabaseRequest = serde_json
-        ::from_slice(payload)
-        .map_err(|error| {
-            (
-                IpcErrorCode::ProtocolViolation,
-                format!("invalid database capability request: {error}"),
-            )
-        })?;
+    let (request_id, request) = match serde_json
+        ::from_slice::<PluginDatabaseCapabilityRequest>(payload)
+    {
+        Ok(envelope) => (envelope.request_id, envelope.request),
+        Err(_) => {
+            let legacy_request: DatabaseContracts::DatabaseRequest = serde_json
+                ::from_slice(payload)
+                .map_err(|error| {
+                    (
+                        IpcErrorCode::ProtocolViolation,
+                        format!("invalid database capability request: {error}"),
+                    )
+                })?;
+            (None, legacy_request)
+        }
+    };
+    let request_id = request_id
+        .map(|request_id| request_id.to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    log::debug!(
+        target: "PluginHost",
+        "PLUGIN_WORKER_DATABASE_CAPABILITY request_id={} outcome=received",
+        request_id
+    );
     let statement = match &request {
         DatabaseContracts::DatabaseRequest::Query(query) => query.statement.as_str(),
         DatabaseContracts::DatabaseRequest::Execute(execute) => execute.statement.as_str(),
